@@ -1,0 +1,48 @@
+trigger: none
+pr: none
+schedules:
+  - cron: "0 */1 * * *"
+    displayName: Mend SCA Sync Scheduler
+    branches:
+      include:
+        - main
+    always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+- group: main
+- group: content
+
+steps:
+
+- script: |
+    python -m pip install --upgrade pip
+    pip install -r requirements.txt
+  displayName: 'Install Mend Azure Work Item Sync'
+
+- script: python mend_azure_wi_sync/azure_wi_sync.py
+  displayName: 'Mend SCA Work Item Sync'
+  env:
+    # Required parameters
+    # Documentation: https://github.com/mend-toolkit/azure-wi-sync/tree/main#azure-pipeline-variables
+    MEND_URL: $(MEND_URL)
+    MEND_USERKEY: $(MEND_USERKEY)
+    MEND_APIKEY: $(MEND_APIKEY)
+    MEND_AZUREPAT: $(MEND_AZUREPAT)
+    MEND_AZUREURI: $(System.CollectionUri)
+    MEND_AZUREPROJECT: $(System.TeamProject)
+    # Optional parameters
+    MEND_PRODUCTTOKEN: $(MEND_PRODUCTTOKEN)
+    MEND_PROJECTTOKEN: $(MEND_PROJECTTOKEN)
+    MEND_EXCLUDETOKEN: $(MEND_EXCLUDETOKEN)
+    MEND_AZUREAREA: $(MEND_AZUREAREA)
+    MEND_AZURETYPE: $(MEND_AZURETYPE)
+    MEND_RESET: $(MEND_RESET)
+    MEND_CUSTOMFIELDS: $(MEND_CUSTOMFIELDS)
+    MEND_DEPENDENCY : $(MEND_DEPENDENCY)
+    MEND_REPONAME : $(MEND_REPONAME)
+    MEND_DESCRIPTION : $(MEND_DESCRIPTION)
+    MEND_CALCULATEPRIORITY : $(MEND_CALCULATEPRIORITY)
+    MEND_ALERT : $(MEND_ALERT)

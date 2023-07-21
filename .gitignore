@@ -1,0 +1,33 @@
+# Excluded IDE Directories
+.idea/
+.vs/
+.vscode/
+.ws/
+
+# Excluded Local/User Directories
+_archive/
+_misc/
+local/
+log/
+target/
+
+# Excluded Files - Extensions
+*.iml
+*.png
+*.tar.gz
+*.url
+.whitesource
+.local-params.config
+
+# Excluded Files - Naming Convention
+local-env.*
+/venv/
+/main.py
+/build/
+/.pytest_cache/
+/dist/
+/*egg-info/
+/__pycache__/
+/.idea/
+
+/out/
