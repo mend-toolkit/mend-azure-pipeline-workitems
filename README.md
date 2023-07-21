@@ -2,6 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-yellowgreen.svg)](https://opensource.org/licenses/Apache-2.0)
 [![CI](https://github.com/mend-toolkit/mend-azure-pipeline-workitems/actions/workflows/ci.yml/badge.svg)](https://github.com/mend-toolkit/mend-azure-pipeline-workitems/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/mend-toolkit/mend-azure-pipeline-workitems)](https://github.com/mend-toolkit/mend-azure-pipeline-workitems/releases/latest)
 
 # Integrate Mend SCA with Azure Work Items
 A self-hosted tool that creates and updates Azure Work Items based on Mend SCA Issue Tracking policies.  
