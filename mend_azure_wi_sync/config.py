@@ -9,7 +9,8 @@ sys.path.append(file_dir)
 
 
 class DescAzure(Enum):
-    Description = ("Epic", "Task", "Issue")
+    Description = ("Epic", "Task", "Issue", "User Story", "Feature", "Test Plan", "Change Request",
+                   "Test Suite", "Product Backlog Item", "Impediment", "Requirement", "Risk")
     ReproSteps = ("Bug")
 
     @classmethod

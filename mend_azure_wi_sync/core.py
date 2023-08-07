@@ -33,6 +33,7 @@ conf = None
 max_wi = 100
 API_VERSION = "1.4"
 AGENT_INFO = {"agent": f"{__tool_name__.replace('_', '-')}", "agentVersion": __version__}
+DEFAULT_PRIORITY = 2
 uuid_pattern = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 token_pattern = r"^[0-9a-zA-Z]{64}$"
 azurearea = r"^[0-9a-zA-Z\s\-_]+$"
@@ -278,14 +279,13 @@ def get_exist_wi():
 
             payload = {
                 "ids": batch_ids,
-                "fields": ["System.Id", "System.Title", "System.WorkItemType", "System.Tags"]
+                "fields": ["System.Id", "System.Title", "System.Tags", "System.WorkItemType"],  #"System.WorkItemType",
             }
-
-            response, err = call_azure_api(api_type="POST", api="wit/workitemsbatch", version="7.0",
+            response, err = call_azure_api(api_type="POST", api="wit/workitemsbatch", version="6.0",
                                            data=payload, project=conf.azure_project, header="application/json")
             if err == 0:
-                work_items.extend([{x["fields"]["System.Title"]: {x["fields"]["System.Id"]: x["fields"]["System.Tags"]}} for x in response["value"]
-                                   if x["fields"]["System.WorkItemType"].lower() == conf.azure_type.lower()])
+                work_items.extend([{x["fields"]["System.Title"]: {x["fields"]["System.Id"]: try_or_error(lambda: x["fields"]["System.Tags"],"")}} for x in response["value"]])
+                                   #if x["fields"]["System.WorkItemType"].lower() == conf.azure_type.lower()])
 
         return work_items
 
@@ -296,14 +296,14 @@ def get_exist_wi():
     try:
         data = {"query": f'select [System.Id] From WorkItems Where '
                          f'[System.TeamProject] = "{conf.azure_project}" And [System.State] <> "Removed" AND [System.State] <> "Deleted"'}
-        r, errocode = call_azure_api(api_type="POST", api="wit/wiql", version="7.0", project=conf.azure_project,
+        r, errocode = call_azure_api(api_type="POST", api="wit/wiql", version="6.0", project=conf.azure_project,
                                      data=data, header="application/json")
         if errocode == 0:
             ids = [x["id"] for x in r["workItems"]]
             return retrieve_work_items(work_item_ids=ids)
         else:
             return []
-    except:
+    except Exception as err:
         return []
 
 
@@ -599,6 +599,12 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         html += f"</details>"
         return html
 
+    def get_field_ref(fld_name):
+        for c_fld_ in cstm_flds:
+            if fld_name == c_fld_["name"]:
+                return f"/fields/{c_fld_['referenceName']}"
+        return f"/fields/Custom.{fld_name}"
+
     def create_wi_content():
         global data, count_item, global_errors
         data = [
@@ -623,7 +629,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         elif conf.description == "ReproSteps":
             desc_field = "/fields/Microsoft.VSTS.TCM.ReproSteps"
         elif conf.description:
-            desc_field = f"/fields/Custom.{conf.description}"
+            desc_field = get_field_ref(conf.description)
         else:
             desc_field = ""
         if desc_field:
@@ -641,6 +647,12 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                     "path": f"/fields/{fld_name}",
                     "value": fld_val
                 })
+            elif not fld_val and "Custom." in fld_name:
+                data.append({
+                    "op": "remove",
+                    "path": f"/fields/{fld_name}",
+                })
+
 
         if conf.azure_area:
             res = create_area(conf.azure_area)
@@ -761,7 +773,18 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 vulnerability_data = ""
                 exist_id = check_wi_id(id=vul_title,project_name=f"{prd_name}/{prj_name}")
                 # Looking for ID by System.Title and Tag (Product/Project Name)
-                azure_operation = "add" if exist_id == 0 else "replace"
+                if exist_id > 0:
+                    wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
+                                                   data={}, project=conf.azure_project)
+                wi_type_ = try_or_error(lambda: wi_data["fields"]["System.WorkItemType"], "")
+                if exist_id == 0:
+                    azure_operation = "add"
+                elif wi_type_.lower() != wi_type.lower():
+                    call_azure_api(api_type="DELETE", api=f"wit//workitems/{exist_id}",
+                                   data={}, project=conf.azure_project)
+                    azure_operation = "add"
+                else:
+                    azure_operation = "replace"
                 if exist_id not in updated_wi:
                     if is_license:  # Different description creation for License and Vulnerability
                         lic_data = ""
@@ -837,7 +860,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                desc + "<b>Details:</b><br>" if vulnerability_data else ""
                         desc += vulnerability_data
 
-                    priority = set_priority(try_or_error(lambda: float(max_severity), 6)) if conf.priority.lower() == "true" else 2
+                    priority = set_priority(try_or_error(lambda: float(max_severity), 6)) if conf.priority.lower() == "true" else DEFAULT_PRIORITY
                     # Default priority is 2
                     if desc:  # Creation WI just in case existing data
                         create_wi_content()
@@ -869,9 +892,20 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                             vul_fix_release_date = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["date"], "")
 
                             exist_id = check_wi_id(id=vul_title,project_name=f"{prd_name}/{prj_name}")
-                            azure_operation = "add" if exist_id == 0 else "replace"
+                            if exist_id > 0:
+                                wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
+                                                               data={}, project=conf.azure_project)
+                            wi_type_ = try_or_error(lambda: wi_data["fields"]["System.WorkItemType"], "")
+                            if exist_id == 0:
+                                azure_operation = "add"
+                            elif wi_type_.lower() != wi_type.lower():
+                                call_azure_api(api_type="DELETE", api=f"wit//workitems/{exist_id}",
+                                               data={}, project=conf.azure_project)
+                                azure_operation = "add"
+                            else:
+                                azure_operation = "replace"
                             if exist_id not in updated_wi:
-                                priority = set_priority(try_or_error(lambda: float(vul_score), 6)) if conf.priority.lower() == "true" else 2
+                                priority = set_priority(try_or_error(lambda: float(vul_score), 6)) if conf.priority.lower() == "true" else DEFAULT_PRIORITY
                                 # Default priority is 2
                                 lic_data = "<br>"
                                 for lic_data_ in lic_data_arr:
@@ -957,24 +991,31 @@ def load_wi_json():
     r, errcode = call_azure_api(api_type="GET", api="wit/workitemtypes/", project=conf.azure_project, data={},
                                 version="7.0", header="application/json")
     wi_list = []
+    is_add = False
     if errcode == 0:
         for el_ in r["value"]:
-            fields = []
-            for el_fld_ in el_["fields"]:
-                if "Custom." in el_fld_["referenceName"] or el_fld_["alwaysRequired"]:
-                    # Taking just custom or mandatory fields
-                    fields.append(
-                        {"referenceName": el_fld_["referenceName"],
-                         "name": el_fld_["name"],
-                         "defaultValue": el_fld_["defaultValue"],
-                         }
-                    )
-            wi_list.append(
-                {
-                    "name": el_["name"],
-                    "referenceName": el_["referenceName"],
-                    "fields": fields
-                })
+            if el_["name"].lower() == load_el.lower():
+                fields = []
+                for el_fld_ in el_["fields"]:
+                    flds, err = call_azure_api(api_type="GET", api=f"wit/fields/{el_fld_['referenceName']}", project=conf.azure_project, data={},
+                                    version="7.0", header="application/json")
+                    if err == 0:
+                        is_add = (flds['type'].lower() == "string" or flds['type'].lower() == "html" or flds['type'].lower() == "double") \
+                                 and not flds["isLocked"] and not flds["isPicklist"] and not flds["readOnly"]
+                    if "Custom." in el_fld_["referenceName"] or el_fld_["alwaysRequired"] or is_add:
+                        fields.append(
+                            {"referenceName": el_fld_["referenceName"],
+                             "name": el_fld_["name"],
+                             "defaultValue": el_fld_["defaultValue"],
+                             }
+                        )
+                wi_list.append(
+                    {
+                        "name": el_["name"],
+                        "referenceName": el_["referenceName"],
+                        "fields": fields
+                    })
+                break
     if not wi_list:
         logger.error(f"No work item types available for project '{conf.azure_project}'{r}")
         exit(-1)
