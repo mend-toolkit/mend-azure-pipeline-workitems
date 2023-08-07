@@ -45,9 +45,9 @@ def main():
         custom_flds = conf.azure_custom.split(";")
         for c_fld_ in custom_flds:
             field_name_from_param = c_fld_.split("::")
-            fld_name = f"Custom.{field_name_from_param[0]}"
+            fld_ref = f"Custom.{field_name_from_param[0]}"
             for w_field_ in wi_fields:
-                if fld_name == w_field_["referenceName"]:
+                if fld_ref == w_field_["referenceName"] or field_name_from_param[0] == w_field_["name"]:
                     w_field_["defaultValue"] = field_name_from_param[1]
                     break
 
