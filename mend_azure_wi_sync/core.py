@@ -367,8 +367,8 @@ def update_wi_in_thread():
                                 prj_token = ""
                                 for wq_el_rel_ in wq_el['relations']:
                                     if wq_el_rel_['rel'] == "Hyperlink":
-                                        prj_token = wq_el_rel_['attributes']['comment'].split(",")[0]
-                                        uuid = wq_el_rel_['attributes']['comment'].split(",")[1]
+                                        prj_token = try_or_error(lambda: wq_el_rel_['attributes']['comment'].split(",")[0], "")
+                                        uuid = try_or_error(lambda: wq_el_rel_['attributes']['comment'].split(",")[1], "")
 
                                 wq_el_url = wq_el['url'][0:wq_el['url'].find("apis")] + f"workitems/edit/{issue_id}"
                                 ext_issues = [{"identifier": f"{issue_wi_title}",
@@ -605,7 +605,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 return f"/fields/{c_fld_['referenceName']}"
         return f"/fields/Custom.{fld_name}"
 
-    def create_wi_content():
+    def create_wi_content(issue_id):
         global data, count_item, global_errors
         data = [
             {
@@ -665,17 +665,19 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             )
         try:
             if azure_operation == "add":
-                data.append(
-                    {
-                        "op": "add",
-                        "path": "/relations/-",
-                        "value": {
-                            "rel": "Hyperlink",
-                            "url": lib_url,
-                            "attributes": {"comment": prj_token + "," + policy_el['issueUuid']}
+                if issue_id:
+                    data.append(
+                        {
+                            "op": "add",
+                            "path": "/relations/-",
+                            "value": {
+                                "rel": "Hyperlink",
+                                "url": lib_url,
+                                "attributes": {"comment": prj_token + "," + issue_id}
+                            }
                         }
-                    }
-                )
+                    )
+
                 r, errcode = call_azure_api(api_type="POST", api=f"wit/workitems/${wi_type}", data=data,
                                             project=conf.azure_project)
                 try:
@@ -786,6 +788,8 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 else:
                     azure_operation = "replace"
                 if exist_id not in updated_wi:
+                    issue_id = try_or_error(lambda: prj_el["policyViolations"][0]["issueUuid"], "")
+                    # For link take first IssuedID
                     if is_license:  # Different description creation for License and Vulnerability
                         lic_data = ""
                         for lic_data_ in lic_data_arr:
@@ -863,7 +867,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                     priority = set_priority(try_or_error(lambda: float(max_severity), 6)) if conf.priority.lower() == "true" else DEFAULT_PRIORITY
                     # Default priority is 2
                     if desc:  # Creation WI just in case existing data
-                        create_wi_content()
+                        create_wi_content(issue_id=issue_id)
             else:
                 for i, policy_el in enumerate(prj_el["policyViolations"]):
                     if (is_license and policy_el["violationType"] == "LICENSE") or (
@@ -931,7 +935,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                        "<br><b>Dependency Hierarchy: </b><br>" + hierarchy_libs + \
                                        f"<br><b> Library home page: " \
                                        f"</b><a href='{lib_home_page}'>{lib_home_page}</a>" + vul_data + lic_data
-                                create_wi_content()
+                                create_wi_content(issue_id=issue_id)
 
         return f"{count_item} {conf.azure_type} work items created/updated for Mend project " \
                f"'{prj_name}' (Product '{prd_name}')" if count_item > 0 else \
