@@ -28,7 +28,7 @@ It utilizes Mend's [Issue Tracking API](https://docs.mend.io/bundle/integrations
 
 ## Prerequisites
 * Python 3.9+
-* Azure DevOps Services instance
+* Azure DevOps Services or Server instance
 * Azure DevOps service user Personal Access Token (PAT) with **Read & write** permissions for both "Work Items" and the "Project and Team" scopes on any organization where you want to run the integration.
 * Azure DevOps service user added to a group with the following permissions in the project: **Create tag definition**, **Manage project properties** and **View permissions for this node** 
 	* The user needs to be added to the team for each area path you wish to create work items for.
