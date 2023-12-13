@@ -11,8 +11,6 @@ on:
       - '!whitesource/**'
     tags:
       - '*'
-  schedule:
-    - cron: '30 13 * * *'
 
 jobs:
   build-and-test:
