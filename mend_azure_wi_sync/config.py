@@ -40,6 +40,7 @@ class varenvs(Enum):  # Lit of Env.variables
     azuredesc = ("WS_DESCRIPTION","MEND_DESCRIPTION")
     azurepriority = ("WS_CALCULATEPRIORITY", "MEND_CALCULATEPRIORITY")
     wsalert = ("WS_ALERT", "MEND_ALERT")
+    proxy = ("PROXY", "MEND_PROXY")
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -93,6 +94,7 @@ class Config:
     description: str
     priority: str
     wsalert: str
+    proxy: str
 
     def conf_json(self):
         return {
@@ -114,7 +116,8 @@ class Config:
             "wsreponame" : self.reponame,
             "azuredesc" : self.description,
             "azurepriority" : self.priority,
-            "wsalert" : self.wsalert
+            "wsalert" : self.wsalert,
+            "proxy" : self.proxy
         }
 
     def get_values(self):
@@ -132,6 +135,19 @@ class Config:
                     value = self.azure_project if not properties[key] else properties[key]
                 elif key == "description":
                     value = DescAzure.get_name_by_value(self.azure_type) if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "proxy":
+                    if properties[key]:
+                        if type(properties[key]) is dict:
+                            value = properties[key]
+                        else:
+                            if "https://" not in properties[key] and "http://" not in properties[key]:
+                                value = {"https":f"https://{properties[key]}"} if "@" in properties[key] else {"http":f"http://{properties[key]}"}
+                            elif "https://" in properties[key]:
+                                value = {"https":properties[key]}
+                            else:
+                                value = {"http": properties[key]}
+                    else:
+                        value = {}
                 else:
                     value = "" if re.match(r"\$\(.+\)$", properties[key]) else properties[key]
                 setattr(self, key, value)

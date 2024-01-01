@@ -99,6 +99,10 @@ def check_patterns():
         res.append("MEND_AZUREURI")
     if conf.azure_custom and "::" not in conf.azure_custom:
         res.append(f"MEND_CUSTOMFIELDS ('{conf.azure_custom}')")
+    if conf.proxy:
+        proxy_str = try_or_error(lambda: conf.proxy['http'], try_or_error(lambda: conf.proxy['https'],""))
+        if proxy_str.count(":") < 2:
+            res.append("MEND_PROXY.(The right format is <proxy_ip>:<proxy_port>)")
     return res
 
 
@@ -216,7 +220,9 @@ def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST"
             method=method,
             url=f"{extract_url(conf.ws_url)}/api/v{API_VERSION}",
             data=json.dumps(data_json),
-            headers=header, )
+            headers=header,
+            proxies=conf.proxy
+        )
         res = res_.text if res_.status_code == 200 else ""
 
     except Exception as err:
@@ -235,7 +241,7 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
         url = f"{conf.azure_uri}_apis/{api}{cmd_type}api-version={version}" if not project else \
             f"{conf.azure_uri}{project}/_apis/{api}{cmd_type}api-version={version}"
         res_ = requests.request(api_type, url, json=data,
-                                headers={'Content-Type': f'{header}'},
+                                headers={'Content-Type': f'{header}'}, proxies=conf.proxy,
                                 auth=('', conf.azure_pat))
         if res_.status_code == 200:
             res = json.loads(res_.text)
@@ -959,9 +965,12 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
                  "productToken": prd_,
                  })
             prj_lst_ = json.loads(call_ws_api(data=data))
-
-            for prj_ in prj_lst_['projects']:
-                res.append(prj_['projectToken'])
+            try:
+                for prj_ in prj_lst_['projects']:
+                    res.append(prj_['projectToken'])
+            except Exception as err:
+                logger.error(f"Mend API call failed. Details:{err}")
+                exit(-1)
 
     if conf.wsprojecttoken:
         res.extend(conf.wsprojecttoken.split(","))
@@ -1059,6 +1068,7 @@ def startup():
         description=varenvs.get_env("azuredesc").strip(),
         priority=varenvs.get_env("azurepriority").strip(),
         wsalert=varenvs.get_env("wsalert").strip(),
+        proxy=varenvs.get_env("proxy").strip(),
     )
     try:
         return conf
