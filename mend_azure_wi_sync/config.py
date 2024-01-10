@@ -139,13 +139,13 @@ class Config:
                     if properties[key]:
                         if type(properties[key]) is dict:
                             value = properties[key]
-                        else:
+                        elif type(properties[key]) is str:
                             if "https://" not in properties[key] and "http://" not in properties[key]:
-                                value = {"https":f"https://{properties[key]}"} if "@" in properties[key] else {"http":f"http://{properties[key]}"}
-                            elif "https://" in properties[key]:
-                                value = {"https":properties[key]}
+                                value = {"http": f"http://{properties[key]}", "https": f"http://{properties[key]}"}
                             else:
-                                value = {"http": properties[key]}
+                                value = {"http": properties[key], "https": properties[key]}
+                        else:
+                            value = {}
                     else:
                         value = {}
                 else:
