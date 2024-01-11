@@ -3,12 +3,16 @@ import inspect
 import json
 import logging
 import os
+import subprocess
+
 import requests
 import sys
 
 sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
+import warnings
+from urllib3.exceptions import InsecureRequestWarning
 
 log_fmt_debug = "[%(asctime)s] [%(levelname)s] [%(funcName)s:%(lineno)d] %(message)s"
 log_fmt_info = "[%(asctime)s] [%(levelname)s] %(message)s"
@@ -31,6 +35,7 @@ reset_back_time = 87600  # 10 years in hours
 
 conf = None
 max_wi = 100
+WARNING_MSG = False
 API_VERSION = "1.4"
 AGENT_INFO = {"agent": f"{__tool_name__.replace('_', '-')}", "agentVersion": __version__}
 DEFAULT_PRIORITY = 2
@@ -99,6 +104,10 @@ def check_patterns():
         res.append("MEND_AZUREURI")
     if conf.azure_custom and "::" not in conf.azure_custom:
         res.append(f"MEND_CUSTOMFIELDS ('{conf.azure_custom}')")
+    if conf.proxy:
+        proxy_str = try_or_error(lambda: conf.proxy['http'], try_or_error(lambda: conf.proxy['https'],""))
+        if proxy_str.count(":") < 2:
+            res.append("MEND_PROXY.(The right format is <proxy_ip>:<proxy_port>)")
     return res
 
 
@@ -131,7 +140,8 @@ def set_lastrun(lastrun: str):
         r, errorcode = call_azure_api(api_type="PATCH", api="projects/{" + azure_prj_id + "}/properties", data=data,
                                       version="7.0-preview")
         if errorcode > 0:
-            logger.error(f"[{fn()}] {r.pop()}")
+            info_el = r.popitem()
+            logger.error(f"[{fn()}] {info_el}")
             global_errors += 1
     else:
         logger.error(f"The Azure Project {conf.azure_project} was not found")
@@ -207,17 +217,58 @@ def get_prj_list_modified(fromdate: str, todate: str):
 
 
 def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST", agent_info_login=False):
+    global WARNING_MSG
     data_json = json.loads(data)
     data_json["agentInfo"] = AGENT_INFO
     if agent_info_login:
         data_json["agentInfo"]["agent"] = AGENT_INFO["agent"].replace("ps-", "ps-login-")
     try:
-        res_ = requests.request(
-            method=method,
-            url=f"{extract_url(conf.ws_url)}/api/v{API_VERSION}",
-            data=json.dumps(data_json),
-            headers=header, )
+        with warnings.catch_warnings(record=True) as warning_list:
+            warnings.simplefilter("always", InsecureRequestWarning)
+            res_ = requests.request(
+                method=method,
+                url=f"{extract_url(conf.ws_url)}/api/v{API_VERSION}",
+                data=json.dumps(data_json),
+                headers=header,
+                proxies=conf.proxy,
+                verify=False
+            )
+        if not WARNING_MSG:
+            for warning in warning_list:
+                if issubclass(warning.category, InsecureRequestWarning):
+                    index_of_see = str(warning.message).find("See:")
+                    logger.warning(str(warning.message)[:index_of_see].strip())
+                    WARNING_MSG = True
+
         res = res_.text if res_.status_code == 200 else ""
+        if res:
+            try:
+                res_check = json.loads(res_.text)
+            except:
+                temp_http_proxy = try_or_error(lambda: conf.proxy["http"], "")
+                if temp_http_proxy:
+                    with warnings.catch_warnings(record=True) as warning_list:
+                        warnings.simplefilter("always", InsecureRequestWarning)
+                        res_ = requests.request(
+                            method=method,
+                            url=f"{extract_url(conf.ws_url)}/api/v{API_VERSION}",
+                            data=json.dumps(data_json),
+                            headers=header,
+                            proxies={"http": temp_http_proxy},
+                            verify=False
+                        )
+                    if not WARNING_MSG:
+                        for warning in warning_list:
+                            if issubclass(warning.category, InsecureRequestWarning):
+                                index_of_see = str(warning.message).find("See:")
+                                logger.warning(str(warning.message)[:index_of_see].strip())
+                                WARNING_MSG = True
+
+                    res = res_.text if res_.status_code == 200 else ""
+                else:
+                    logger.error("Shutting down SSL/TLS connection. "
+                                 "Check that your proxy is appropriately configured and run again.")
+                    exit(-1)
 
     except Exception as err:
         res = f"Error was raised. {try_or_error(lambda: err.args[0].reason.args[0], '')}"
@@ -227,18 +278,56 @@ def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST"
 
 def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", project: str = "", cmd_type: str = "?",
                    header: str = "application/json-patch+json"):
-    global conf
+
+    global conf, WARNING_MSG
     errorcode = 0
     conf = startup() if not conf else conf
     conf.update_properties()
     try:
         url = f"{conf.azure_uri}_apis/{api}{cmd_type}api-version={version}" if not project else \
             f"{conf.azure_uri}{project}/_apis/{api}{cmd_type}api-version={version}"
-        res_ = requests.request(api_type, url, json=data,
-                                headers={'Content-Type': f'{header}'},
-                                auth=('', conf.azure_pat))
+        with warnings.catch_warnings(record=True) as warning_list:
+            warnings.simplefilter("always", InsecureRequestWarning)
+            res_ = requests.request(api_type, url, json=data,
+                                    headers={'Content-Type': f'{header}'},
+                                    proxies=conf.proxy,
+                                    verify=False,
+                                    auth=('', conf.azure_pat))
+        if not WARNING_MSG:
+            for warning in warning_list:
+                if issubclass(warning.category, InsecureRequestWarning):
+                    index_of_see = str(warning.message).find("See:")
+                    logger.warning(str(warning.message)[:index_of_see].strip())
+                    WARNING_MSG = True
         if res_.status_code == 200:
-            res = json.loads(res_.text)
+            try:
+                res = json.loads(res_.text)
+            except json.JSONDecodeError as e:
+                temp_http_proxy = try_or_error(lambda: conf.proxy["http"], "")
+                if temp_http_proxy:
+                    with warnings.catch_warnings(record=True) as warning_list:
+                        warnings.simplefilter("always", InsecureRequestWarning)
+                        res_ = requests.request(api_type, url, json=data,
+                                                headers={'Content-Type': f'{header}'},
+                                                proxies={"http": temp_http_proxy},
+                                                verify=False,
+                                                auth=('', conf.azure_pat))
+                    if not WARNING_MSG:
+                        for warning in warning_list:
+                            if issubclass(warning.category, InsecureRequestWarning):
+                                index_of_see = str(warning.message).find("See:")
+                                logger.warning(str(warning.message)[:index_of_see].strip())
+                                WARNING_MSG = True
+                    try:
+                        res = json.loads(res_.text)
+                    except:
+                        logger.error("Impossible to get data. "
+                                     "Check that your proxy is appropriately configured and run again.")
+                        exit(-1)
+                else:
+                    logger.error("Shutting down SSL/TLS connection. "
+                                 "Check that your proxy is appropriately configured and run again.")
+                    exit(-1)
             try:
                 msg = res['message']
                 logger.error(f"[{fn()}] Error: {msg}")
@@ -683,7 +772,8 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 try:
                     exist_wis.append({lib_name: r["id"]})
                 except Exception as err:
-                    logger.warning(f"[{ex()}] Work item creation/update failed: {r}")
+                    pass
+                    #logger.warning(f"[{ex()}] Work item creation/update failed: {r}")
 
                 status_op = "created"
             else:
@@ -701,7 +791,8 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             elif errcode == 1:
                 logger.warning(f"{conf.azure_type} creation/update failed: {r['message']}")
             else:
-                logger.error(f"[{fn()}] {r.pop()}")
+                info_el = r.popitem()
+                logger.error(f"[{fn()}] {info_el}")
         except Exception as err:
             logger.error(f"[{ex()}] Work item creation/update failed: {err}")
             global_errors += 1
@@ -959,9 +1050,12 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
                  "productToken": prd_,
                  })
             prj_lst_ = json.loads(call_ws_api(data=data))
-
-            for prj_ in prj_lst_['projects']:
-                res.append(prj_['projectToken'])
+            try:
+                for prj_ in prj_lst_['projects']:
+                    res.append(prj_['projectToken'])
+            except Exception as err:
+                logger.error(f"Mend API call failed. Details:{err}")
+                exit(-1)
 
     if conf.wsprojecttoken:
         res.extend(conf.wsprojecttoken.split(","))
@@ -1059,6 +1153,7 @@ def startup():
         description=varenvs.get_env("azuredesc").strip(),
         priority=varenvs.get_env("azurepriority").strip(),
         wsalert=varenvs.get_env("wsalert").strip(),
+        proxy=varenvs.get_env("proxy").strip(),
     )
     try:
         return conf
