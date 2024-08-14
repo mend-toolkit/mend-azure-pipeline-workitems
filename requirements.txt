@@ -14,5 +14,5 @@ tzdata~=2022.1
 urllib3~=2.1.0
 vsts~=0.1.25
 zope.interface~=6.0
-setuptools~=69.0.3
+setuptools~=72.2.0
 pytest~=7.3.1
