@@ -414,7 +414,7 @@ def update_wi_in_thread():
         conf = startup()
         conf.update_properties()
     try:
-        logger.info("Start to update Mend's data")
+        logger.info("Start to update Mend’s data")
         first_id = 0
         executed_wi = 0
         tag_lic = Tags.get_el_by_name("LICENSE")
