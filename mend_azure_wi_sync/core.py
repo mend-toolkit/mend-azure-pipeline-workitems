@@ -140,7 +140,7 @@ def set_lastrun(lastrun: str):
         r, errorcode = call_azure_api(api_type="PATCH", api="projects/{" + azure_prj_id + "}/properties", data=data,
                                       version="7.0-preview")
         if errorcode > 0:
-            info_el = r.popitem()
+            info_el = r.pop()
             logger.error(f"[{fn()}] {info_el}")
             global_errors += 1
     else:
@@ -414,7 +414,7 @@ def update_wi_in_thread():
         conf = startup()
         conf.update_properties()
     try:
-        logger.info("Start to update Mend’s data")
+        logger.info("Start to update Mend's data")
         first_id = 0
         executed_wi = 0
         tag_lic = Tags.get_el_by_name("LICENSE")
