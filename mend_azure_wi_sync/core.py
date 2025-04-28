@@ -791,7 +791,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             elif errcode == 1:
                 logger.warning(f"{conf.azure_type} creation/update failed: {r['message']}")
             else:
-                info_el = r.popitem()
+                info_el = r.pop()
                 logger.error(f"[{fn()}] {info_el}")
         except Exception as err:
             logger.error(f"[{ex()}] Work item creation/update failed: {err}")
