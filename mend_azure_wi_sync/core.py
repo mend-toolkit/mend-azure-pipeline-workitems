@@ -140,7 +140,7 @@ def set_lastrun(lastrun: str):
         r, errorcode = call_azure_api(api_type="PATCH", api="projects/{" + azure_prj_id + "}/properties", data=data,
                                       version="7.0-preview")
         if errorcode > 0:
-            info_el = r.popitem()
+            info_el = r.pop()
             logger.error(f"[{fn()}] {info_el}")
             global_errors += 1
     else:
@@ -791,7 +791,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             elif errcode == 1:
                 logger.warning(f"{conf.azure_type} creation/update failed: {r['message']}")
             else:
-                info_el = r.popitem()
+                info_el = r.pop()
                 logger.error(f"[{fn()}] {info_el}")
         except Exception as err:
             logger.error(f"[{ex()}] Work item creation/update failed: {err}")
