@@ -4,13 +4,14 @@ import json
 import logging
 import os
 import subprocess
+import re
 
 import requests
 import sys
 
 sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
-from config import *
+from config import Config, varenvs, SeverityMapping, Tags, DescAzure
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -562,6 +563,10 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 break
         return i + 1
 
+    def set_severity(cvss_score: float):
+        """Map CVSS score to Azure severity level"""
+        return SeverityMapping.get_severity_by_cvss_score(cvss_score)
+
     def analyze_fields(fld: dict, prj: list):
         val = ""
         if fld["defaultValue"]:
@@ -713,6 +718,15 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 "value": ",".join(tags)
             },
         ]
+        
+        # Add severity field if severity mapping is enabled
+        if conf.severity.lower() == "true":
+            data.append({
+                "op": azure_operation,
+                "path": "/fields/Microsoft.VSTS.Common.Severity",
+                "value": work_item_severity
+            })
+
         if conf.description == "Description":
             desc_field = "/fields/System.Description"
         elif conf.description == "ReproSteps":
@@ -893,7 +907,9 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
                                "<br><b>Vulnerable Library: </b>" + lib_name + f"<br><b> Library home page: " \
                                                                               f"</b><a href='{lib_home_page}'>{lib_home_page}</a>" + lic_data
+                        work_item_severity = SeverityMapping.NONE.value[0]
                     else:
+                        work_item_severity = set_severity(try_or_error(lambda: float(max_severity), 0)) if conf.severity.lower() == "true" else SeverityMapping.NONE.value[0]
                         table_data = []
                         for i, policy_el in enumerate(prj_el["policyViolations"]):
                             vul_name = f"License Policy Violation" if is_license else \
@@ -1152,6 +1168,7 @@ def startup():
         reponame=varenvs.get_env("wsreponame").strip(),
         description=varenvs.get_env("azuredesc").strip(),
         priority=varenvs.get_env("azurepriority").strip(),
+        severity=varenvs.get_env("azureseverity").strip(),
         wsalert=varenvs.get_env("wsalert").strip(),
         proxy=varenvs.get_env("proxy").strip(),
     )

@@ -21,6 +21,29 @@ class DescAzure(Enum):
         return ""
 
 
+class SeverityMapping(Enum):
+    """Maps CVSS 3 scores to Azure Work Item severity levels"""
+    CRITICAL = ("1 - Critical", 9.0, 10.0)
+    HIGH = ("2 - High", 7.0, 8.9)
+    MEDIUM = ("3 - Medium", 4.0, 6.9)
+    LOW = ("4 - Low", 0.1, 3.9)
+    NONE = ("", 0.0, 0.0)
+
+    @classmethod
+    def get_severity_by_cvss_score(cls, cvss_score: float):
+        """Map CVSS 3 score to Azure severity level"""
+        try:
+            score_value = float(cvss_score)
+            for member in cls:
+                min_score = member.value[1]
+                max_score = member.value[2]
+                if min_score <= score_value <= max_score:
+                    return member.value[0]
+        except (ValueError, TypeError):
+            pass
+        return cls.NONE.value[0]
+
+
 class varenvs(Enum):  # Lit of Env.variables
     wsuserkey = ("WS_USERKEY", "MEND_USERKEY")
     wsapikey = ("MEND_APIKEY","WS_APIKEY","WS_TOKEN")
@@ -39,6 +62,7 @@ class varenvs(Enum):  # Lit of Env.variables
     wsreponame = ("WS_REPONAME","MEND_REPONAME")
     azuredesc = ("WS_DESCRIPTION","MEND_DESCRIPTION")
     azurepriority = ("WS_CALCULATEPRIORITY", "MEND_CALCULATEPRIORITY")
+    azureseverity = ("WS_CALCULATESEVERITY", "MEND_CALCULATESEVERITY")
     wsalert = ("WS_ALERT", "MEND_ALERT")
     proxy = ("PROXY", "MEND_PROXY")
 
@@ -93,6 +117,7 @@ class Config:
     reponame: str
     description: str
     priority: str
+    severity: str
     wsalert: str
     proxy: str
 
@@ -116,6 +141,7 @@ class Config:
             "wsreponame" : self.reponame,
             "azuredesc" : self.description,
             "azurepriority" : self.priority,
+            "azureseverity" : self.severity,
             "wsalert" : self.wsalert,
             "proxy" : self.proxy
         }
