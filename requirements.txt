@@ -15,4 +15,4 @@ urllib3~=2.1.0
 vsts~=0.1.25
 zope.interface~=6.0
 setuptools~=69.0.3
-pytest~=7.3.1
+pytest~=7.4.4
