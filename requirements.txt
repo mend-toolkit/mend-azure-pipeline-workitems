@@ -1,5 +1,5 @@
 certifi~=2023.11.17
-charset-normalizer~=3.0.1
+charset-normalizer~=3.5.1
 DateTime~=5.1
 idna~=3.4
 isodate~=0.6.1
