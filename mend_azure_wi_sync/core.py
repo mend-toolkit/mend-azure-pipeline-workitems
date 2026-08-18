@@ -12,7 +12,7 @@ sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
-                     SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN)
+                     SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -102,6 +102,11 @@ def check_patterns():
                 break
     if not conf.azure_project:
         res.append("MEND_AZUREPROJECT")
+    elif "/" in conf.azure_project:
+        # Azure reads "{project}/{team}" and returns HTTP 500 — this is almost always a
+        # $(System.TeamProject)-style value that picked up a team suffix by mistake.
+        res.append(f"MEND_AZUREPROJECT ('{conf.azure_project}') must not contain '/' "
+                   f"— Azure DevOps parses this as '{{project}}/{{team}}'")
     if not conf.azure_pat:
         res.append("MEND_AZUREPAT")
     if not conf.ws_url:
@@ -787,8 +792,17 @@ def update_wi_in_thread():
     results = []
     for azure_project in routed_targets:
         conf.azure_project = azure_project
+        failed_before = run_failed
         result = update_wi_for_project()
         results.append(f"{azure_project}: {result}")
+        if run_failed and not failed_before:
+            # This target's own reverse sync failed (WIQL, hydration, or an exception).
+            # Its watermark must stay put so the retry can recover the missed window —
+            # otherwise the global watermark being withheld (below) cannot help this
+            # target, because its per-target watermark already moved.
+            logger.error(f"Not advancing Lastrun for {azure_project}: its reverse sync "
+                         f"did not complete.")
+            continue
         # Only now is this target's window safe to close: the forward sync created its work
         # items and the reverse sync has just read the old watermark.
         # utc_delta, like every other reader and writer of this property (azure_wi_sync.py:54,
@@ -1392,6 +1406,12 @@ def sync_had_fatal_error() -> bool:
     return run_failed
 
 
+def error_count() -> int:
+    # Mirrors sync_had_fatal_error(): azure_wi_sync.py must call this rather than import
+    # global_errors by value, or its "completed successfully" check is frozen at 0 forever.
+    return global_errors
+
+
 def expand_product_tokens(producttoken: str) -> list:
     # Shared by the legacy and routed paths. Two deliberate behaviour changes from the
     # inline block this replaces:
@@ -1493,14 +1513,22 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
 
     report = coverage_report(outcomes)
     routed = len([o for o in outcomes.values() if o == SKIP_OK])
-    if outcomes and not routed:
-        # Zero coverage is never normal once anything is tagged. This must also be FATAL:
-        # logging at ERROR alone still lets main() advance the global watermark and print
-        # "completed successfully" with exit 0, because global_errors is imported by value.
+    # scope-excluded, out-of-scope and branch-filtered are deliberate outcomes — the last
+    # is "the normal state during rollout" per routing.py — so a run made up entirely of
+    # those must not be fatal. Only count outcomes that actually reached a routing decision.
+    considered = [o for o in outcomes.values()
+                  if o not in (SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_BRANCH)]
+    if considered and not routed:
+        # Zero coverage among projects that reached a routing decision is never normal.
+        # This must also be FATAL: logging at ERROR alone still lets main() advance the
+        # global watermark and print "completed successfully" with exit 0, because
+        # global_errors is imported by value.
         global_errors += 1
         run_failed = True
         logger.error(f"{report} — nothing routed. Check MEND_BRANCHES "
                      f"('{conf.branches}') and the scan template's tag keys.")
+    elif outcomes and not routed:
+        logger.warning(f"{report} — nothing routed this window.")
     else:
         logger.info(report)
     for token, outcome in sorted(outcomes.items()):

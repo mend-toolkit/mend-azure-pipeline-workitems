@@ -131,6 +131,14 @@ jobs:
           # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
+      - name: Test with pytest
+        id: test_with_pytest
+        working-directory: ${{ env.APP_PWD }}
+        run: |
+          # pytest.ini's addopts already deselects tests marked "live" (they hit real
+          # Mend/Azure DevOps APIs and need real credentials) — nothing extra to pass here.
+          pytest
+
       - name: Create wheel Package
         id: create_whl
         working-directory: ${{ env.APP_PWD }}

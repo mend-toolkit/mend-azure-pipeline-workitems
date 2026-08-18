@@ -84,6 +84,56 @@ def test_untagged_project_is_never_synced():
     assert "tok-c" not in created
 
 
+def test_run_is_not_fatal_when_every_outcome_is_a_deliberate_skip():
+    """CRITICAL 2: scope-excluded, out-of-scope and branch-filtered are deliberate
+    outcomes — branch-filtered is "the normal state during rollout" per routing.py's own
+    comment. A pilot window where only other projects changed must not exit fatally just
+    because nothing routed here."""
+    conf = _conf(exclude="tok-excluded")
+    tags = {
+        "tok-excluded": [{"key": "azure-project", "value": "Platform"},
+                         {"key": "azure-repo", "value": "api"},
+                         {"key": "azure-branch", "value": "refs/heads/main"}],
+        "tok-branch-filtered": [{"key": "azure-project", "value": "Platform"},
+                                {"key": "azure-repo", "value": "cli"},
+                                {"key": "azure-branch", "value": "refs/heads/develop"}],
+    }
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=list(tags)), \
+         mock.patch.object(core, "fetch_project_tags", return_value=tags), \
+         mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "set_lastrun", return_value=0):
+        try:
+            core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    assert core.sync_had_fatal_error() is False
+
+
+def test_run_is_still_fatal_when_zero_routed_outcomes_are_genuine():
+    """CRITICAL 2, other half: no-target/schema-fault are real misconfigurations, not
+    deliberate skips, so a run made up entirely of those and zero routed targets must
+    still trip the fatal path."""
+    conf = _conf()
+    tags = {"tok-untagged": []}
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=list(tags)), \
+         mock.patch.object(core, "fetch_project_tags", return_value=tags), \
+         mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "set_lastrun", return_value=0):
+        try:
+            core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    assert core.sync_had_fatal_error() is True
+
+
 def test_collided_token_reaches_a_loud_outcome_not_the_quiet_no_target_bucket():
     # fetch_project_tags returns a per-token None (not []) when the (product, project)
     # name pair collided in /entities and the join is ambiguous. That must classify as

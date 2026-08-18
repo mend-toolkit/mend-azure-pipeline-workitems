@@ -61,3 +61,15 @@ def test_check_patterns_rejects_an_empty_branch_list():
     with mock.patch.object(core, "conf", _valid_conf(routing="true", email="a@b.c",
                                                      branches="")):
         assert any("BRANCHES" in el for el in core.check_patterns())
+
+
+def test_check_patterns_rejects_a_slash_in_azure_project():
+    """Azure reads 'MyProject/MyTeam' as {project}/{team} and returns HTTP 500. This is
+    almost always a $(System.TeamProject)-style value that picked up a team suffix."""
+    with mock.patch.object(core, "conf", _valid_conf(azure_project="Platform/MyTeam")):
+        assert any("AZUREPROJECT" in el for el in core.check_patterns())
+
+
+def test_check_patterns_accepts_an_azure_project_without_a_slash():
+    with mock.patch.object(core, "conf", _valid_conf(azure_project="Platform")):
+        assert not any("AZUREPROJECT" in el for el in core.check_patterns())

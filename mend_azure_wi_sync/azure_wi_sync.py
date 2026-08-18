@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _version import __tool_name__, __version__, __description__
 from core import run_sync, update_wi_in_thread, startup, get_lastrun, set_lastrun, load_wi_json, AGENT_INFO, \
-    check_patterns, global_errors, sync_had_fatal_error
+    check_patterns, sync_had_fatal_error, error_count
 
 logger = logging.getLogger(__tool_name__)
 logging.getLogger('urllib3').setLevel(logging.INFO)
@@ -65,10 +65,11 @@ def main():
         logger.error("Sync process FAILED. Please look at the log.")
         exit(1)
     set_lastrun(now.strftime("%Y-%m-%d %H:%M:%S"))
-    if global_errors == 0:
+    errors = error_count()
+    if errors == 0:
         logger.info("Sync process completed successfully")
     else:
-        logger.info(f"Sync process finished with {global_errors} errors. Please, looks at the log.")
+        logger.info(f"Sync process finished with {errors} errors. Please, looks at the log.")
 
 
 if __name__ == '__main__':
