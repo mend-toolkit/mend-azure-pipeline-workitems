@@ -11,6 +11,8 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
+from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
+                     SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN)
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -45,6 +47,7 @@ token_pattern = r"^[0-9a-zA-Z]{64}$"
 azurearea = r"^[0-9a-zA-Z\s\-_]+$"
 global_errors = 0
 exist_wis = []
+routed_targets = []
 updated_wi = []
 run_failed = False
 mend_v2_session = None  # SessionInfo dict from POST /api/v2.0/login; JWT lives 10 minutes
@@ -1338,28 +1341,175 @@ def sync_had_fatal_error() -> bool:
     return run_failed
 
 
+def expand_product_tokens(producttoken: str) -> list:
+    # Shared by the legacy and routed paths. Two deliberate behaviour changes from the
+    # inline block this replaces:
+    #   1. No exit(-1) on failure — under routing, one bad product token must not kill
+    #      every other target in the run.
+    #   2. json.loads(call_ws_api(...)) is now inside the try. In the original it sat
+    #      outside, so a non-200 from Mend returned "" and raised an uncaught
+    #      JSONDecodeError instead of the graceful failure this refactor exists to give.
+    res = []
+    for prd_ in producttoken.split(","):
+        data = json.dumps({"requestType": "getAllProjects",
+                           "userKey": conf.ws_user_key,
+                           "orgToken": conf.ws_org_token,
+                           "productToken": prd_})
+        try:
+            prj_lst_ = json.loads(call_ws_api(data=data))
+            for prj_ in prj_lst_['projects']:
+                res.append(prj_['projectToken'])
+        except Exception as err:
+            logger.error(f"Mend API call failed. Details:{err}")
+            return None
+    return res
+
+
+def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom_flds: list,
+                    wi_type: str):
+    global exist_wis, global_errors, routed_targets, run_failed
+    # conf.azure_project, conf.reponame and conf.azure_area are all re-pointed per target
+    # below and must be restored: main() still uses conf.azure_project for bookkeeping, and
+    # create_area mutates azure_area cumulatively.
+    original_azure_project = conf.azure_project
+    original_reponame = conf.reponame
+    original_azure_area = conf.azure_area
+
+    tags = fetch_project_tags(modified_projects)
+    if tags is None:
+        global_errors += 1
+        run_failed = True
+        return "Aborted: could not read Mend project tags."
+
+    known = list_azure_projects()
+    if known is None:
+        global_errors += 1
+        run_failed = True
+        return "Aborted: could not list Azure DevOps projects."
+    # Azure project names are matched case-insensitively for lookup, but classify()'s
+    # known_projects membership test is deliberately exact-string (routing.py stays dumb).
+    # Normalise here, the only place that sees both the real Azure names and the raw tag
+    # value, by rewriting each route's azure_project to the canonically-cased name before
+    # classify() ever runs — that keeps classify()'s exact-match contract intact.
+    known_by_casefold = {name.casefold(): name for name in known}
+
+    # Tokens stop selecting targets and become scope narrowing, so a pilot can be limited
+    # and MEND_EXCLUDETOKEN keeps working. Absent config narrows nothing.
+    narrowed = set(modified_projects)
+    scope = set()
+    if conf.wsproducttoken:
+        expanded = expand_product_tokens(conf.wsproducttoken)
+        if expanded is None:
+            # Failing to expand must never widen scope. An empty `scope` skips narrowing
+            # entirely, which would route all ~400 projects and evaporate the pilot limit.
+            global_errors += 1
+            run_failed = True
+            return "Aborted: could not expand MEND_PRODUCTTOKEN; refusing to widen scope."
+        scope.update(expanded)
+    if conf.wsprojecttoken:
+        scope.update(conf.wsprojecttoken.split(","))
+    if scope:
+        narrowed &= scope
+    excluded = set([t for t in conf.wsexcludetoken.split(",") if t]) & set(modified_projects)
+    narrowed -= excluded
+
+    # Distinguish the two reasons a project is out of scope: an operator excluded it on
+    # purpose, versus it simply not being in the pilot's product/project scope.
+    preset = {t: SKIP_EXCLUDED for t in excluded}
+    preset.update({t: SKIP_OUT_OF_SCOPE
+                   for t in (set(modified_projects) - narrowed) - excluded})
+
+    # A per-token None from fetch_project_tags means the (product, project) name pair
+    # collided in /entities and the join is ambiguous — distinct from a genuinely
+    # untagged project ([]). That must surface loudly (SKIP_UNKNOWN, in LOUD_OUTCOMES),
+    # never fall into the quiet no-target bucket that an empty route would produce.
+    collided = set()
+    routes = {}
+    for token in modified_projects:
+        per_token_tags = tags.get(token)
+        if per_token_tags is None:
+            collided.add(token)
+            per_token_tags = []
+        route = parse_route(per_token_tags)
+        if route.azure_project:
+            route.azure_project = known_by_casefold.get(route.azure_project.casefold(),
+                                                         route.azure_project)
+        routes[token] = route
+    for token in collided:
+        preset.setdefault(token, SKIP_UNKNOWN)
+
+    targets, outcomes = build_table(routes, known, conf.branches, preset=preset)
+
+    report = coverage_report(outcomes)
+    routed = len([o for o in outcomes.values() if o == SKIP_OK])
+    if outcomes and not routed:
+        # Zero coverage is never normal once anything is tagged. This must also be FATAL:
+        # logging at ERROR alone still lets main() advance the global watermark and print
+        # "completed successfully" with exit 0, because global_errors is imported by value.
+        global_errors += 1
+        run_failed = True
+        logger.error(f"{report} — nothing routed. Check MEND_BRANCHES "
+                     f"('{conf.branches}') and the scan template's tag keys.")
+    else:
+        logger.info(report)
+    for token, outcome in sorted(outcomes.items()):
+        if outcome in LOUD_OUTCOMES:
+            logger.error(f"Mend project {token}: {outcome} "
+                         f"(destination '{routes[token].azure_project}')")
+    unknown = len([o for o in outcomes.values() if o == SKIP_UNKNOWN])
+    if unknown and routed and unknown >= routed:
+        # Many unknown targets is more likely a PAT that cannot see those projects than
+        # that many bad tags. We cannot prove it — call_azure_api collapses 403 and 404.
+        logger.error(f"{unknown} destinations were not found in the organization. If they "
+                     f"exist, the PAT may lack visibility into them.")
+
+    # Populated as targets SUCCEED, not up front: the reverse sync uses this list to decide
+    # whose Lastrun to advance, and a failed target must not have its window closed.
+    routed_targets = []
+    synced = 0
+    for azure_project in sorted(targets):
+        # Each Azure project is its own failure boundary: one bad target must not cost the
+        # other 106. Backlog #6 owns turning this into a real per-target result object.
+        conf.azure_project = azure_project
+        conf.azure_area = original_azure_area
+        exist_wis = get_exist_wi()
+        if exist_wis is None:
+            global_errors += 1
+            run_failed = True
+            exist_wis = []
+            logger.error(f"Skipping Azure project '{azure_project}': could not read "
+                         f"existing work items. Lastrun will not advance for it.")
+            continue
+        for token, route in targets[azure_project]:
+            conf.reponame = route.repo
+            logger.info(create_wi(token, st_date, end_date, custom_flds, wi_type))
+            synced += 1
+        routed_targets.append(azure_project)
+        # Deliberately NO set_lastrun here. Lastrun is read by the reverse sync, which runs
+        # after this (azure_wi_sync.py:60). Writing it now would close the window before it
+        # is read and the reverse sync would push nothing back to Mend. Task 12 writes it.
+
+    conf.azure_project = original_azure_project
+    conf.reponame = original_reponame
+    conf.azure_area = original_azure_area
+    return f"{coverage_report(outcomes)}; {synced} Mend project(s) synced"
+
+
 def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     global exist_wis, global_errors, run_failed
     run_failed = False
     res = []
     logger.info("Getting a modified project list")
     modified_projects = get_prj_list_modified(st_date, end_date)
+    logger.info(f"Selection mode: {'tag-based routing' if conf.routing.lower() == 'true' else 'token list'}")
+    if conf.routing.lower() == "true":
+        return run_sync_routed(modified_projects, st_date, end_date, custom_flds, wi_type)
     if conf.wsproducttoken:
-        prd_list = conf.wsproducttoken.split(",")
-        for prd_ in prd_list:
-            data = json.dumps(
-                {"requestType": "getAllProjects",
-                 "userKey": conf.ws_user_key,
-                 "orgToken": conf.ws_org_token,
-                 "productToken": prd_,
-                 })
-            prj_lst_ = json.loads(call_ws_api(data=data))
-            try:
-                for prj_ in prj_lst_['projects']:
-                    res.append(prj_['projectToken'])
-            except Exception as err:
-                logger.error(f"Mend API call failed. Details:{err}")
-                exit(-1)
+        expanded = expand_product_tokens(conf.wsproducttoken)
+        if expanded is None:
+            logger.error("Mend API call failed while expanding MEND_PRODUCTTOKEN.")
+            exit(-1)
+        res.extend(expanded)
 
     if conf.wsprojecttoken:
         res.extend(conf.wsprojecttoken.split(","))
