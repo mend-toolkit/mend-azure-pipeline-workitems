@@ -767,6 +767,15 @@ def update_wi_in_thread():
         return f"[{ex()}] Update Mend's data failed: {err}"
 
 
+def build_wi_tags(project_tag: str, policy_tag: str, routing: str, reponame: str) -> list:
+    # Repo identity is a work item tag because the client declined Area Path. Taking the
+    # values as arguments keeps this testable without constructing a whole Config.
+    tags = [project_tag, policy_tag]
+    if routing.lower() == "true" and reponame:
+        tags.append(reponame)
+    return tags
+
+
 def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: str):
     def dep_hierarchy(key_uuid):
         def get_dependencies(dependencies):
@@ -1115,7 +1124,9 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             lib_name = prj_el["library"]["filename"]
             policy_lic_name = try_or_error(
                 lambda: prj_el['policy']['name'][prj_el['policy']['name'].find("]") + 1:].strip(), "")
-            tags = [f"{prd_name}/{prj_name}", Tags.get_el_by_name(prj_el["policy"]["policyMatch"]["type"])]
+            tags = build_wi_tags(f"{prd_name}/{prj_name}",
+                                 Tags.get_el_by_name(prj_el["policy"]["policyMatch"]["type"]),
+                                 conf.routing, conf.reponame)
             key_uuid = try_or_error(lambda: prj_el['library']['keyUuid'], "")
             path_dep, path_lib = get_pathes(key_uuid)
             list_dep_lib = dep_hierarchy(key_uuid=key_uuid)
