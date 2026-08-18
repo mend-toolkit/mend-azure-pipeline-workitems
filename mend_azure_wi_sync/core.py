@@ -405,8 +405,12 @@ def tag_set(raw_tags: str) -> set:
 
 
 def check_wi_id(id: str, project_name: str):
+    def owns(entry):
+        # entry is {work_item_id: raw_tags}; a malformed entry must skip, not abort the search.
+        return try_or_error(lambda: project_name in tag_set(''.join(entry.values())), False)
+
     try:
-        values = [d[id] for d in exist_wis if id in d and project_name in ''.join(d[id].values())]
+        values = [d[id] for d in exist_wis if id in d and owns(d[id])]
         res = try_or_error(lambda: max(values, key=lambda x: list(x.keys())[0]), 0)
         if type(res) is dict:
             return list(res.keys())[0]
