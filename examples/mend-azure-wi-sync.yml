@@ -46,3 +46,6 @@ steps:
     MEND_DESCRIPTION : $(MEND_DESCRIPTION)
     MEND_CALCULATEPRIORITY : $(MEND_CALCULATEPRIORITY)
     MEND_ALERT : $(MEND_ALERT)
+    # Tag-based routing to multiple Azure projects (optional — requires Mend API 2.0)
+    # MEND_ROUTING: $(MEND_ROUTING)
+    # MEND_BRANCHES: $(MEND_BRANCHES)
