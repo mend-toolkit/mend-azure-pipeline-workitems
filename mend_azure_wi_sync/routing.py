@@ -33,8 +33,12 @@ def parse_route(tags) -> Route:
     for raw in (tags or []):
         if not isinstance(raw, dict):
             continue
-        key = (raw.get("key") or "").strip().lower()
-        value = (raw.get("value") or "").strip()
+        key = raw.get("key")
+        value = raw.get("value")
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        key = key.strip().lower()
+        value = value.strip()
         attr = TAG_KEYS.get(key)
         if attr and value:
             setattr(route, attr, value)

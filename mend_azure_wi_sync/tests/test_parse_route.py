@@ -51,3 +51,21 @@ def test_repeated_key_takes_the_last_value():
     route = parse_route([{"key": "azure-project", "value": "Old"},
                          {"key": "azure-project", "value": "New"}])
     assert route.azure_project == "New"
+
+
+def test_non_string_key_is_skipped_not_fatal():
+    route = parse_route([{"key": 123, "value": "Platform"}])
+    assert route.azure_project == ""
+
+
+def test_non_string_value_is_skipped_not_fatal():
+    route = parse_route([{"key": "azure-project", "value": 123}])
+    assert route.azure_project == ""
+
+
+def test_non_string_entry_before_a_good_entry_does_not_clobber_it():
+    route = parse_route([{"key": "azure-schema", "value": 1},
+                         {"key": "azure-project", "value": 123},
+                         {"key": "azure-project", "value": "Platform"}])
+    assert route.azure_project == "Platform"
+    assert route.schema == ""
