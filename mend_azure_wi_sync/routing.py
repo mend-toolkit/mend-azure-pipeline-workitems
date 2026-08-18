@@ -43,3 +43,19 @@ def parse_route(tags) -> Route:
         if attr and value:
             setattr(route, attr, value)
     return route
+
+
+def branch_allowed(branch_ref: str, patterns: str) -> bool:
+    # The tag carries a full ref (refs/heads/release/1.2) because $(Build.SourceBranchName)
+    # returns only the final path segment and cannot express "release/*". Strip the ref
+    # prefix here so the configured patterns stay readable.
+    name = (branch_ref or "").strip()
+    if not name:
+        return False
+    if name.startswith("refs/heads/"):
+        name = name[len("refs/heads/"):]
+    for pattern in (patterns or "").split(","):
+        pattern = pattern.strip()
+        if pattern and fnmatch.fnmatch(name, pattern):
+            return True
+    return False
