@@ -45,6 +45,7 @@ azurearea = r"^[0-9a-zA-Z\s\-_]+$"
 global_errors = 0
 exist_wis = []
 updated_wi = []
+mend_v2_session = None  # SessionInfo dict from POST /api/v2.0/login; JWT lives 10 minutes
 
 
 def fn():
@@ -115,6 +116,10 @@ def check_patterns():
         # so without this every project is skipped silently.
         res.append("MEND_BRANCHES must list at least one branch pattern when "
                    "MEND_ROUTING is enabled")
+    if conf.routing.lower() == "true" and not conf.email:
+        # Mend API 2.0 login (used by routing's paged sweep) requires an email; there is
+        # no default, so this must be caught here rather than surfacing as a login failure.
+        res.append("MEND_EMAIL must be set when MEND_ROUTING is enabled")
     return res
 
 
@@ -301,6 +306,68 @@ def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST"
         res = f"Error was raised. {try_or_error(lambda: err.args[0].reason.args[0], '')}"
         logger.error(f'[{ex()}] {err}')
     return res
+
+
+def _post_v2_login():
+    # Split out so tests can stub the transport without mocking requests itself.
+    # conf.api_url, NOT conf.ws_url: 2.0 lives on api-saas.mend.io while 1.4 lives on the
+    # SCA app host. See the spec's servers block.
+    url = f"{extract_url(conf.api_url)}/api/v2.0/login"
+    body = {"email": conf.email, "userKey": conf.ws_user_key, "orgToken": conf.ws_org_token}
+    try:
+        res_ = requests.post(url, json=body, verify=False, proxies=conf.proxy,
+                             headers={"Content-Type": "application/json"})
+        return (json.loads(res_.text), 0) if res_.status_code == 200 \
+            else (try_or_error(lambda: json.loads(res_.text), {}), 2)
+    except Exception as err:
+        return {f"[{ex()}] Mend 2.0 login failed": f"{err}"}, 2
+
+
+def mend_v2_token() -> str:
+    # Cached for the process. The JWT is valid for 10 minutes and all 2.0 use in this tool
+    # is one burst at the start of a run, so expiry is handled by a single retry in
+    # call_ws_api_v2 rather than by refresh-token plumbing.
+    global mend_v2_session
+    if mend_v2_session:
+        return try_or_error(lambda: mend_v2_session["retVal"]["jwtToken"], "")
+    payload, errorcode = _post_v2_login()
+    if errorcode != 0:
+        logger.error(f"[{fn()}] Mend API 2.0 login failed: {payload}")
+        return ""
+    token = try_or_error(lambda: payload["retVal"]["jwtToken"], "")
+    if token:
+        mend_v2_session = payload
+    return token
+
+
+def _get_v2(url: str, token: str, params: dict):
+    try:
+        res_ = requests.get(url, params=params or {}, verify=False, proxies=conf.proxy,
+                            headers={"Authorization": f"Bearer {token}",
+                                     "Content-Type": "application/json"})
+        if res_.status_code == 200:
+            return json.loads(res_.text), 0
+        return try_or_error(lambda: json.loads(res_.text), {}), res_.status_code
+    except Exception as err:
+        return {f"[{ex()}] Mend 2.0 call failed": f"{err}"}, 2
+
+
+def call_ws_api_v2(api: str, params: dict = None):
+    # Returns (payload, errorcode) with the same convention as call_azure_api:
+    # 0 = success, non-zero = failure. One re-login covers a JWT that expired mid-run.
+    global mend_v2_session
+    url = f"{extract_url(conf.api_url)}/api/v2.0/{api}"
+    payload, errorcode = _get_v2(url, mend_v2_token(), params)
+    if errorcode in (401, 403):
+        # The JWT lives 10 minutes. The spec documents no 401 anywhere, so an expired token
+        # most plausibly surfaces as 403 — retry both. A real permission denial costs one
+        # wasted re-login and still fails, which is the right trade.
+        mend_v2_session = None
+        payload, errorcode = _get_v2(url, mend_v2_token(), params)
+    if errorcode != 0:
+        logger.error(f"[{fn()}] Mend 2.0 call to '{api}' failed: {payload}")
+        errorcode = 2
+    return payload, errorcode
 
 
 def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", project: str = "", cmd_type: str = "?",

@@ -36,9 +36,10 @@ import pytest
 def reset_core_globals():
     """core.py holds mutable module globals that leak between tests."""
     from mend_azure_wi_sync import core
-    saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf)
+    saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session)
     core.exist_wis = []
     core.updated_wi = []
     core.global_errors = 0
+    core.mend_v2_session = None
     yield
-    core.exist_wis, core.updated_wi, core.global_errors, core.conf = saved
+    core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session = saved
