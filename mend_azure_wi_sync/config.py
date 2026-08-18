@@ -152,7 +152,11 @@ class Config:
                 elif key == "dependency":
                     value = "True" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "reponame":
-                    value = self.azure_project if not properties[key] else properties[key]
+                    # Under routing this is set per Mend project from the scan tag, and
+                    # update_properties runs on every Azure call — backfilling it here would
+                    # overwrite an intentionally empty value with the Azure project name.
+                    value = properties[key] if (properties[key] or self.routing.lower() == "true") \
+                        else self.azure_project
                 elif key == "description":
                     value = DescAzure.get_name_by_value(self.azure_type) if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "routing":
