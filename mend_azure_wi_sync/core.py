@@ -291,6 +291,7 @@ def _resolve_project_names(tokens: list):
             projects = json.loads(call_ws_api(data=json.dumps(
                 {"requestType": "getAllProjects",
                  "userKey": conf.ws_user_key,
+                 "orgToken": conf.ws_org_token,
                  "productToken": prd_token,
                  })))["projects"]
         except Exception as err:
@@ -304,11 +305,18 @@ def _resolve_project_names(tokens: list):
 
 
 def fetch_project_tags(tokens: list) -> dict:
-    """Map Mend project token -> list of tag objects ({key|namespace, value}).
+    """Map Mend project token -> list of tag objects ({key|namespace, value}), per token, one of:
 
-    A token with no tags must appear in the result with an empty list, so the caller can
-    distinguish "scanned but untagged" (no-target) from "not in this run" (absent).
-    Returns None if the Mend call failed, matching the get_exist_wi failure convention.
+    - Resolved and scanned with tags -> the tag list.
+    - Resolved but scanned with no tags, or absent from /entities, or unresolvable to a
+      (product, project) name pair -> [] ("no-target": scanned/known but nothing to route on).
+    - Resolved to a (product, project) name pair that collided with another project's in
+      /entities -> None (ambiguous: ownership of the tags cannot be determined, so this must
+      not be confused with a genuinely untagged project — see the duplicate-name-pair guard
+      below). This is a per-token value, distinct from the function returning None outright.
+
+    Returns None (the whole call, not a per-token value) if the Mend call failed, matching the
+    get_exist_wi failure convention.
 
     1.4 project tokens and 2.0 /entities uuids are different identifier spaces (verified live:
     0 of 25 matched), so the join is done on (productName, projectName) instead — the same pair
@@ -319,6 +327,7 @@ def fetch_project_tags(tokens: list) -> dict:
         return None
 
     tags_by_name = {}
+    collided_names = set()
     page = 0
     page_size = 1000
     while True:
@@ -338,11 +347,12 @@ def fetch_project_tags(tokens: list) -> dict:
             row_tags = try_or_error(lambda: project["tags"], [])
             if key in tags_by_name:
                 # A duplicate (product, project) name pair makes the join ambiguous. Report it
-                # loudly and mark it unusable rather than silently picking one of the two.
+                # loudly and mark it unusable rather than silently picking one of the two — the
+                # per-token result below surfaces this as None, distinct from a plain [].
                 logger.error(f"[{fn()}] Duplicate Mend project name pair "
                              f"'{product_name}/{project_name}' seen in /entities; refusing to "
                              f"guess which one owns the routing tags.")
-                tags_by_name[key] = None
+                collided_names.add(key)
             else:
                 tags_by_name[key] = row_tags
         # isLastPage is documented as a string ("true"/"false") but has been observed live as a
@@ -356,8 +366,12 @@ def fetch_project_tags(tokens: list) -> dict:
     result = {}
     for token in tokens:
         name = names.get(token)
-        row_tags = tags_by_name.get(name) if name else None
-        result[token] = row_tags if row_tags else []
+        if name is None:
+            result[token] = []
+        elif name in collided_names:
+            result[token] = None
+        else:
+            result[token] = tags_by_name.get(name, [])
     return result
 
 

@@ -111,9 +111,10 @@ def test_failed_name_resolution_returns_none_and_skips_the_entities_call():
     api.assert_not_called()
 
 
-def test_duplicate_name_pair_is_reported_loudly_and_treated_as_unusable():
+def test_duplicate_name_pair_is_reported_loudly_and_returns_none_for_that_token():
     """Two /entities rows sharing the same (product, project) name must not let the join
-    silently pick one of them for a token that resolves to that pair."""
+    silently pick one of them for a token that resolves to that pair. The collision must be
+    distinguishable from a genuinely untagged project, so the per-token value is None, not []."""
     dup_a = [{"key": "azure-project", "value": "A"}]
     dup_b = [{"key": "azure-project", "value": "B"}]
     page = {"retVal": [_entity("Product X", "Project X", dup_a),
@@ -125,8 +126,87 @@ def test_duplicate_name_pair_is_reported_loudly_and_treated_as_unusable():
          mock.patch.object(core, "call_ws_api_v2", return_value=(page, 0)), \
          mock.patch.object(core, "logger") as logger:
         result = core.fetch_project_tags(["tok-a"])
-    assert result == {"tok-a": []}
+    assert result == {"tok-a": None}
     assert logger.error.called
+
+
+def test_collided_token_is_none_while_an_ordinary_untagged_token_in_the_same_response_is_empty():
+    """The three-state contract in one response: a collision must not contaminate an unrelated,
+    genuinely-untagged project's result, and the two must remain distinguishable."""
+    dup_a = [{"key": "azure-project", "value": "A"}]
+    dup_b = [{"key": "azure-project", "value": "B"}]
+    page = {"retVal": [_entity("Product X", "Project X", dup_a),
+                       _entity("Product X", "Project X", dup_b),
+                       _entity("Product Y", "Project Y", [])],
+           "additionalData": {"isLastPage": True}}
+    names = {"tok-collided": ("Product X", "Project X"), "tok-plain": ("Product Y", "Project Y")}
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "_resolve_project_names", return_value=names), \
+         mock.patch.object(core, "call_ws_api_v2", return_value=(page, 0)):
+        result = core.fetch_project_tags(["tok-collided", "tok-plain"])
+    assert result["tok-collided"] is None
+    assert result["tok-plain"] == []
+
+
+# ---------------------------------------------------------------------------
+# isLastPage permutations — pinned individually against a full-size page so the flag's own
+# branch (not the belt-and-braces short-row fallback) is what each test proves.
+# ---------------------------------------------------------------------------
+
+_ABSENT = object()
+
+
+def _full_page(is_last_page_value):
+    rows = [_entity(f"P{i}", f"J{i}", []) for i in range(1000)]
+    additional_data = {} if is_last_page_value is _ABSENT else {"isLastPage": is_last_page_value}
+    return {"retVal": rows, "additionalData": additional_data}
+
+
+def test_is_last_page_bool_true_stops_the_sweep():
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "_resolve_project_names", return_value={}), \
+         mock.patch.object(core, "call_ws_api_v2",
+                           return_value=(_full_page(True), 0)) as api:
+        core.fetch_project_tags([])
+    assert api.call_count == 1
+
+
+def test_is_last_page_bool_false_continues_the_sweep():
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "_resolve_project_names", return_value={}), \
+         mock.patch.object(core, "call_ws_api_v2",
+                           side_effect=[(_full_page(False), 0), (_full_page(True), 0)]) as api:
+        core.fetch_project_tags([])
+    assert api.call_count == 2
+
+
+def test_is_last_page_string_true_stops_the_sweep():
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "_resolve_project_names", return_value={}), \
+         mock.patch.object(core, "call_ws_api_v2",
+                           return_value=(_full_page("true"), 0)) as api:
+        core.fetch_project_tags([])
+    assert api.call_count == 1
+
+
+def test_is_last_page_string_false_continues_the_sweep():
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "_resolve_project_names", return_value={}), \
+         mock.patch.object(core, "call_ws_api_v2",
+                           side_effect=[(_full_page("false"), 0), (_full_page(True), 0)]) as api:
+        core.fetch_project_tags([])
+    assert api.call_count == 2
+
+
+def test_is_last_page_absent_falls_back_to_the_row_count_check():
+    """No additionalData.isLastPage key at all — a full page must be treated as 'more to come',
+    just like the documented-false case, rather than stopping on an absent flag."""
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "_resolve_project_names", return_value={}), \
+         mock.patch.object(core, "call_ws_api_v2",
+                           side_effect=[(_full_page(_ABSENT), 0), (_full_page(True), 0)]) as api:
+        core.fetch_project_tags([])
+    assert api.call_count == 2
 
 
 # ---------------------------------------------------------------------------
