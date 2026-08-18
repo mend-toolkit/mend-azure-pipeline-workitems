@@ -49,3 +49,4 @@ steps:
     # Tag-based routing to multiple Azure projects (optional — requires Mend API 2.0)
     # MEND_ROUTING: $(MEND_ROUTING)
     # MEND_BRANCHES: $(MEND_BRANCHES)
+    # MEND_EMAIL: $(MEND_EMAIL)

@@ -10,6 +10,8 @@ A self-hosted tool that creates and updates Azure Work Items based on Mend SCA I
 The tool is deployed within an Azure Pipeline triggered on fixed intervals by a cron schedule.  
 It utilizes Mend's [Issue Tracking API](https://docs.mend.io/bundle/integrations/page/creating_your_own_issue_tracker_plugin.html) to identify the Mend SCA projects that were [modified](https://docs.mend.io/bundle/integrations/page/creating_your_own_issue_tracker_plugin.html#getOrganizationLastModifiedProjects) since the last execution, obtain the list of [policy matched issues](https://docs.mend.io/bundle/integrations/page/creating_your_own_issue_tracker_plugin.html#fetchProjectPolicyIssues) for each of them and create or update the corresponding Work Item.  
 
+> **_BEHAVIOR CHANGE_**: On any run where the sync did not fully complete (for example, a transient error talking to Azure DevOps or Mend), this integration now exits with a **non-zero exit code**, and it deliberately withholds the `Lastrun` watermark so the missed window is retried on the next run. Previously such a run still exited `0` and could silently advance past a window it never finished processing. If your pipeline treats a non-zero exit as a failed/red run (the normal case), you should now expect an existing, otherwise-healthy nightly sync to occasionally go red on a single transient failure — that failure is retried automatically on the next scheduled run, and no data is lost. This is intentional: it replaces silent data loss with a visible, self-recovering failure.
+
 ## Table of Contents
 - [Supported Operating Systems](#supported-operating-systems)
 - [Prerequisites](#prerequisites)
@@ -17,6 +19,7 @@ It utilizes Mend's [Issue Tracking API](https://docs.mend.io/bundle/integrations
 - [Azure DevOps Setup](#azure-devops-setup)
 - [Mend SCA Setup](#mend-sca-setup)
 - [Azure Pipeline Variables](#azure-pipeline-variables)
+- [Setting Scan Tags for Tag-Based Routing](#setting-scan-tags-for-tag-based-routing)
 - [Custom Field Mapping](#custom-field-mapping)
   - [Examples](#examples)
   - [Execution](#execution)
@@ -85,6 +88,7 @@ The following variables can be placed into the pipeline where the integration is
 | `MEND_REPONAME`          | string  |   No*    | <Name of Repository\> <br /> **_Do not change_** | The field contains Repo Name which can be used as value for any Custom field according Custom Fields syntax. See [Custom Work Item Types](#custom-field-mapping) below for syntax guidelines (`$MEND_REPONAME`). When `MEND_ROUTING` is enabled this is set per Mend project from the scan tag rather than read from the environment.                                                                                                                                                                                                                                                                                                                  |
 | `MEND_ROUTING`           | boolean |    No    | `false` | Route findings to Azure DevOps projects using tags recorded on each Mend project at scan time, instead of choosing targets from `MEND_PRODUCTTOKEN` / `MEND_PROJECTTOKEN`. Requires the scan pipeline to set the `azure-project`, `azure-repo` and `azure-branch` tags on each Mend project. When `false` (the default) behaviour is unchanged. |
 | `MEND_EMAIL`             | string  |   No*    | Empty String | Email of the Mend service user the integration signs in as. **Required when `MEND_ROUTING` is enabled** — Mend API 2.0 authenticates with an email plus `MEND_USERKEY`, unlike the 1.4 API which needs only the key. Use a service user, not a personal account. |
+| `MEND_APIURL`            | string  |    No    | Derived from `MEND_URL` (`https://api-{host}`) | Base URL for the Mend API 2.0 endpoints used by `MEND_ROUTING` (project tag lookups, API 2.0 login). By default this is derived from `MEND_URL` by prefixing the host with `api-`; that derivation has only been validated against `saas.mend.io`. Set this explicitly if your Mend server does not follow that convention. |
 | `MEND_BRANCHES`          | string  |    No    | `main,master` | Comma-separated glob patterns of branches to sync when `MEND_ROUTING` is enabled. Matched against the branch recorded at scan time with the `refs/heads/` prefix stripped — e.g. `main,release/*`. Applied at sync time, so changing it does not require rescanning. |
 | `MEND_DEPENDENCY`        | boolean |   No*    | True | Specify whether to create work items based on the dependency (value: True) or based on the CVE (value: False). Typically creates more work items if set to `false`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `MEND_DESCRIPTION`       | string | No* | "ReproSteps" | Used to tell the Integrations which field should contain the description. Use "ReproSteps" for bugs, "Description" for issues, or a custom name for a custom field.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -92,7 +96,31 @@ The following variables can be placed into the pipeline where the integration is
 | `MEND_PROXY`             | string  |    No    | Empty String <br /> | The Proxy URL. The right format is <proxy_ip>:<proxy_port>. In case of a proxy requires Basic Authentication the format should be like this <proxy_username>:<proxy_password>@<proxy_ip>:<proxy_port>.If http:// or https:// prefix is not provided, the prefix http:// will be used by default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `MEND_ALERT`             | boolean |   No*    | True | Whether to include ignored vulnerabilities. Set to false for exclude ignored vulnerabilities.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
->**_NOTE_**: `azure-wi-sync` would accept all environment variables with either `MEND_` or `WS_` prefix.
+>**_NOTE_**: `azure-wi-sync` would accept all environment variables with either `MEND_` or `WS_` prefix. For the Azure DevOps settings (`*AZUREURI`, `*AZUREPAT`, `*AZUREPROJECT`, `*AZUREAREA`, `*AZURETYPE`), if both prefixes are set for the same setting, the `WS_` variable wins.
+<br />
+
+## Setting Scan Tags for Tag-Based Routing
+`MEND_ROUTING` reads its destinations from tags on each Mend **project** — `azure-project`, `azure-repo` and `azure-branch` (an optional fourth, `azure-schema`, is used for validation). Those tags are not set on this pipeline. They are set as **Mend CLI scan tags**, in each repository's own build pipeline, at the point where that repository is scanned; Mend then promotes the scan tags onto the Mend project record, which is what this integration later reads. Consult your Mend CLI's documentation for the current flag/property syntax for attaching tags to a scan, and set the three tag values to:
+
+| Tag            | Azure Pipelines variable    |
+|----------------|------------------------------|
+| `azure-project`| `$(System.TeamProject)`      |
+| `azure-repo`   | `$(Build.Repository.Name)`   |
+| `azure-branch` | `$(Build.SourceBranch)`      |
+
+>**_IMPORTANT_**: Use `$(Build.SourceBranch)`, **not** `$(Build.SourceBranchName)`. `SourceBranchName` returns only the final path segment of the ref (`refs/heads/release/1.2` becomes `1.2`), which loses the `release/` prefix and cannot express a `MEND_BRANCHES` pattern like `release/*`. `SourceBranch` carries the full ref (`refs/heads/release/1.2`); this integration strips the `refs/heads/` prefix itself before matching it against `MEND_BRANCHES`.
+
+>**_WARNING_**: Azure Pipelines variable substitution uses `$(...)` parentheses. `${...}` curly braces are **not** pipeline variable syntax — inside a `script` step they are handed to the shell, and bash will fail with `bad substitution`. Also note that tag values (especially `azure-repo`) may contain spaces or other shell-significant characters; the safest pattern is to map each one through the step's `env:` block first and quote it there, rather than interpolating `$(...)` directly into a shell command line:
+>```yaml
+>  env:
+>    AZURE_PROJECT: $(System.TeamProject)
+>    AZURE_REPO: $(Build.Repository.Name)
+>    AZURE_BRANCH: $(Build.SourceBranch)
+>  script: |
+>    your-mend-cli-scan-command --tag "azure-project=$AZURE_PROJECT" \
+>                               --tag "azure-repo=$AZURE_REPO" \
+>                               --tag "azure-branch=$AZURE_BRANCH"
+>```
 <br />
 
 ## Execution
