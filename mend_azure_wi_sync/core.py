@@ -601,10 +601,8 @@ def update_wi_in_thread():
                     for wq_el in wi['value']:
                         issue_id = wq_el['id']
                         issue_wi_title = wq_el['fields']['System.Title']
-                        if list(set(try_or_error(lambda: wq_el['fields']['System.Tags'], "").split(";")) &
-                                {f"{tag_vul}", f"{tag_lic}"}) or \
-                            list(set(try_or_error(lambda: wq_el['fields']['System.Tags'], "").split(";")) &
-                                 {f" {tag_vul}", f" {tag_lic}"}):
+                        if tag_set(try_or_error(lambda: wq_el['fields']['System.Tags'], "")) & \
+                                {tag_vul, tag_lic}:
                             # If we have completely another task in the same Azure Project then just pass it
                             # Now Vulnerability and License violation are produced only
                             try:

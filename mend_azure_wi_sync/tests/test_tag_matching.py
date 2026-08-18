@@ -38,3 +38,10 @@ def test_matches_regardless_of_spacing():
     for raw in ("a;security vulnerability", "a; security vulnerability",
                 "a ;  security vulnerability  "):
         assert "security vulnerability" in tag_set(raw)
+
+
+def test_tag_set_makes_the_leading_space_workaround_unnecessary():
+    """core.py tested the tag set twice, once with ' ' prepended, to cope with Azure's
+    '; ' delimiter. tag_set strips, so one test now suffices."""
+    raw = "ProductX/api; security vulnerability; license policy violation"
+    assert {"security vulnerability", "license policy violation"} <= tag_set(raw)
