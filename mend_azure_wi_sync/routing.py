@@ -59,3 +59,30 @@ def branch_allowed(branch_ref: str, patterns: str) -> bool:
         if pattern and fnmatch.fnmatch(name, pattern):
             return True
     return False
+
+
+SKIP_OK = "ok"
+SKIP_NO_TARGET = "no-target"
+SKIP_SCHEMA = "schema-fault"
+SKIP_BRANCH = "branch-filtered"
+SKIP_UNKNOWN = "unknown-target"
+SKIP_EXCLUDED = "scope-excluded"     # raised in core.py — MEND_EXCLUDETOKEN, deliberate
+SKIP_OUT_OF_SCOPE = "out-of-scope"   # raised in core.py — outside the product/project narrowing
+
+# Outcomes that should be logged at ERROR. no-target and branch-filtered are the normal
+# state during rollout and must not drown out a real misconfiguration.
+LOUD_OUTCOMES = (SKIP_SCHEMA, SKIP_UNKNOWN)
+
+
+def classify(route: Route, known_projects: set, patterns: str) -> str:
+    if not route.is_routable():
+        return SKIP_NO_TARGET
+    if not route.branch:
+        # Tagged with a destination but no branch: the scan template is missing a field.
+        # Distinct from branch-filtered, which is a policy decision we made on purpose.
+        return SKIP_SCHEMA
+    if not branch_allowed(route.branch, patterns):
+        return SKIP_BRANCH
+    if route.azure_project not in (known_projects or set()):
+        return SKIP_UNKNOWN
+    return SKIP_OK
