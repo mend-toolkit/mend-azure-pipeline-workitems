@@ -108,6 +108,13 @@ def check_patterns():
         proxy_str = try_or_error(lambda: conf.proxy['http'], try_or_error(lambda: conf.proxy['https'],""))
         if proxy_str.count(":") < 2:
             res.append("MEND_PROXY.(The right format is <proxy_ip>:<proxy_port>)")
+    if conf.routing.lower() not in ("true", "false"):
+        res.append(f"MEND_ROUTING must be 'true' or 'false', got '{conf.routing}'")
+    if conf.routing.lower() == "true" and not [b for b in conf.branches.split(",") if b.strip()]:
+        # An empty pattern list matches nothing, and branch-filtered is the quiet bucket —
+        # so without this every project is skipped silently.
+        res.append("MEND_BRANCHES must list at least one branch pattern when "
+                   "MEND_ROUTING is enabled")
     return res
 
 
@@ -1181,6 +1188,10 @@ def startup():
         priority=varenvs.get_env("azurepriority").strip(),
         wsalert=varenvs.get_env("wsalert").strip(),
         proxy=varenvs.get_env("proxy").strip(),
+        routing=varenvs.get_env("wsrouting").strip(),
+        branches=varenvs.get_env("wsbranches").strip(),
+        email=varenvs.get_env("wsemail").strip(),
+        api_url=varenvs.get_env("wsapiurl").strip(),
     )
     try:
         return conf
