@@ -256,6 +256,111 @@ def get_prj_list_modified(fromdate: str, todate: str):
             return [r["apiToken"] for r in res]
 
 
+def _resolve_project_names(tokens: list):
+    """Map Mend 1.4 project token -> (productName, projectName).
+
+    There is no 1.4 call that takes an arbitrary project token directly, and getAllProjects
+    requires a productToken. So this enumerates products org-wide (getAllProducts, one call)
+    and then each product's projects (getAllProjects, one call per product) until every
+    requested token is resolved or the products run out — a handful of calls, not one per
+    project. Returns None on any Mend API failure: a partial map here would silently make a
+    real project look untagged rather than surface as an error.
+    """
+    wanted = set(tokens)
+    if not wanted:
+        return {}
+    resolved = {}
+    try:
+        products = json.loads(call_ws_api(data=json.dumps(
+            {"requestType": "getAllProducts",
+             "userKey": conf.ws_user_key,
+             "orgToken": conf.ws_org_token,
+             })))["products"]
+    except Exception as err:
+        logger.error(f"[{ex()}] Getting product list for tag resolution failed: {err}")
+        return None
+
+    for prd in products:
+        if len(resolved) == len(wanted):
+            break
+        prd_token = try_or_error(lambda: prd["productToken"], "")
+        prd_name = try_or_error(lambda: prd["productName"], "")
+        if not prd_token:
+            continue
+        try:
+            projects = json.loads(call_ws_api(data=json.dumps(
+                {"requestType": "getAllProjects",
+                 "userKey": conf.ws_user_key,
+                 "productToken": prd_token,
+                 })))["projects"]
+        except Exception as err:
+            logger.error(f"[{ex()}] Getting projects for product '{prd_name}' failed: {err}")
+            return None
+        for prj in projects:
+            prj_token = try_or_error(lambda: prj["projectToken"], "")
+            if prj_token and prj_token in wanted:
+                resolved[prj_token] = (prd_name, try_or_error(lambda: prj["projectName"], ""))
+    return resolved
+
+
+def fetch_project_tags(tokens: list) -> dict:
+    """Map Mend project token -> list of tag objects ({key|namespace, value}).
+
+    A token with no tags must appear in the result with an empty list, so the caller can
+    distinguish "scanned but untagged" (no-target) from "not in this run" (absent).
+    Returns None if the Mend call failed, matching the get_exist_wi failure convention.
+
+    1.4 project tokens and 2.0 /entities uuids are different identifier spaces (verified live:
+    0 of 25 matched), so the join is done on (productName, projectName) instead — the same pair
+    already carried in the Work Item tag. Names are resolved via _resolve_project_names().
+    """
+    names = _resolve_project_names(tokens)
+    if names is None:
+        return None
+
+    tags_by_name = {}
+    page = 0
+    page_size = 1000
+    while True:
+        payload, errorcode = call_ws_api_v2(f"orgs/{conf.ws_org_token}/entities",
+                                            {"pageSize": page_size, "page": page})
+        if errorcode != 0:
+            return None
+        rows = try_or_error(lambda: payload["retVal"], None)
+        if rows is None:
+            logger.error(f"[{fn()}] Unexpected /entities payload: {payload}")
+            return None
+        for row in rows:
+            product_name = try_or_error(lambda: row["product"]["name"], "")
+            project = try_or_error(lambda: row["project"], {})
+            project_name = try_or_error(lambda: project["name"], "")
+            key = (product_name, project_name)
+            row_tags = try_or_error(lambda: project["tags"], [])
+            if key in tags_by_name:
+                # A duplicate (product, project) name pair makes the join ambiguous. Report it
+                # loudly and mark it unusable rather than silently picking one of the two.
+                logger.error(f"[{fn()}] Duplicate Mend project name pair "
+                             f"'{product_name}/{project_name}' seen in /entities; refusing to "
+                             f"guess which one owns the routing tags.")
+                tags_by_name[key] = None
+            else:
+                tags_by_name[key] = row_tags
+        # isLastPage is documented as a string ("true"/"false") but has been observed live as a
+        # JSON bool. str(...).lower() handles both; the row-count check is belt-and-braces.
+        is_last_page = str(try_or_error(lambda: payload["additionalData"]["isLastPage"], "")
+                           ).lower() == "true"
+        if is_last_page or len(rows) < page_size:
+            break
+        page += 1
+
+    result = {}
+    for token in tokens:
+        name = names.get(token)
+        row_tags = tags_by_name.get(name) if name else None
+        result[token] = row_tags if row_tags else []
+    return result
+
+
 def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST", agent_info_login=False):
     global WARNING_MSG
     data_json = json.loads(data)
