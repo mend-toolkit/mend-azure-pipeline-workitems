@@ -27,3 +27,18 @@ def pytest_configure(config):
                      azure_prj=config.getoption("azureproject"),azure_area=config.getoption("azurearea"),
                      azure_type=config.getoption("azuretype"))
     return args
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def reset_core_globals():
+    """core.py holds mutable module globals that leak between tests."""
+    from mend_azure_wi_sync import core
+    saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf)
+    core.exist_wis = []
+    core.updated_wi = []
+    core.global_errors = 0
+    yield
+    core.exist_wis, core.updated_wi, core.global_errors, core.conf = saved
