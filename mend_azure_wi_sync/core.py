@@ -167,7 +167,9 @@ azure_project_page = 100
 def iter_azure_projects():
     # Azure DevOps pages _apis/projects. The previous unpaginated call silently hid every
     # project past the first page, which at 107 projects broke get_lastrun/set_lastrun.
-    # Yields pages; returns without yielding on failure so callers can tell empty from failed.
+    # Yields pages; on failure it yields a terminal `None` sentinel (already logged) before
+    # returning, so a consumer can tell "a later page failed" from "no more pages" instead of
+    # silently treating a partial sweep as complete.
     skip = 0
     while True:
         r, errocode = call_azure_api(api_type="GET", api="projects", version="7.0",
@@ -175,10 +177,12 @@ def iter_azure_projects():
                                      cmd_type=f"?$top={azure_project_page}&$skip={skip}&")
         if errocode != 0:
             logger.error(f"[{fn()}] Could not list Azure DevOps projects: {r}")
+            yield None
             return
         page = try_or_error(lambda: r["value"], None)
         if page is None:
             logger.error(f"[{fn()}] Unexpected project list payload: {r}")
+            yield None
             return
         yield page
         if len(page) < azure_project_page:
@@ -190,6 +194,8 @@ def get_azure_prj_id(prj_name: str):
     res = ""
     try:
         for page in iter_azure_projects():
+            if page is None:
+                continue
             for prj_ in page:
                 if prj_["name"] == prj_name:
                     return prj_["id"]
@@ -1158,10 +1164,13 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
 
 def list_azure_projects():
     # Returns None on failure so the caller can tell a real empty organization from a
-    # call that did not happen.
+    # call that did not happen or a partial sweep - a page failing after earlier pages
+    # already succeeded must not be reported as the complete set.
     names = set()
     saw_page = False
     for page in iter_azure_projects():
+        if page is None:
+            return None
         saw_page = True
         names.update([x["name"] for x in page])
     return names if saw_page else None
