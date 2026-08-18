@@ -84,6 +84,64 @@ def test_untagged_project_is_never_synced():
     assert "tok-c" not in created
 
 
+def test_collided_token_reaches_a_loud_outcome_not_the_quiet_no_target_bucket():
+    # fetch_project_tags returns a per-token None (not []) when the (product, project)
+    # name pair collided in /entities and the join is ambiguous. That must classify as
+    # the loud "unknown-target" outcome, never fall into the quiet "no-target" bucket
+    # that an empty/absent route would otherwise produce via parse_route(None or []).
+    conf = _conf()
+    tags = dict(TAGS)
+    tags["tok-collided"] = None
+    created = []
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=list(tags)), \
+         mock.patch.object(core, "fetch_project_tags", return_value=tags), \
+         mock.patch.object(core, "list_azure_projects", return_value={"Platform", "Tools"}), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "create_wi",
+                           side_effect=lambda t, *a, **k: created.append(t) or "done"), \
+         mock.patch.object(core, "set_lastrun", return_value=0):
+        try:
+            result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    assert "tok-collided" not in created
+    # tok-c is the genuinely-untagged one; tok-collided must be counted separately as
+    # unknown-target, not lumped into the same no-target bucket as tok-c.
+    assert "no-target: 1" in result
+    assert "unknown-target: 1" in result
+
+
+def test_case_insensitive_tag_routes_to_the_canonical_azure_project_casing():
+    # classify()'s known_projects membership check is deliberately exact-string, so the
+    # case-insensitive normalisation has to happen in core.py before classify() runs. This
+    # locks in both that the route is not lost (case mismatch alone must not produce
+    # unknown-target) and that Azure API calls receive the real, canonically-cased name
+    # rather than whatever casing happened to be on the tag.
+    conf = _conf()
+    tags = {"tok-lower": [{"key": "azure-project", "value": "platform"},
+                          {"key": "azure-repo", "value": "api"},
+                          {"key": "azure-branch", "value": "refs/heads/main"}]}
+    seen_azure_project = []
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=list(tags)), \
+         mock.patch.object(core, "fetch_project_tags", return_value=tags), \
+         mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "create_wi",
+                           side_effect=lambda t, *a, **k: seen_azure_project.append(conf.azure_project) or "done"), \
+         mock.patch.object(core, "set_lastrun", return_value=0):
+        try:
+            result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    assert seen_azure_project == ["Platform"]   # canonical Azure casing, not the raw "platform" tag
+    assert "1 of 1" in result
+    assert "Platform" in core.routed_targets
+
+
 def test_aborts_when_the_project_list_cannot_be_read():
     conf = _conf()
     with mock.patch.object(core, "create_wi") as create:
@@ -97,6 +155,9 @@ def test_aborts_when_the_project_list_cannot_be_read():
 
 
 def test_a_failed_target_does_not_stop_the_others():
+    # sorted(targets) visits "Platform" before "Tools"; get_exist_wi's side_effect fails
+    # Platform first so this exercises the failure-isolation and Lastrun-safety paths, not
+    # just "some target failed, some target didn't".
     conf = _conf()
     with mock.patch.object(core, "get_exist_wi", side_effect=[None, []]), \
          mock.patch.object(core, "create_wi", return_value="done") as create:
@@ -106,6 +167,12 @@ def test_a_failed_target_does_not_stop_the_others():
         finally:
             mock.patch.stopall()
     assert create.call_count == 1
+    # The failure must be visible to main() via the fatal-error signal...
+    assert core.sync_had_fatal_error() is True
+    # ...and the failed target must never appear in routed_targets: Task 12 uses that list
+    # to decide whose Lastrun to advance, and a failed target's window must stay open.
+    assert "Platform" not in core.routed_targets
+    assert "Tools" in core.routed_targets
 
 
 def test_conf_azure_project_is_restored():

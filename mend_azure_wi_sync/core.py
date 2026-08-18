@@ -1492,7 +1492,7 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
     conf.azure_project = original_azure_project
     conf.reponame = original_reponame
     conf.azure_area = original_azure_area
-    return f"{coverage_report(outcomes)}; {synced} Mend project(s) synced"
+    return f"{report}; {synced} Mend project(s) synced"
 
 
 def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
