@@ -86,3 +86,31 @@ def classify(route: Route, known_projects: set, patterns: str) -> str:
     if route.azure_project not in (known_projects or set()):
         return SKIP_UNKNOWN
     return SKIP_OK
+
+
+def build_table(routes: dict, known_projects: set, patterns: str, preset: dict = None):
+    # routes maps Mend project token -> Route. preset lets core.py inject outcomes it
+    # determined itself (scope-excluded) without routing.py needing config awareness.
+    # Sorted so the run log is diffable.
+    preset = preset or {}
+    targets = {}
+    outcomes = {}
+    for token in sorted(routes or {}):
+        route = routes[token]
+        outcome = preset.get(token) or classify(route, known_projects, patterns)
+        outcomes[token] = outcome
+        if outcome == SKIP_OK:
+            targets.setdefault(route.azure_project, []).append((token, route))
+    return targets, outcomes
+
+
+def coverage_report(outcomes: dict) -> str:
+    outcomes = outcomes or {}
+    total = len(outcomes)
+    routed = len([o for o in outcomes.values() if o == SKIP_OK])
+    counts = {}
+    for outcome in outcomes.values():
+        counts[outcome] = counts.get(outcome, 0) + 1
+    detail = ", ".join([f"{name}: {counts[name]}" for name in sorted(counts) if name != SKIP_OK])
+    report = f"Routing coverage: {routed} of {total} Mend project(s) routed"
+    return f"{report} ({detail})" if detail else report
