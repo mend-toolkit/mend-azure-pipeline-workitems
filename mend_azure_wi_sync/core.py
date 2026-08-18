@@ -407,7 +407,13 @@ def tag_set(raw_tags: str) -> set:
 def check_wi_id(id: str, project_name: str):
     def owns(entry):
         # entry is {work_item_id: raw_tags}; a malformed entry must skip, not abort the search.
-        return try_or_error(lambda: project_name in tag_set(''.join(entry.values())), False)
+        # ';' joins multiple values so a tag at the end of one value can't weld onto the start
+        # of the next; the needle is stripped since tag_set() only strips the haystack; both
+        # sides are casefolded because Azure Boards tags are case-insensitive for identity
+        # (case-preserving on first write, lowercased on read back), so an exact case-sensitive
+        # comparison would miss an existing tag forever and create a duplicate every run.
+        return try_or_error(lambda: project_name.strip().casefold() in
+                             {t.casefold() for t in tag_set(';'.join(entry.values()))}, False)
 
     try:
         values = [d[id] for d in exist_wis if id in d and owns(d[id])]
@@ -884,7 +890,11 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 wi_type_ = try_or_error(lambda: wi_data["fields"]["System.WorkItemType"], "")
                 if exist_id == 0:
                     azure_operation = "add"
-                elif wi_type_.lower() != wi_type.lower():
+                # err_ == 0 is required here: exist_id may be a work item created earlier in
+                # this same run, and wi_data/err_ are not reset when exist_id == 0, so a stale
+                # or transiently-failed (e.g. throttled) GET must not be read as "wrong type"
+                # and trigger a DELETE of the item we just created.
+                elif err_ == 0 and wi_type_.lower() != wi_type.lower():
                     call_azure_api(api_type="DELETE", api=f"wit//workitems/{exist_id}",
                                    data={}, project=conf.azure_project)
                     azure_operation = "add"
@@ -1005,7 +1015,12 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                             wi_type_ = try_or_error(lambda: wi_data["fields"]["System.WorkItemType"], "")
                             if exist_id == 0:
                                 azure_operation = "add"
-                            elif wi_type_.lower() != wi_type.lower():
+                            # err_ == 0 is required here: exist_id may be a work item created
+                            # earlier in this same run, and wi_data/err_ are not reset when
+                            # exist_id == 0, so a stale or transiently-failed (e.g. throttled)
+                            # GET must not be read as "wrong type" and trigger a DELETE of the
+                            # item we just created.
+                            elif err_ == 0 and wi_type_.lower() != wi_type.lower():
                                 call_azure_api(api_type="DELETE", api=f"wit//workitems/{exist_id}",
                                                data={}, project=conf.azure_project)
                                 azure_operation = "add"

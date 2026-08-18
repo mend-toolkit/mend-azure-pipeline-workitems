@@ -58,6 +58,30 @@ def test_entry_in_creation_shape_is_findable():
     assert core.check_wi_id(id=TITLE, project_name="ProductX/api") == 4821
 
 
+def test_project_name_with_surrounding_whitespace_still_matches():
+    """The haystack tags are stripped by tag_set, but project_name itself must also be
+    stripped, or a Mend product/project name with leading/trailing whitespace never matches."""
+    core.exist_wis = [{TITLE: {4821: "ProductX/api; security vulnerability"}}]
+    assert core.check_wi_id(id=TITLE, project_name="  ProductX/api  ") == 4821
+
+
+def test_tag_match_differing_only_in_case():
+    """Azure Boards tags are case-insensitive for identity and case-preserving on first
+    creation; an existing 'productx/api' tag must still match a differently-cased needle."""
+    core.exist_wis = [{TITLE: {4821: "productx/api; security vulnerability"}}]
+    assert core.check_wi_id(id=TITLE, project_name="ProductX/api") == 4821
+
+
+def test_multi_key_entry_values_are_not_welded_together():
+    """A multi-key entry's tag strings must be joined with ';' rather than '' — otherwise the
+    last tag of one value welds onto the first tag of the next, inventing a phantom tag and
+    losing a real one."""
+    core.exist_wis = [{TITLE: {4821: "ProductX/ap", 4822: "i; security vulnerability"}}]
+    # Joining with '' would produce "ProductX/api" out of "ProductX/ap" + "i" — a phantom tag
+    # that must NOT be considered a match for "ProductX/api".
+    assert core.check_wi_id(id=TITLE, project_name="ProductX/api") == 0
+
+
 def test_two_repos_sharing_a_library_each_keep_their_own_item():
     """Not a duplicate — this is the design. Distinct tags mean distinct work items,
     even though the titles are byte-identical."""
