@@ -396,6 +396,14 @@ def get_exist_wi():
         return []
 
 
+def tag_set(raw_tags: str) -> set:
+    # Azure DevOps returns System.Tags as "; "-delimited, while this tool writes them
+    # comma-joined. Azure normalizes on write, so accepting both separators makes this
+    # safe wherever it is called. Splitting is safe because neither character is legal
+    # inside an Azure DevOps tag.
+    return {t.strip() for t in (raw_tags or "").replace(",", ";").split(";") if t.strip()}
+
+
 def check_wi_id(id: str, project_name: str):
     try:
         values = [d[id] for d in exist_wis if id in d and project_name in ''.join(d[id].values())]
