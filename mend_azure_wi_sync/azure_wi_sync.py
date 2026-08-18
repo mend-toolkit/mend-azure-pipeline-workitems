@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _version import __tool_name__, __version__, __description__
 from core import run_sync, update_wi_in_thread, startup, get_lastrun, set_lastrun, load_wi_json, AGENT_INFO, \
-    check_patterns, global_errors
+    check_patterns, global_errors, sync_had_fatal_error
 
 logger = logging.getLogger(__tool_name__)
 logging.getLogger('urllib3').setLevel(logging.INFO)
@@ -59,6 +59,11 @@ def main():
                      todate, wi_fields, wi_type))
     logger.info(update_wi_in_thread())
     now = datetime.datetime.now() + datetime.timedelta(hours=conf.utc_delta)
+    if sync_had_fatal_error():
+        logger.error("Not advancing Lastrun: the sync did not complete. "
+                     "This window will be retried on the next run.")
+        logger.error("Sync process FAILED. Please look at the log.")
+        exit(1)
     set_lastrun(now.strftime("%Y-%m-%d %H:%M:%S"))
     if global_errors == 0:
         logger.info("Sync process completed successfully")

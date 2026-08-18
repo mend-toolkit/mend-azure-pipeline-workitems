@@ -76,6 +76,16 @@ class Tags(Enum):
                 break
         return res
 
+    @classmethod
+    def all_tags(cls) -> list:
+        # Several policy match types map to the same tag string; de-duplicate while
+        # preserving declaration order so the generated WIQL is stable.
+        seen = []
+        for el_ in cls:
+            if el_.value[1] not in seen:
+                seen.append(el_.value[1])
+        return seen
+
 
 @dataclass
 class Config:

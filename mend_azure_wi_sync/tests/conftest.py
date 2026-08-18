@@ -1,5 +1,20 @@
 from argparse import Namespace
 import os
+import sys
+
+from mend_azure_wi_sync import core as _core
+
+# Both import styles are supported by this codebase (see CLAUDE.md "Import quirk"): production
+# runs core.py flatly (`from core import ...`), while this test package imports it via the
+# package path (`from mend_azure_wi_sync import core`). Python treats those as two independent
+# modules with independent globals unless the names are aliased to the same module object, so
+# without this, a test that exercises the flat import path (e.g.
+# test_run_sync_guard.py::test_the_flag_is_visible_through_the_flat_import_path) would import a
+# freshly-executed second copy of core.py and never observe state set on the package-imported
+# module. In the real process there is only ever one "core" module — this alias makes the test
+# environment match that reality instead of accidentally exercising a split-brain artifact of
+# running both import styles side by side.
+sys.modules.setdefault("core", _core)
 
 
 def pytest_addoption(parser):
@@ -36,10 +51,13 @@ import pytest
 def reset_core_globals():
     """core.py holds mutable module globals that leak between tests."""
     from mend_azure_wi_sync import core
-    saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session)
+    saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session,
+             core.run_failed)
     core.exist_wis = []
     core.updated_wi = []
     core.global_errors = 0
     core.mend_v2_session = None
+    core.run_failed = False
     yield
-    core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session = saved
+    (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session,
+     core.run_failed) = saved

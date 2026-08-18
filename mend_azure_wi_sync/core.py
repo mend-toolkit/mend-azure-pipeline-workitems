@@ -35,6 +35,7 @@ reset_back_time = 87600  # 10 years in hours
 
 conf = None
 max_wi = 100
+max_wiql_page = 5000  # WIQL rows per page; Azure DevOps hard-caps a single result set at 20000
 WARNING_MSG = False
 API_VERSION = "1.4"
 AGENT_INFO = {"agent": f"{__tool_name__.replace('_', '-')}", "agentVersion": __version__}
@@ -45,6 +46,7 @@ azurearea = r"^[0-9a-zA-Z\s\-_]+$"
 global_errors = 0
 exist_wis = []
 updated_wi = []
+run_failed = False
 mend_v2_session = None  # SessionInfo dict from POST /api/v2.0/login; JWT lives 10 minutes
 
 
@@ -455,26 +457,37 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
     return res, errorcode
 
 
+def mend_tag_predicate() -> str:
+    # Every work item this tool creates carries exactly one policy tag from the Tags enum.
+    # OR-ing them narrows the WIQL query from the customer's entire backlog down to items
+    # this integration owns. See the plan's note on how that invariant is maintained.
+    return " OR ".join([f'[System.Tags] CONTAINS "{t}"' for t in Tags.all_tags()])
+
+
 def get_exist_wi():
     def retrieve_work_items(work_item_ids):
         work_items = []
         batch_size = 200  # This is maximum for running one bulk
-        num_batches = (len(work_item_ids) // batch_size) + 1
+        num_batches = (len(work_item_ids) + batch_size - 1) // batch_size
 
         for batch_index in range(num_batches):
             start_index = batch_index * batch_size
             end_index = min(start_index + batch_size, len(work_item_ids))
             batch_ids = work_item_ids[start_index:end_index]
 
+            if not batch_ids:
+                continue
             payload = {
                 "ids": batch_ids,
                 "fields": ["System.Id", "System.Title", "System.Tags", "System.WorkItemType"],  #"System.WorkItemType",
             }
             response, err = call_azure_api(api_type="POST", api="wit/workitemsbatch", version="6.0",
                                            data=payload, project=conf.azure_project, header="application/json")
-            if err == 0:
-                work_items.extend([{x["fields"]["System.Title"]: {x["fields"]["System.Id"]: try_or_error(lambda: x["fields"]["System.Tags"],"")}} for x in response["value"]])
-                                   #if x["fields"]["System.WorkItemType"].lower() == conf.azure_type.lower()])
+            if err != 0:
+                logger.error(f"[{fn()}] Work item batch hydration failed: {response}")
+                return None
+            work_items.extend([{x["fields"]["System.Title"]: {x["fields"]["System.Id"]: try_or_error(lambda: x["fields"]["System.Tags"],"")}} for x in response["value"]])
+                               #if x["fields"]["System.WorkItemType"].lower() == conf.azure_type.lower()])
 
         return work_items
 
@@ -483,17 +496,33 @@ def get_exist_wi():
         conf = startup()
         conf.update_properties()
     try:
-        data = {"query": f'select [System.Id] From WorkItems Where '
-                         f'[System.TeamProject] = "{conf.azure_project}" And [System.State] <> "Removed" AND [System.State] <> "Deleted"'}
-        r, errocode = call_azure_api(api_type="POST", api="wit/wiql", version="6.0", project=conf.azure_project,
-                                     data=data, header="application/json")
-        if errocode == 0:
-            ids = [x["id"] for x in r["workItems"]]
-            return retrieve_work_items(work_item_ids=ids)
-        else:
-            return []
+        ids = []
+        first_id = 0
+        while True:
+            data = {"query": f'select [System.Id] From WorkItems Where '
+                             f'[System.TeamProject] = "{conf.azure_project}" '
+                             f'And [System.Id] > {first_id} '
+                             f'And ({mend_tag_predicate()}) '
+                             f'And [System.State] <> "Removed" AND [System.State] <> "Deleted" '
+                             f'ORDER BY [System.Id]'}
+            r, errocode = call_azure_api(api_type="POST", api="wit/wiql", version="6.0",
+                                         project=conf.azure_project, data=data,
+                                         header="application/json",
+                                         cmd_type=f"?$top={max_wiql_page}&")
+            if errocode != 0:
+                logger.error(f"[{fn()}] Could not read existing work items for "
+                             f"'{conf.azure_project}': {r}")
+                return None
+            page = [x["id"] for x in r["workItems"]]
+            if not page:
+                break
+            ids.extend(page)
+            first_id = page[-1]
+        return retrieve_work_items(work_item_ids=ids)
     except Exception as err:
-        return []
+        logger.error(f"[{ex()}] Could not read existing work items for "
+                     f"'{conf.azure_project}': {err}")
+        return None
 
 
 def tag_set(raw_tags: str) -> set:
@@ -527,7 +556,7 @@ def check_wi_id(id: str, project_name: str):
 
 
 def update_wi_in_thread():
-    global conf, global_errors
+    global conf, global_errors, run_failed
     if conf is None:
         conf = startup()
         conf.update_properties()
@@ -605,6 +634,7 @@ def update_wi_in_thread():
         return f"Updated {executed_wi} corresponded Mend's item(s)"
     except Exception as err:
         global_errors += 1
+        run_failed = True
         return f"[{ex()}] Update Mend's data failed: {err}"
 
 
@@ -1176,8 +1206,15 @@ def list_azure_projects():
     return names if saw_page else None
 
 
+def sync_had_fatal_error() -> bool:
+    # A function, not a value: azure_wi_sync.py imports names at module load, so an
+    # imported flag would be frozen at False (the same trap global_errors falls into).
+    return run_failed
+
+
 def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
-    global exist_wis
+    global exist_wis, global_errors, run_failed
+    run_failed = False
     res = []
     logger.info("Getting a modified project list")
     modified_projects = get_prj_list_modified(st_date, end_date)
@@ -1204,6 +1241,13 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     res = list(set(res) - set(conf.wsexcludetoken.split(",")))
     #deleted_items = get_deleted_items()
     exist_wis = get_exist_wi()
+    if exist_wis is None:
+        global_errors += 1
+        run_failed = True
+        exist_wis = []
+        return (f"Aborted: could not read existing work items in Azure project "
+                f"'{conf.azure_project}'. Skipping to avoid creating duplicates. "
+                f"Lastrun will not advance; this window will be retried.")
     for prj_el in res:
         logger.info(create_wi(prj_el, st_date, end_date, custom_flds, wi_type))
 
