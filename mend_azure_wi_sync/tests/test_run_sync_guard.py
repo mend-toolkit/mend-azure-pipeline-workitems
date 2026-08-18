@@ -1,6 +1,7 @@
 from unittest import mock
 
 from mend_azure_wi_sync import core
+from mend_azure_wi_sync.core import sync_had_fatal_error, global_errors as frozen_counter
 
 
 def _conf():
@@ -42,15 +43,54 @@ def test_a_clean_run_is_not_reported_as_fatal():
     assert core.sync_had_fatal_error() is False
 
 
-def test_the_flag_is_visible_through_the_flat_import_path():
-    """Production imports `from core import sync_had_fatal_error` (azure_wi_sync.py:8-9),
-    not the package path the other tests use. That is the path the import-by-value trap
-    lives on, so it is the one worth proving."""
-    import os
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(core.__file__)))
-    from core import sync_had_fatal_error as flat_accessor
+def test_a_function_reads_live_state_but_an_imported_value_is_frozen():
+    """This is why sync_had_fatal_error is a function and not a flag: azure_wi_sync.py
+    imports names at module load, so an imported boolean would be frozen at False forever —
+    the trap global_errors already falls into."""
     core.run_failed = True
-    assert flat_accessor() is True
-    core.run_failed = False
-    assert flat_accessor() is False
+    core.global_errors = 5
+    assert sync_had_fatal_error() is True      # function -> live
+    assert frozen_counter == 0                 # value    -> frozen at import time
+
+
+def test_a_failed_reverse_sync_wiql_query_sets_the_fatal_flag():
+    """A failed WIQL query in the reverse sync must never be treated as 'no more work items
+    changed' — that would let Lastrun advance past updates that were never actually read."""
+    with mock.patch.object(core, "get_lastrun", return_value="2020-01-01 00:00:00"), \
+         mock.patch.object(core, "call_azure_api", return_value=({"message": "boom"}, 2)), \
+         mock.patch.object(core, "conf", _conf()):
+        before = core.global_errors
+        core.update_wi_in_thread()
+
+    assert core.sync_had_fatal_error() is True
+    assert core.global_errors == before + 1
+
+
+def test_a_genuinely_empty_reverse_sync_result_is_not_treated_as_a_failure():
+    """A successful WIQL query that legitimately finds nothing changed must not be
+    confused with a failed one — that distinction is the entire point of this fix."""
+    with mock.patch.object(core, "get_lastrun", return_value="2020-01-01 00:00:00"), \
+         mock.patch.object(core, "call_azure_api", return_value=({"workItems": []}, 0)), \
+         mock.patch.object(core, "conf", _conf()):
+        before = core.global_errors
+        result = core.update_wi_in_thread()
+
+    assert core.sync_had_fatal_error() is False
+    assert core.global_errors == before
+    assert "Updated 0" in result
+
+
+def test_a_failed_reverse_sync_hydration_batch_sets_the_fatal_flag():
+    """A failed wit/workitems hydration call must not silently drop that page of updates."""
+    wiql_page = ({"workItems": [{"id": 1}]}, 0)
+    failed_hydration = ({"message": "boom"}, 2)
+    empty_next_page = ({"workItems": []}, 0)
+    with mock.patch.object(core, "get_lastrun", return_value="2020-01-01 00:00:00"), \
+         mock.patch.object(core, "call_azure_api",
+                           side_effect=[wiql_page, failed_hydration, empty_next_page]), \
+         mock.patch.object(core, "conf", _conf()):
+        before = core.global_errors
+        core.update_wi_in_thread()
+
+    assert core.sync_had_fatal_error() is True
+    assert core.global_errors == before + 1

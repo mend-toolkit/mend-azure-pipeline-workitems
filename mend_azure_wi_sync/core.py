@@ -576,7 +576,12 @@ def update_wi_in_thread():
             r, errocode = call_azure_api(api_type="POST", api="wit/wiql", version="7.0", project=conf.azure_project,
                                          data=data, header="application/json",
                                          cmd_type=f"?timePrecision=True&$top={max_wi}&")
-            results_wi = r["workItems"] if errocode == 0 else []
+            if errocode != 0:
+                logger.error(f"[{fn()}] Reverse sync WIQL query failed: {r}")
+                global_errors += 1
+                run_failed = True
+                break
+            results_wi = r["workItems"]
             if not results_wi:
                 break
             id_str = ""
@@ -588,6 +593,10 @@ def update_wi_in_thread():
             if id_str:
                 wi, errcode = call_azure_api(api_type="GET", api=f"wit/workitems?ids={id_str}&$expand=Relations",
                                              data={}, project=conf.azure_project, cmd_type="&")
+                if errcode != 0:
+                    logger.error(f"[{fn()}] Reverse sync hydration failed for ids {id_str}: {wi}")
+                    global_errors += 1
+                    run_failed = True
                 if errcode == 0:
                     for wq_el in wi['value']:
                         issue_id = wq_el['id']
