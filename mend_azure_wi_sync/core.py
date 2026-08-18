@@ -156,18 +156,38 @@ def set_lastrun(lastrun: str):
     return errorcode
 
 
+azure_project_page = 100
+
+
+def iter_azure_projects():
+    # Azure DevOps pages _apis/projects. The previous unpaginated call silently hid every
+    # project past the first page, which at 107 projects broke get_lastrun/set_lastrun.
+    # Yields pages; returns without yielding on failure so callers can tell empty from failed.
+    skip = 0
+    while True:
+        r, errocode = call_azure_api(api_type="GET", api="projects", version="7.0",
+                                     data={}, header="application/json",
+                                     cmd_type=f"?$top={azure_project_page}&$skip={skip}&")
+        if errocode != 0:
+            logger.error(f"[{fn()}] Could not list Azure DevOps projects: {r}")
+            return
+        page = try_or_error(lambda: r["value"], None)
+        if page is None:
+            logger.error(f"[{fn()}] Unexpected project list payload: {r}")
+            return
+        yield page
+        if len(page) < azure_project_page:
+            return
+        skip += azure_project_page
+
+
 def get_azure_prj_id(prj_name: str):
     res = ""
     try:
-        r, errorcode = call_azure_api(api_type="GET", api="projects", data={}, version="7.0", header="application/json")
-        if errorcode == 0:
-            for prj_ in r["value"]:
+        for page in iter_azure_projects():
+            for prj_ in page:
                 if prj_["name"] == prj_name:
-                    res = prj_["id"]
-                    break
-        elif errorcode == 2:  # Invalid Azure URI or PAT provided
-            logger.error(f"[{fn()}] Invalid Azure URI or PAT was provided")
-            exit(-1)
+                    return prj_["id"]
     except Exception as err:
         pass
     return res
@@ -1067,6 +1087,17 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             f"No {conf.azure_type} work items {status_op} for Mend project '{prj_name}' (Product '{prd_name}')"
     except Exception as err:
         return f"[{ex()}] Work item creation failed: {err}"
+
+
+def list_azure_projects():
+    # Returns None on failure so the caller can tell a real empty organization from a
+    # call that did not happen.
+    names = set()
+    saw_page = False
+    for page in iter_azure_projects():
+        saw_page = True
+        names.update([x["name"] for x in page])
+    return names if saw_page else None
 
 
 def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
