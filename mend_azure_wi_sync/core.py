@@ -782,7 +782,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 r, errcode = call_azure_api(api_type="POST", api=f"wit/workitems/${wi_type}", data=data,
                                             project=conf.azure_project)
                 try:
-                    exist_wis.append({lib_name: r["id"]})
+                    exist_wis.append({vul_title: {r["id"]: ",".join(tags)}})
                 except Exception as err:
                     pass
                     #logger.warning(f"[{ex()}] Work item creation/update failed: {r}")

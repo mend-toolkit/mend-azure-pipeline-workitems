@@ -45,3 +45,25 @@ def test_malformed_entry_is_ignored_not_fatal():
         {TITLE: {4821: "ProductX/api; security vulnerability"}},
     ]
     assert core.check_wi_id(id=TITLE, project_name="ProductX/api") == 4821
+
+
+def test_entry_in_creation_shape_is_findable():
+    """Entries appended at creation time must share the shape get_exist_wi produces.
+
+    core.py appended {lib_name: int} — keyed by library rather than title, with a bare int
+    where a {id: tags} dict belongs. Unreachable rather than harmful today, but backlog #4
+    will iterate exist_wis for real and cannot tolerate a mixed shape.
+    """
+    core.exist_wis = [{TITLE: {4821: "ProductX/api,security vulnerability"}}]
+    assert core.check_wi_id(id=TITLE, project_name="ProductX/api") == 4821
+
+
+def test_two_repos_sharing_a_library_each_keep_their_own_item():
+    """Not a duplicate — this is the design. Distinct tags mean distinct work items,
+    even though the titles are byte-identical."""
+    core.exist_wis = [
+        {TITLE: {4821: "ProductX/api; security vulnerability"}},
+        {TITLE: {4822: "ProductX/api-client; security vulnerability"}},
+    ]
+    assert core.check_wi_id(id=TITLE, project_name="ProductX/api") == 4821
+    assert core.check_wi_id(id=TITLE, project_name="ProductX/api-client") == 4822
