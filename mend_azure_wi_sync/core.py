@@ -677,7 +677,7 @@ def check_wi_id(id: str, project_name: str):
         return 0
 
 
-def update_wi_in_thread():
+def update_wi_for_project():
     global conf, global_errors, run_failed
     if conf is None:
         conf = startup()
@@ -765,6 +765,46 @@ def update_wi_in_thread():
         global_errors += 1
         run_failed = True
         return f"[{ex()}] Update Mend's data failed: {err}"
+
+
+def update_wi_in_thread():
+    # Kept under the original name because azure_wi_sync.py imports it by that name.
+    # Under routing the forward sync visits many Azure projects; the reverse sync must
+    # visit the same set, since its WIQL is scoped to conf.azure_project.
+    global conf
+    if conf is None:
+        conf = startup()
+        conf.update_properties()
+    if conf.routing.lower() != "true":
+        return update_wi_for_project()
+    if not routed_targets:
+        # Routing is on but the forward sync routed nothing this run — a quiet window, or
+        # everything branch-filtered. Do NOT fall back to conf.azure_project: that would
+        # sync one bookkeeping project and silently skip the other 106.
+        return "Routing enabled but no targets were synced; reverse sync skipped."
+
+    original_azure_project = conf.azure_project
+    results = []
+    for azure_project in routed_targets:
+        conf.azure_project = azure_project
+        result = update_wi_for_project()
+        results.append(f"{azure_project}: {result}")
+        # Only now is this target's window safe to close: the forward sync created its work
+        # items and the reverse sync has just read the old watermark.
+        # utc_delta, like every other reader and writer of this property (azure_wi_sync.py:54,
+        # :61 and get_lastrun at core.py:116/:124). Without it the watermark is written in a
+        # different timezone from the one it is compared against — merely wasteful west of
+        # UTC, but silently lossy east of it.
+        try:
+            stamp = datetime.datetime.now() + datetime.timedelta(hours=conf.utc_delta)
+            set_lastrun(stamp.strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception as err:
+            # Don't let one target's watermark write take down the rest of the loop — a bad
+            # write here just means that target's window is retried next run, not that every
+            # subsequent routed target gets skipped and conf.azure_project is left dangling.
+            logger.error(f"[{ex()}] Failed to advance Lastrun for {azure_project}: {err}")
+    conf.azure_project = original_azure_project
+    return "; ".join(results)
 
 
 def build_wi_tags(project_tag: str, policy_tag: str, routing: str, reponame: str) -> list:
