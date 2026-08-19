@@ -118,6 +118,11 @@ def format_reachability(policy_el: dict) -> str:
     value = _get(policy_el, "reachability")
     if value is None:
         return NO_DATA
+    # dict.get() raises TypeError: unhashable type on a dict/list key. _get only guarantees
+    # the CONTAINER is a dict, never the leaf type, so an unexpected object/array from Mend
+    # must not propagate — this function is called unguarded from inside create_wi.
+    if not isinstance(value, str):
+        return NO_DATA
     return REACHABILITY_LABELS.get(value, str(value))
 
 
@@ -138,6 +143,10 @@ def format_epss(policy_el: dict) -> str:
 def format_exploit(policy_el: dict) -> str:
     maturity = _get(policy_el, "vulnerability", "threatAssessment", "exploitCodeMaturity")
     if maturity is not None:
+        # See format_reachability: dict.get() raises on an unhashable (dict/list) key, and
+        # this function is called unguarded from inside create_wi.
+        if not isinstance(maturity, str):
+            return NO_DATA
         return MATURITY_LABELS.get(maturity, str(maturity))
     exploitable = _get(policy_el, "exploitable")
     if exploitable is True:

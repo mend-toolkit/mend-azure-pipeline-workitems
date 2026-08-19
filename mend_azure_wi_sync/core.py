@@ -491,25 +491,27 @@ def safe_decorate(sorted_libs: list, index: dict):
 
     create_wi has one outer try whose error string both callers log at INFO, so an
     exception raised here would silently drop every Work Item for the project while the run
-    still reported success. Display-only data must never cost a Work Item.
+    still reported success. Display-only data must never cost a Work Item. The whole body
+    runs inside one try_or_error, not just the decorate_policy_violations call: an arity
+    change in its return value or a non-numeric max_epss must not raise into create_wi either.
     """
-    global epss_unit_warned
-    result = try_or_error(lambda: decorate_policy_violations(sorted_libs, index), None)
-    if result is None:
-        return None
-    candidates, matched, max_epss = result
-    if candidates and not matched:
-        # 3.0 returns every finding in the project, 1.4 only this window's policy
-        # violations, so compare against the 1.4 candidates. Comparing against the 3.0
-        # total would fire on most projects and train operators to ignore it.
-        logger.warning(f"[{fn()}] Enrichment matched 0 of {candidates} candidate finding(s) "
-                       f"for this project. If this repeats, the (CVE, library uuid) join key "
-                       f"is wrong and every work item will show blank reachability.")
-    if max_epss is not None and max_epss > 1 and not epss_unit_warned:
-        epss_unit_warned = True
-        logger.warning(f"[{fn()}] EPSS value {max_epss} is greater than 1. This tool renders "
-                       f"epssPercentage as a 0-1 probability; if Mend returns a percentage, "
-                       f"every EPSS figure on these work items is 100x too high.")
+    def _decorate():
+        global epss_unit_warned
+        candidates, matched, max_epss = decorate_policy_violations(sorted_libs, index)
+        if candidates and not matched:
+            # 3.0 returns every finding in the project, 1.4 only this window's policy
+            # violations, so compare against the 1.4 candidates. Comparing against the 3.0
+            # total would fire on most projects and train operators to ignore it.
+            logger.warning(f"[{fn()}] Enrichment matched 0 of {candidates} candidate finding(s) "
+                           f"for this project. If this repeats, the (CVE, library uuid) join key "
+                           f"is wrong and every work item will show blank reachability.")
+        if max_epss is not None and max_epss > 1 and not epss_unit_warned:
+            epss_unit_warned = True
+            logger.warning(f"[{fn()}] EPSS value {max_epss} is greater than 1. This tool renders "
+                           f"epssPercentage as a 0-1 probability; if Mend returns a percentage, "
+                           f"every EPSS figure on these work items is 100x too high.")
+
+    try_or_error(_decorate, None)
     return None
 
 
@@ -1366,6 +1368,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         prj_licenses = try_or_error(lambda: get_prj_licenses(), [])
         prj_lib_locations = try_or_error(lambda: get_lib_locations(), [])
         enrichment_index = enrich_project(prj_token)
+        enrich_on = bool(enrichment_enabled())
         prd_name = ws_prj[0]
         prj_name = ws_prj[1]
         status_op = "created"
@@ -1460,18 +1463,26 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                 vul_fix_type = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["type"], "")
                                 vul_url = lib_home_page if is_license else try_or_error(
                                     lambda: policy_el["vulnerability"]["url"], "")
-                                table_data.append({
+                                # MEND_ENRICHMENT defaults to false, and the README/design
+                                # doc promise a byte-identical work item when it's off, so
+                                # these two keys are gated on enrich_on. URL must stay the
+                                # last key written either way: create_html_table drops the
+                                # final cell by position, so anything after URL vanishes.
+                                row = {
                                     "CVE": vul_name,
                                     "Severity": vul_severity,
                                     "CVSS": vul_score,
-                                    "EPSS": format_epss(policy_el),
-                                    "Exploit": format_exploit(policy_el),
-                                    "Dependency": lib_name,
-                                    "Type": lib_dep,
-                                    "Fixed in": vul_fix_resolution,
-                                    "Reachability": format_reachability(policy_el),
-                                    "URL": vul_url
-                                })
+                                }
+                                if enrich_on:
+                                    row["EPSS"] = format_epss(policy_el)
+                                    row["Exploit"] = format_exploit(policy_el)
+                                row["Dependency"] = lib_name
+                                row["Type"] = lib_dep
+                                row["Fixed in"] = vul_fix_resolution
+                                if enrich_on:
+                                    row["Reachability"] = format_reachability(policy_el)
+                                row["URL"] = vul_url
+                                table_data.append(row)
                                 lic_data = "<br>"
                                 for lic_data_ in lic_data_arr:
                                     lic_data = lic_data + f"<a href='{lic_data_[2]}'>{lic_data_[1]}</a>" + \
@@ -1479,16 +1490,21 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                                f"<b>License Policy Violation - </b>{policy_lic_name}<br>"
                                 lic_data = generate_expandable_section("<b>License Details</b>", lic_data) if is_license else ""
 
+                                # Gated on enrich_on: MEND_ENRICHMENT defaults to false, and
+                                # the README/design doc promise a byte-identical work item
+                                # when it's off.
+                                enrich_html = (f"<br><b>Reachability:</b> {format_reachability(policy_el)}"
+                                              f"<br><b>EPSS:</b> {format_epss(policy_el)}"
+                                              f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}") \
+                                    if enrich_on else ""
                                 vul_data = "<b>Vulnerable Library:</b>" + lib_name + \
                                     "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
                                     "<br><b>Vulnerability Details:</b> " + vul_desc + "<br><b>Publish Date:</b> " + \
                                     vul_publish_date + \
                                     f"<br><b>URL:</b> <a href='{vul_url}'>{vul_name}</a>" + \
-                                    "<br><b>CVSS 3 Score Details </b>(" + str(vul_score) + ")" \
-                                    f"<br><b>Reachability:</b> {format_reachability(policy_el)}" \
-                                    f"<br><b>EPSS:</b> {format_epss(policy_el)}" \
-                                    f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}" \
-                                                                                           "<br><b>Suggested Fix:</b> " + \
+                                    "<br><b>CVSS 3 Score Details </b>(" + str(vul_score) + ")" + \
+                                    enrich_html + \
+                                    "<br><b>Suggested Fix:</b> " + \
                                     vul_fix_type + f"<br><b>Origin:</b> <a href='{vul_origin_url}'></a><br>" \
                                                    f"<b>Release Date:</b> " + vul_fix_release_date + \
                                     "<br><b>Fix Resolution:</b> " + vul_fix_resolution
@@ -1565,15 +1581,20 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                                f"<br><b>License Reference File: </b><a href='{lic_data_[0]}'>{lic_data_[0]}</a><br>" \
                                                f"<b>License Policy Violation - </b>{policy_lic_name}<br>"
                                 lic_data = generate_expandable_section("<b>License Details</b>", lic_data) if is_license else ""
+                                # Gated on enrich_on: MEND_ENRICHMENT defaults to false, and
+                                # the README/design doc promise a byte-identical work item
+                                # when it's off.
+                                enrich_html = (f"<br><b>Reachability:</b> {format_reachability(policy_el)}"
+                                              f"<br><b>EPSS:</b> {format_epss(policy_el)}"
+                                              f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}") \
+                                    if enrich_on else ""
                                 vul_data = "" if is_license else \
                                     "<br><b>Vulnerability Details:</b> " + vul_desc + \
                                     "<br><b>Publish Date:</b> " + vul_publish_date + \
                                     f"<br><b>URL:</b> <a href='{vul_url}'>{vul_name}</a>" + \
-                                    "<br><b>CVSS 3 Score Details </b>(" + str(vul_score) + ")" \
-                                    f"<br><b>Reachability:</b> {format_reachability(policy_el)}" \
-                                    f"<br><b>EPSS:</b> {format_epss(policy_el)}" \
-                                    f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}" \
-                                                                                           "<br><b>Suggested Fix:</b> " + \
+                                    "<br><b>CVSS 3 Score Details </b>(" + str(vul_score) + ")" + \
+                                    enrich_html + \
+                                    "<br><b>Suggested Fix:</b> " + \
                                     vul_fix_type + f"<br><b>Origin:</b> <a href='{vul_origin_url}'></a><br>" \
                                                    f"<b>Release Date:</b> " + vul_fix_release_date + \
                                     "<br><b>Fix Resolution:</b> " + vul_fix_resolution
