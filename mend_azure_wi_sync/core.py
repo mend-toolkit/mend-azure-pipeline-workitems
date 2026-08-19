@@ -482,10 +482,19 @@ def mend_v2_token() -> str:
 
 
 def _get_v2(url: str, token: str, params: dict):
+    global WARNING_MSG
     try:
-        res_ = requests.get(url, params=params or {}, verify=False, proxies=conf.proxy,
-                            headers={"Authorization": f"Bearer {token}",
-                                     "Content-Type": "application/json"})
+        with warnings.catch_warnings(record=True) as warning_list:
+            warnings.simplefilter("always", InsecureRequestWarning)
+            res_ = requests.get(url, params=params or {}, verify=False, proxies=conf.proxy,
+                                headers={"Authorization": f"Bearer {token}",
+                                         "Content-Type": "application/json"})
+        if not WARNING_MSG:
+            for warning in warning_list:
+                if issubclass(warning.category, InsecureRequestWarning):
+                    index_of_see = str(warning.message).find("See:")
+                    logger.warning(str(warning.message)[:index_of_see].strip())
+                    WARNING_MSG = True
         if res_.status_code == 200:
             return json.loads(res_.text), 0
         return try_or_error(lambda: json.loads(res_.text), {}), res_.status_code
@@ -507,6 +516,22 @@ def call_ws_api_v2(api: str, params: dict = None):
         payload, errorcode = _get_v2(url, mend_v2_token(), params)
     if errorcode != 0:
         logger.error(f"[{fn()}] Mend 2.0 call to '{api}' failed: {payload}")
+        errorcode = 2
+    return payload, errorcode
+
+
+def call_ws_api_v3(api: str, params: dict = None):
+    # Same (payload, errorcode) convention as call_ws_api_v2. Mend 3.0 accepts the JWT
+    # minted by the 2.0 login, so there is deliberately no separate 3.0 login path — but
+    # 3.0 lives on the same API host as 2.0, not on the 1.4 SCA app host.
+    global mend_v2_session
+    url = f"{extract_url(conf.api_url)}/api/v3.0/{api}"
+    payload, errorcode = _get_v2(url, mend_v2_token(), params)
+    if errorcode in (401, 403):
+        mend_v2_session = None
+        payload, errorcode = _get_v2(url, mend_v2_token(), params)
+    if errorcode != 0:
+        logger.error(f"[{fn()}] Mend 3.0 call to '{api}' failed: {payload}")
         errorcode = 2
     return payload, errorcode
 
