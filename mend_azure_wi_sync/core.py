@@ -52,6 +52,7 @@ routed_targets = []
 updated_wi = []
 run_failed = False
 mend_v2_session = None  # SessionInfo dict from POST /api/v2.0/login; JWT lives 10 minutes
+entities_rows = None    # one /entities sweep per run, shared by tags and UUID resolution
 
 
 def fn():
@@ -319,6 +320,40 @@ def _resolve_project_names(tokens: list):
     return resolved
 
 
+def _fetch_entities_rows():
+    """Page /entities once per run and cache the raw rows.
+
+    Returns None on any failure, matching fetch_project_tags' all-or-nothing convention: a
+    partial sweep would make a real project look untagged or unresolvable, which is worse
+    than a clean abort.
+    """
+    global entities_rows
+    if entities_rows is not None:
+        return entities_rows
+    collected = []
+    page = 0
+    page_size = 1000
+    while True:
+        payload, errorcode = call_ws_api_v2(f"orgs/{conf.ws_org_token}/entities",
+                                            {"pageSize": page_size, "page": page})
+        if errorcode != 0:
+            return None
+        rows = try_or_error(lambda: payload["retVal"], None)
+        if rows is None:
+            logger.error(f"[{fn()}] Unexpected /entities payload: {payload}")
+            return None
+        collected.extend(rows)
+        # isLastPage is documented as a string ("true"/"false") but has been observed live as
+        # a JSON bool. str(...).lower() handles both; the row-count check is belt-and-braces.
+        is_last_page = str(try_or_error(lambda: payload["additionalData"]["isLastPage"], "")
+                           ).lower() == "true"
+        if is_last_page or len(rows) < page_size:
+            break
+        page += 1
+    entities_rows = collected
+    return entities_rows
+
+
 def fetch_project_tags(tokens: list) -> dict:
     """Map Mend project token -> list of tag objects ({key|namespace, value}), per token, one of:
 
@@ -343,40 +378,25 @@ def fetch_project_tags(tokens: list) -> dict:
 
     tags_by_name = {}
     collided_names = set()
-    page = 0
-    page_size = 1000
-    while True:
-        payload, errorcode = call_ws_api_v2(f"orgs/{conf.ws_org_token}/entities",
-                                            {"pageSize": page_size, "page": page})
-        if errorcode != 0:
-            return None
-        rows = try_or_error(lambda: payload["retVal"], None)
-        if rows is None:
-            logger.error(f"[{fn()}] Unexpected /entities payload: {payload}")
-            return None
-        for row in rows:
-            product_name = try_or_error(lambda: row["product"]["name"], "")
-            project = try_or_error(lambda: row["project"], {})
-            project_name = try_or_error(lambda: project["name"], "")
-            key = (product_name, project_name)
-            row_tags = try_or_error(lambda: project["tags"], [])
-            if key in tags_by_name:
-                # A duplicate (product, project) name pair makes the join ambiguous. Report it
-                # loudly and mark it unusable rather than silently picking one of the two — the
-                # per-token result below surfaces this as None, distinct from a plain [].
-                logger.error(f"[{fn()}] Duplicate Mend project name pair "
-                             f"'{product_name}/{project_name}' seen in /entities; refusing to "
-                             f"guess which one owns the routing tags.")
-                collided_names.add(key)
-            else:
-                tags_by_name[key] = row_tags
-        # isLastPage is documented as a string ("true"/"false") but has been observed live as a
-        # JSON bool. str(...).lower() handles both; the row-count check is belt-and-braces.
-        is_last_page = str(try_or_error(lambda: payload["additionalData"]["isLastPage"], "")
-                           ).lower() == "true"
-        if is_last_page or len(rows) < page_size:
-            break
-        page += 1
+    rows = _fetch_entities_rows()
+    if rows is None:
+        return None
+    for row in rows:
+        product_name = try_or_error(lambda: row["product"]["name"], "")
+        project = try_or_error(lambda: row["project"], {})
+        project_name = try_or_error(lambda: project["name"], "")
+        key = (product_name, project_name)
+        row_tags = try_or_error(lambda: project["tags"], [])
+        if key in tags_by_name:
+            # A duplicate (product, project) name pair makes the join ambiguous. Report it
+            # loudly and mark it unusable rather than silently picking one of the two — the
+            # per-token result below surfaces this as None, distinct from a plain [].
+            logger.error(f"[{fn()}] Duplicate Mend project name pair "
+                         f"'{product_name}/{project_name}' seen in /entities; refusing to "
+                         f"guess which one owns the routing tags.")
+            collided_names.add(key)
+        else:
+            tags_by_name[key] = row_tags
 
     result = {}
     for token in tokens:
@@ -388,6 +408,36 @@ def fetch_project_tags(tokens: list) -> dict:
         else:
             result[token] = tags_by_name.get(name, [])
     return result
+
+
+def resolve_project_uuids(tokens: list) -> dict:
+    """Map Mend 1.4 project token -> Mend 3.0 project uuid.
+
+    1.4 tokens and the uuids carried in /entities are different identifier spaces (verified
+    live: 0 of 25 matched), and 3.0 exposes no 1.4 token, so the join goes through the
+    (productName, projectName) pair — the same one fetch_project_tags uses.
+
+    Tokens that cannot be resolved, or whose name pair collided, are simply absent from the
+    result. The caller skips enrichment for them rather than guessing.
+    """
+    names = _resolve_project_names(tokens)
+    if not names:
+        return {}
+    rows = _fetch_entities_rows()
+    if rows is None:
+        return {}
+    uuid_by_name = {}
+    collided = set()
+    for row in rows:
+        key = (try_or_error(lambda: row["product"]["name"], ""),
+               try_or_error(lambda: row["project"]["name"], ""))
+        uuid_ = try_or_error(lambda: row["project"]["uuid"], "")
+        if key in uuid_by_name:
+            collided.add(key)
+        elif uuid_:
+            uuid_by_name[key] = uuid_
+    return {token: uuid_by_name[name] for token, name in names.items()
+            if name in uuid_by_name and name not in collided}
 
 
 def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST", agent_info_login=False):
