@@ -11,12 +11,19 @@ sys.path.append(file_dir)
 class DescAzure(Enum):
     Description = ("Epic", "Task", "Issue", "User Story", "Feature", "Test Plan", "Change Request",
                    "Test Suite", "Product Backlog Item", "Impediment", "Requirement", "Risk")
-    ReproSteps = ("Bug")
+    ReproSteps = ("Bug",)
 
     @classmethod
     def get_name_by_value(cls, value):
+        # Matched case-sensitively until 2026-08-19, and against a bare string for
+        # ReproSteps — so `value in member.value` was a substring test. MEND_AZURETYPE=BUG
+        # (which Azure DevOps itself accepts, being case-insensitive about type names)
+        # resolved to "", and core.py's `if desc_field:` guard then dropped the description
+        # patch entirely: work items were created with a title, tags and priority but no
+        # description in any field, with nothing logged. Exact, case-insensitive match.
         for member in cls:
-            if value in member.value:
+            values = member.value if isinstance(member.value, tuple) else (member.value,)
+            if any(str(value).casefold() == str(known).casefold() for known in values):
                 return member.name
         return ""
 
