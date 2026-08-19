@@ -110,6 +110,8 @@ When enabled, the three values appear on every **vulnerability** work item — l
 - `MEND_DEPENDENCY: true` (default) — as three additional columns in the CVE table, and as three additional lines in each CVE's expandable detail section. The exploit-code-maturity column's header is the short **`Exploit`**; only the expandable detail line spells it out as `Exploit Code Maturity:`.
 - `MEND_DEPENDENCY: false` — there is no table and no expandable section (each CVE is its own work item), so the three lines land directly in the flat description.
 
+**EPSS** is rendered exactly as Mend reports it, as a percentage on a 0-100 scale, to one decimal place — `0.8%` is a low-probability finding and `92.4%` is a high one. It is not rescaled.
+
 >**_NOTE_**: `Reachability Unavailable` and `-` are not the same thing, and should not be read as such. `Reachability Unavailable` means Mend answered and has no reachability analysis for that library. `-` means this tool could not retrieve the value at all (for example, a failed or partial API 3.0 lookup). The same distinction applies to exploitability: `No` means Mend reports no known exploit for that vulnerability, while `-` means the lookup failed.
 
 >**_NOTE_**: Existing work items do not gain these fields retroactively. A work item is only updated when its Mend project next appears in the modified-projects window, so items created before you turned on `MEND_ENRICHMENT` keep showing the old, shorter table until then. To backfill the new fields onto all existing work items immediately, run once with `MEND_RESET: true` after enabling `MEND_ENRICHMENT`.
@@ -226,4 +228,4 @@ Populating custom fields **Reachability**, **EPSS** and **Exploit Maturity** wit
 >**_NOTE_**: These three paths are real, but inherit pre-existing `MEND:` resolution behavior that will surprise you if you expect them to match the description table's CVE columns:
 >- A path into `policyViolations` resolves against the **last** violation in the list, not the first — if a library matched more than one CVE, the custom field only ever reflects the last one.
 >- When the value is missing, the custom field receives the literal string `No content`, not an empty string.
->- Values arrive **raw**, not the human-readable wording used in the description table: `REACHABLE` rather than `Reachable`, `0.8` rather than `80.0%`. Expect the custom field and the description table to disagree in wording for the same finding.
+>- Values arrive **raw**, not the human-readable wording used in the description table: `REACHABLE` rather than `Reachable`, and `0.8` rather than `0.8%` (the number is the same — the custom field just has no `%` suffix). Expect the custom field and the description table to disagree in wording for the same finding.

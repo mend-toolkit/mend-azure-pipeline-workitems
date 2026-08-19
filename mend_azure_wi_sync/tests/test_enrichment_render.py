@@ -104,7 +104,7 @@ def test_decoration_failure_after_the_call_also_cannot_cost_work_items():
     # call: an arity change in its return value must not raise into create_wi either.
     libs = [{"library": {"keyUuid": "lib-a"},
              "policyViolations": [{"vulnerability": {"name": "CVE-1"}}]}]
-    with mock.patch.object(core, "decorate_policy_violations", return_value=(1, 1)):  # missing max_epss
+    with mock.patch.object(core, "decorate_policy_violations", return_value=(1,)):  # wrong arity
         assert core.safe_decorate(libs, {}) is None
 
 
@@ -123,17 +123,19 @@ def test_safe_decorate_warns_only_when_candidates_matched_nothing(caplog):
     assert not caplog.records
 
 
-def test_safe_decorate_warns_once_when_epss_exceeds_one(caplog):
-    # The 0-1 reading is a decision, not a verified fact. A value above 1 is the only
-    # evidence the unit is a percentage, in which case every figure is 100x too high.
+def test_a_normal_epss_score_does_not_warn(caplog):
+    """The EPSS unit question is settled: epssPercentage is 0-100, confirmed against live
+    Mend data 2026-08-19.
+
+    The old `> 1` warning existed only to detect the unit being a percentage. Now that it
+    IS a percentage, values above 1 are ordinary — every genuinely exploited CVE has one —
+    so a warning there would fire constantly and say something false.
+    """
     libs = [{"library": {"keyUuid": "lib-a"},
              "policyViolations": [{"vulnerability": {"name": "CVE-1"}}]}]
-    index = {("CVE-1", "lib-a"): {"epss": 5.0}}
-    core.epss_unit_warned = False
     with caplog.at_level("WARNING"):
-        core.safe_decorate(libs, index)
-        core.safe_decorate(libs, index)
-    assert len([r for r in caplog.records if "100x" in r.message]) == 1
+        core.safe_decorate(libs, {("CVE-1", "lib-a"): {"epss": 92.4}})
+    assert not [r for r in caplog.records if "100x" in r.message]
 
 
 def test_format_reachability_ignores_a_non_string_leaf():

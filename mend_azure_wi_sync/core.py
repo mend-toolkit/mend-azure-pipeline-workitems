@@ -56,7 +56,6 @@ mend_v2_session = None  # SessionInfo dict from POST /api/v2.0/login; JWT lives 
 entities_rows = None    # one /entities sweep per run, shared by tags and UUID resolution
 enrichment_disabled = False  # set for the rest of a run once resolution comes back empty
 project_uuid_map = {}   # Mend 1.4 project token -> 3.0 project uuid, resolved once per run
-epss_unit_warned = False
 resolved_project_names = None  # token -> (productName, projectName), one sweep per run,
                                 # shared by fetch_project_tags and resolve_project_uuids
 
@@ -511,11 +510,10 @@ def safe_decorate(sorted_libs: list, index: dict):
     exception raised here would silently drop every Work Item for the project while the run
     still reported success. Display-only data must never cost a Work Item. The whole body
     runs inside one try_or_error, not just the decorate_policy_violations call: an arity
-    change in its return value or a non-numeric max_epss must not raise into create_wi either.
+    change in its return value must not raise into create_wi either.
     """
     def _decorate():
-        global epss_unit_warned
-        candidates, matched, max_epss = decorate_policy_violations(sorted_libs, index)
+        candidates, matched = decorate_policy_violations(sorted_libs, index)
         if candidates and not matched:
             # 3.0 returns every finding in the project, 1.4 only this window's policy
             # violations, so compare against the 1.4 candidates. Comparing against the 3.0
@@ -523,11 +521,6 @@ def safe_decorate(sorted_libs: list, index: dict):
             logger.warning(f"[{fn()}] Enrichment matched 0 of {candidates} candidate finding(s) "
                            f"for this project. If this repeats, the (CVE, library uuid) join key "
                            f"is wrong and every work item will show blank reachability.")
-        if max_epss is not None and max_epss > 1 and not epss_unit_warned:
-            epss_unit_warned = True
-            logger.warning(f"[{fn()}] EPSS value {max_epss} is greater than 1. This tool renders "
-                           f"epssPercentage as a 0-1 probability; if Mend returns a percentage, "
-                           f"every EPSS figure on these work items is 100x too high.")
 
     try_or_error(_decorate, None)
     return None

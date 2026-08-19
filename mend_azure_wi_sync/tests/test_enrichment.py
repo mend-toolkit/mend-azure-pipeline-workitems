@@ -54,13 +54,13 @@ def _libs():
 def test_decorate_writes_values_onto_matching_violations_only():
     libs = _libs()
     idx = en.build_index([_finding("CVE-1", "lib-a")])
-    candidates, matched, max_epss = en.decorate_policy_violations(libs, idx)
+    candidates, matched = en.decorate_policy_violations(libs, idx)
     hit, miss = libs[0]["policyViolations"]
     assert hit["reachability"] == "REACHABLE"
     assert hit["vulnerability"]["threatAssessment"]["epssPercentage"] == 0.92
     assert "reachability" not in miss
     assert "threatAssessment" not in miss["vulnerability"]
-    assert (candidates, matched, max_epss) == (2, 1, 0.92)
+    assert (candidates, matched) == (2, 1)
 
 
 def test_decorate_merges_threat_assessment_rather_than_replacing_it():
@@ -87,7 +87,7 @@ def test_decorate_never_creates_a_vulnerability_key():
 
 
 def test_decorate_survives_malformed_input():
-    assert en.decorate_policy_violations([{}, {"policyViolations": None}], {}) == (0, 0, None)
+    assert en.decorate_policy_violations([{}, {"policyViolations": None}], {}) == (0, 0)
 
 
 def test_an_empty_but_real_match_still_counts_as_matched():
@@ -96,9 +96,9 @@ def test_an_empty_but_real_match_still_counts_as_matched():
     # — which exists to detect a wrong join key — fire on a perfectly correct join.
     libs = [{"library": {"keyUuid": "lib-a"},
              "policyViolations": [{"vulnerability": {"name": "CVE-1"}}]}]
-    candidates, matched, max_epss = en.decorate_policy_violations(
+    candidates, matched = en.decorate_policy_violations(
         libs, {("CVE-1", "lib-a"): {}})
-    assert (candidates, matched, max_epss) == (1, 1, None)
+    assert (candidates, matched) == (1, 1)
     assert "reachability" not in libs[0]["policyViolations"][0]
 
 
@@ -112,11 +112,28 @@ def test_format_reachability_covers_every_state():
     assert en.format_reachability({"reachability": "FUTURE_VALUE"}) == "FUTURE_VALUE"
 
 
+def test_format_epss_does_not_rescale_the_value():
+    """epssPercentage arrives on a 0-100 scale — it is already a percentage.
+
+    Confirmed against live Mend data 2026-08-19, correcting an earlier assumption that it
+    was a 0-1 probability. Multiplying by 100 rendered every score 100x too high: a real
+    0.8% read as 80.0%, which in a triage field is the difference between "ignore this"
+    and "drop everything".
+    """
+    def _epss(raw):
+        return en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": raw}}})
+
+    assert _epss(0.8) == "0.8%"        # was "80.0%" before the correction
+    assert _epss(92.4) == "92.4%"
+    assert _epss(100) == "100.0%"
+    assert _epss(0.04) == "0.0%"       # rounds to one decimal, as CVSS does
+
+
 def test_format_epss_renders_zero_as_a_real_score():
     # 0.0 is a valid EPSS score and is falsy. A truthiness check here would render a real
     # answer as "we got nothing".
     assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": 0.0}}}) == "0.0%"
-    assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": 0.924}}}) == "92.4%"
+    assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": 0.924}}}) == "0.9%"
     assert en.format_epss({}) == en.NO_DATA
     assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": "x"}}}) == en.NO_DATA
 

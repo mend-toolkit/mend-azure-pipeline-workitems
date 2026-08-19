@@ -76,12 +76,11 @@ def decorate_policy_violations(sorted_libs: list, index: dict):
     several libraries in a project, so a CVE-only match would attribute reachability to the
     wrong library — confidently wrong is worse than blank in a triage field.
 
-    Returns (candidates, matched, max_epss). The caller needs candidates to tell "nothing to
-    match" from "matched nothing"; the second is the signal that the join key is wrong.
+    Returns (candidates, matched). The caller needs candidates to tell "nothing to match"
+    from "matched nothing"; the second is the signal that the join key is wrong.
     """
     candidates = 0
     matched = 0
-    max_epss = None
     for prj_el in sorted_libs or []:
         lib_uuid = _get(prj_el, "library", "keyUuid")
         violations = _get(prj_el, "policyViolations")
@@ -101,9 +100,6 @@ def decorate_policy_violations(sorted_libs: list, index: dict):
             threat = {}
             if "epss" in values:
                 threat["epssPercentage"] = values["epss"]
-                if isinstance(values["epss"], (int, float)) and \
-                        (max_epss is None or values["epss"] > max_epss):
-                    max_epss = values["epss"]
             if "maturity" in values:
                 threat["exploitCodeMaturity"] = values["maturity"]
             # Only ever decorate a vulnerability Mend actually sent. A license policy
@@ -121,7 +117,7 @@ def decorate_policy_violations(sorted_libs: list, index: dict):
                     existing.update(threat)
                 else:
                     policy_el["vulnerability"]["threatAssessment"] = threat
-    return candidates, matched, max_epss
+    return candidates, matched
 
 
 def format_reachability(policy_el: dict) -> str:
@@ -137,7 +133,12 @@ def format_reachability(policy_el: dict) -> str:
 
 
 def format_epss(policy_el: dict) -> str:
-    """Rendered as a 0-1 probability times 100 (decision, 2026-08-19).
+    """epssPercentage is already a percentage, on a 0-100 scale.
+
+    Confirmed against live Mend data 2026-08-19. It was briefly read as a 0-1 probability
+    and multiplied by 100, which rendered every score 100x too high — a real 0.8% showed as
+    80.0%. In a triage column that is the difference between "ignore" and "drop everything",
+    and nothing in the value itself reveals the error.
 
     Presence is tested with `is None`, never truthiness: 0.0 is a valid EPSS score.
     """
@@ -145,7 +146,7 @@ def format_epss(policy_el: dict) -> str:
     if raw is None:
         return NO_DATA
     try:
-        return f"{float(raw) * 100:.1f}%"
+        return f"{float(raw):.1f}%"
     except (TypeError, ValueError, OverflowError):
         # OverflowError: float() of a very large JSON integer (e.g. from a malformed
         # payload) overflows rather than raising ValueError, and this formatter is called
