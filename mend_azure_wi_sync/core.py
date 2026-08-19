@@ -611,17 +611,19 @@ def fetch_project_enrichment(project_uuid: str) -> dict:
         if errorcode != 0:
             return res
         findings = try_or_error(lambda: payload["response"], None)
-        if not findings:
+        if not isinstance(findings, list) or not findings:
             return res
         res.update(build_index(findings))
         if len(findings) < int(ENRICHMENT_PAGE_LIMIT):
             return res
         cursor = try_or_error(lambda: payload["additionalData"]["cursor"], None)
         # The cursor is documented as pointing at the last item retrieved, so it is present
-        # on the final page too. A missing or repeated cursor is the only reliable stop.
-        if cursor is None or cursor == "" or cursor in seen_cursors:
+        # on the final page too. A missing, repeated, or unhashable cursor is the only
+        # reliable stop -- an unhashable cursor can't be tracked, so continuing would risk
+        # looping on a cursor we have no way to recognize as repeated.
+        if cursor is None or cursor == "" or try_or_error(lambda: cursor in seen_cursors, True):
             return res
-        seen_cursors.add(cursor)
+        try_or_error(lambda: seen_cursors.add(cursor), None)
     logger.warning(f"[{fn()}] Enrichment for Mend project {project_uuid} hit the "
                    f"{ENRICHMENT_MAX_PAGES}-page cap; some findings were not read.")
     return res

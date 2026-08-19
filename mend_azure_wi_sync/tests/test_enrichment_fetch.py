@@ -70,3 +70,22 @@ def test_the_limit_is_sent_as_a_string():
         core.fetch_project_enrichment("uuid-1")
     assert call.call_args[0][1]["limit"] == core.ENRICHMENT_PAGE_LIMIT
     assert isinstance(core.ENRICHMENT_PAGE_LIMIT, str)
+
+
+def test_a_non_list_response_degrades_instead_of_raising():
+    # Display-only data must never cost a work item. A scalar under "response" is a
+    # shape a backend bug could emit; iterating it would raise out of create_wi.
+    for bad in (42, True):
+        with mock.patch.object(core, "call_ws_api_v3",
+                               return_value=({"response": bad, "additionalData": {}}, 0)):
+            assert core.fetch_project_enrichment("uuid-1") == {}
+
+
+def test_an_unhashable_cursor_stops_paging_instead_of_raising():
+    limit = int(core.ENRICHMENT_PAGE_LIMIT)
+    full = [{"name": f"CVE-{i}", "component": {"uuid": "lib-1"}} for i in range(limit)]
+    page = {"response": full, "additionalData": {"cursor": {"bad": "type"}}}
+    with mock.patch.object(core, "call_ws_api_v3", return_value=(page, 0)) as call:
+        result = core.fetch_project_enrichment("uuid-1")
+    assert call.call_count == 1        # stopped, did not raise, did not spin
+    assert len(result) == limit        # the page that did arrive is still used
