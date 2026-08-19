@@ -45,6 +45,7 @@ class varenvs(Enum):  # Lit of Env.variables
     wsbranches = ("WS_BRANCHES", "MEND_BRANCHES")
     wsemail = ("WS_EMAIL", "MEND_EMAIL")
     wsapiurl = ("WS_APIURL", "MEND_APIURL")
+    wsenrichment = ("WS_ENRICHMENT", "MEND_ENRICHMENT")
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -113,6 +114,7 @@ class Config:
     branches: str
     email: str
     api_url: str
+    enrichment: str
 
     def conf_json(self):
         return {
@@ -137,7 +139,8 @@ class Config:
             "wsalert" : self.wsalert,
             "proxy" : self.proxy,
             "wsrouting": self.routing,
-            "wsbranches": self.branches
+            "wsbranches": self.branches,
+            "wsenrichment": self.enrichment,
         }
 
     def get_values(self):
@@ -160,6 +163,8 @@ class Config:
                 elif key == "description":
                     value = DescAzure.get_name_by_value(self.azure_type) if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "routing":
+                    value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "enrichment":
                     value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "branches":
                     value = "main,master" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]

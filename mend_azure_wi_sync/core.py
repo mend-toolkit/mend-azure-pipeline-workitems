@@ -130,6 +130,12 @@ def check_patterns():
         # Mend API 2.0 login (used by routing's paged sweep) requires an email; there is
         # no default, so this must be caught here rather than surfacing as a login failure.
         res.append("MEND_EMAIL must be set when MEND_ROUTING is enabled")
+    if conf.enrichment.lower() not in ("true", "false"):
+        res.append(f"MEND_ENRICHMENT must be 'true' or 'false', got '{conf.enrichment}'")
+    if conf.enrichment.lower() == "true" and not conf.email:
+        # The 2.0/3.0 login takes an email and has no default. Failing here costs one line;
+        # failing at call time costs a doomed login attempt per project.
+        res.append("MEND_EMAIL must be set when MEND_ENRICHMENT is enabled")
     return res
 
 
@@ -1698,6 +1704,7 @@ def startup():
         branches=varenvs.get_env("wsbranches").strip(),
         email=varenvs.get_env("wsemail").strip(),
         api_url=varenvs.get_env("wsapiurl").strip(),
+        enrichment=varenvs.get_env("wsenrichment").strip(),
     )
     try:
         return conf
