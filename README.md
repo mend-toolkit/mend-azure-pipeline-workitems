@@ -20,6 +20,7 @@ It utilizes Mend's [Issue Tracking API](https://docs.mend.io/bundle/integrations
 - [Mend SCA Setup](#mend-sca-setup)
 - [Azure Pipeline Variables](#azure-pipeline-variables)
 - [Setting Scan Tags for Tag-Based Routing](#setting-scan-tags-for-tag-based-routing)
+- [Enrichment: Reachability, EPSS and Exploit Code Maturity](#enrichment-reachability-epss-and-exploit-code-maturity)
 - [Custom Field Mapping](#custom-field-mapping)
   - [Examples](#examples)
   - [Execution](#execution)
@@ -87,7 +88,7 @@ The following variables can be placed into the pipeline where the integration is
 | `MEND_CUSTOMFIELDS`      | string  |   No*    | Empty String <br /> (No custom fields) | Used for mapping additional information from Mend's Issue Policy objects into custom fields of the specified Work Item type (`$MEND_AZURETYPE`). <br/> See [Custom Work Item Types](#custom-field-mapping) below for syntax guidelines. <br/>  This variable is required when using custom Work Item types.                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `MEND_REPONAME`          | string  |   No*    | <Name of Repository\> <br /> **_Do not change_** | The field contains Repo Name which can be used as value for any Custom field according Custom Fields syntax. See [Custom Work Item Types](#custom-field-mapping) below for syntax guidelines (`$MEND_REPONAME`). When `MEND_ROUTING` is enabled this is set per Mend project from the scan tag rather than read from the environment.                                                                                                                                                                                                                                                                                                                  |
 | `MEND_ROUTING`           | boolean |    No    | `false` | Route findings to Azure DevOps projects using tags recorded on each Mend project at scan time, instead of choosing targets from `MEND_PRODUCTTOKEN` / `MEND_PROJECTTOKEN`. Requires the scan pipeline to set the `azure-project`, `azure-repo` and `azure-branch` tags on each Mend project. When `false` (the default) behaviour is unchanged. |
-| `MEND_EMAIL`             | string  |   No*    | Empty String | Email of the Mend service user the integration signs in as. **Required when `MEND_ROUTING` is enabled** — Mend API 2.0 authenticates with an email plus `MEND_USERKEY`, unlike the 1.4 API which needs only the key. Use a service user, not a personal account. |
+| `MEND_EMAIL`             | string  |   No*    | Empty String | Email of the Mend service user the integration signs in as. **Required when `MEND_ROUTING` or `MEND_ENRICHMENT` is enabled** — Mend API 2.0/3.0 authenticate with an email plus `MEND_USERKEY`, unlike the 1.4 API which needs only the key. Use a service user, not a personal account. |
 | `MEND_APIURL`            | string  |    No    | Derived from `MEND_URL` (`https://api-{host}`) | Base URL for the Mend API 2.0 endpoints used by `MEND_ROUTING` (project tag lookups, API 2.0 login). By default this is derived from `MEND_URL` by prefixing the host with `api-`; that derivation has only been validated against `saas.mend.io`. Set this explicitly if your Mend server does not follow that convention. |
 | `MEND_BRANCHES`          | string  |    No    | `main,master` | Comma-separated glob patterns of branches to sync when `MEND_ROUTING` is enabled. Matched against the branch recorded at scan time with the `refs/heads/` prefix stripped — e.g. `main,release/*`. Applied at sync time, so changing it does not require rescanning. |
 | `MEND_DEPENDENCY`        | boolean |   No*    | True | Specify whether to create work items based on the dependency (value: True) or based on the CVE (value: False). Typically creates more work items if set to `false`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -95,8 +96,25 @@ The following variables can be placed into the pipeline where the integration is
 | `MEND_CALCULATEPRIORITY` | boolean |   No*    | False | Priority will be calculated according to Mend’s severity (CSS3) value if the value is equal to True. If not, it will be set to 2 (default priority).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `MEND_PROXY`             | string  |    No    | Empty String <br /> | The Proxy URL. The right format is <proxy_ip>:<proxy_port>. In case of a proxy requires Basic Authentication the format should be like this <proxy_username>:<proxy_password>@<proxy_ip>:<proxy_port>.If http:// or https:// prefix is not provided, the prefix http:// will be used by default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `MEND_ALERT`             | boolean |   No*    | True | Whether to include ignored vulnerabilities. Set to false for exclude ignored vulnerabilities.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `MEND_ENRICHMENT`        | boolean |    No    | `false` | When `true`, adds Reachability, EPSS score and Exploit Code Maturity to each work item, read from Mend API 3.0. **Requires `MEND_EMAIL`** — the integration aborts at startup naming `MEND_EMAIL` if it is missing, before making any HTTP call. See [Enrichment: Reachability, EPSS and Exploit Code Maturity](#enrichment-reachability-epss-and-exploit-code-maturity) below. |
 
 >**_NOTE_**: `azure-wi-sync` would accept all environment variables with either `MEND_` or `WS_` prefix. For the Azure DevOps settings (`*AZUREURI`, `*AZUREPAT`, `*AZUREPROJECT`, `*AZUREAREA`, `*AZURETYPE`), if both prefixes are set for the same setting, the `WS_` variable wins.
+<br />
+
+## Enrichment: Reachability, EPSS and Exploit Code Maturity
+Set `MEND_ENRICHMENT: true` to add three extra risk signals to each work item, read from Mend API 3.0: **Reachability**, **EPSS score** and **Exploit Code Maturity**. This defaults to `false`; leaving it unset changes nothing about existing behavior.
+
+> **_IMPORTANT_**: `MEND_ENRICHMENT: true` requires `MEND_EMAIL` to also be set — Mend API 3.0, like API 2.0, authenticates with an email plus `MEND_USERKEY`, unlike the 1.4 API which needs only the key. If `MEND_EMAIL` is missing, the integration aborts at startup and names `MEND_EMAIL` in the error, before making any HTTP call.
+
+When enabled, the three values appear in two places on every work item:
+- as three additional columns in the CVE table, and
+- as three additional lines in each CVE's expandable detail section.
+
+>**_NOTE_**: `Reachability Unavailable` and `-` are not the same thing, and should not be read as such. `Reachability Unavailable` means Mend answered and has no reachability analysis for that library. `-` means this tool could not retrieve the value at all (for example, a failed or partial API 3.0 lookup). The same distinction applies to exploitability: `No` means Mend reports no known exploit for that vulnerability, while `-` means the lookup failed.
+
+>**_NOTE_**: Existing work items do not gain these fields retroactively. A work item is only updated when its Mend project next appears in the modified-projects window, so items created before you turned on `MEND_ENRICHMENT` keep showing the old, shorter table until then. To backfill the new fields onto all existing work items immediately, run once with `MEND_RESET: true` after enabling `MEND_ENRICHMENT`.
+
+These same values can also be mapped into custom fields — see [Custom Field Mapping](#custom-field-mapping) below.
 <br />
 
 ## Setting Scan Tags for Tag-Based Routing
@@ -192,3 +210,20 @@ Populating the Work Item's custom field **Team Comments** with the initial text:
     MEND_AZURETYPE: 'SCA Issue'
     MEND_CUSTOMFIELDS: 'Team Comments::Mend policy name: &MEND:policy.name& (scope: &MEND:policy.policyContext&)'
 ```
+<br />
+
+**Example 3**  
+Populating custom fields **Reachability**, **EPSS** and **Exploit Maturity** with the risk signals added by `MEND_ENRICHMENT` (see [Enrichment: Reachability, EPSS and Exploit Code Maturity](#enrichment-reachability-epss-and-exploit-code-maturity)):
+
+```yaml
+  env:
+    ...
+    MEND_ENRICHMENT: true
+    MEND_AZURETYPE: 'SCA Issue'
+    MEND_CUSTOMFIELDS: 'Reachability::MEND:policyViolations.reachability;EPSS::MEND:policyViolations.vulnerability.threatAssessment.epssPercentage;Exploit Maturity::MEND:policyViolations.vulnerability.threatAssessment.exploitCodeMaturity'
+```
+
+>**_NOTE_**: These three paths are real, but inherit pre-existing `MEND:` resolution behavior that will surprise you if you expect them to match the description table's CVE columns:
+>- A path into `policyViolations` resolves against the **last** violation in the list, not the first — if a library matched more than one CVE, the custom field only ever reflects the last one.
+>- When the value is missing, the custom field receives the literal string `No content`, not an empty string.
+>- Values arrive **raw**, not the human-readable wording used in the description table: `REACHABLE` rather than `Reachable`, `0.8` rather than `80.0%`. Expect the custom field and the description table to disagree in wording for the same finding.
