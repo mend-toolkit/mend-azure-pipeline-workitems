@@ -11,7 +11,8 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
-from enrichment import build_index
+from enrichment import (build_index, decorate_policy_violations, format_epss,
+                        format_exploit, format_reachability)
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 import warnings
@@ -55,6 +56,7 @@ mend_v2_session = None  # SessionInfo dict from POST /api/v2.0/login; JWT lives 
 entities_rows = None    # one /entities sweep per run, shared by tags and UUID resolution
 enrichment_disabled = False  # set for the rest of a run once resolution comes back empty
 project_uuid_map = {}   # Mend 1.4 project token -> 3.0 project uuid, resolved once per run
+epss_unit_warned = False
 
 
 def fn():
@@ -482,6 +484,33 @@ def enrich_project(prj_token: str) -> dict:
     if not project_uuid:
         return {}
     return try_or_error(lambda: fetch_project_enrichment(project_uuid), {})
+
+
+def safe_decorate(sorted_libs: list, index: dict):
+    """Decorate this project's issue objects, absorbing anything that goes wrong.
+
+    create_wi has one outer try whose error string both callers log at INFO, so an
+    exception raised here would silently drop every Work Item for the project while the run
+    still reported success. Display-only data must never cost a Work Item.
+    """
+    global epss_unit_warned
+    result = try_or_error(lambda: decorate_policy_violations(sorted_libs, index), None)
+    if result is None:
+        return None
+    candidates, matched, max_epss = result
+    if candidates and not matched:
+        # 3.0 returns every finding in the project, 1.4 only this window's policy
+        # violations, so compare against the 1.4 candidates. Comparing against the 3.0
+        # total would fire on most projects and train operators to ignore it.
+        logger.warning(f"[{fn()}] Enrichment matched 0 of {candidates} candidate finding(s) "
+                       f"for this project. If this repeats, the (CVE, library uuid) join key "
+                       f"is wrong and every work item will show blank reachability.")
+    if max_epss is not None and max_epss > 1 and not epss_unit_warned:
+        epss_unit_warned = True
+        logger.warning(f"[{fn()}] EPSS value {max_epss} is greater than 1. This tool renders "
+                       f"epssPercentage as a 0-1 probability; if Mend returns a percentage, "
+                       f"every EPSS figure on these work items is 100x too high.")
+    return None
 
 
 def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST", agent_info_login=False):
@@ -1336,11 +1365,14 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         prj_lib_hierarchy = try_or_error(lambda: get_prj_lib_hierarchy()["libraries"], [])
         prj_licenses = try_or_error(lambda: get_prj_licenses(), [])
         prj_lib_locations = try_or_error(lambda: get_lib_locations(), [])
+        enrichment_index = enrich_project(prj_token)
         prd_name = ws_prj[0]
         prj_name = ws_prj[1]
         status_op = "created"
         count_item = 0
         sorted_libs = sorted(ws_prj[2:], key=lambda x: (x["library"]["keyId"], -len(x["policyViolations"])))
+        if enrichment_index:
+            safe_decorate(sorted_libs, enrichment_index)
         for prj_el in sorted_libs:
             lib_url = prj_el["library"]["url"]
             lib_name = prj_el["library"]["filename"]
@@ -1432,9 +1464,12 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                     "CVE": vul_name,
                                     "Severity": vul_severity,
                                     "CVSS": vul_score,
+                                    "EPSS": format_epss(policy_el),
+                                    "Exploit": format_exploit(policy_el),
                                     "Dependency": lib_name,
                                     "Type": lib_dep,
                                     "Fixed in": vul_fix_resolution,
+                                    "Reachability": format_reachability(policy_el),
                                     "URL": vul_url
                                 })
                                 lic_data = "<br>"
@@ -1450,6 +1485,9 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                     vul_publish_date + \
                                     f"<br><b>URL:</b> <a href='{vul_url}'>{vul_name}</a>" + \
                                     "<br><b>CVSS 3 Score Details </b>(" + str(vul_score) + ")" \
+                                    f"<br><b>Reachability:</b> {format_reachability(policy_el)}" \
+                                    f"<br><b>EPSS:</b> {format_epss(policy_el)}" \
+                                    f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}" \
                                                                                            "<br><b>Suggested Fix:</b> " + \
                                     vul_fix_type + f"<br><b>Origin:</b> <a href='{vul_origin_url}'></a><br>" \
                                                    f"<b>Release Date:</b> " + vul_fix_release_date + \
@@ -1532,6 +1570,9 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                     "<br><b>Publish Date:</b> " + vul_publish_date + \
                                     f"<br><b>URL:</b> <a href='{vul_url}'>{vul_name}</a>" + \
                                     "<br><b>CVSS 3 Score Details </b>(" + str(vul_score) + ")" \
+                                    f"<br><b>Reachability:</b> {format_reachability(policy_el)}" \
+                                    f"<br><b>EPSS:</b> {format_epss(policy_el)}" \
+                                    f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}" \
                                                                                            "<br><b>Suggested Fix:</b> " + \
                                     vul_fix_type + f"<br><b>Origin:</b> <a href='{vul_origin_url}'></a><br>" \
                                                    f"<b>Release Date:</b> " + vul_fix_release_date + \
