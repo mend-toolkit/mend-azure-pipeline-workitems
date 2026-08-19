@@ -11,6 +11,7 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
+from enrichment import build_index
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 import warnings
@@ -534,6 +535,46 @@ def call_ws_api_v3(api: str, params: dict = None):
         logger.error(f"[{fn()}] Mend 3.0 call to '{api}' failed: {payload}")
         errorcode = 2
     return payload, errorcode
+
+
+# 3.0 types `limit` as a string (default "50", max 10000). At the default a 2,000-finding
+# project costs 40 round trips, so ask for the maximum.
+ENRICHMENT_PAGE_LIMIT = "10000"
+ENRICHMENT_MAX_PAGES = 20
+
+
+def fetch_project_enrichment(project_uuid: str) -> dict:
+    """{(cve, library_uuid): values} for one Mend project, from the 3.0 findings endpoint.
+
+    Returns whatever arrived on failure rather than raising: this is display-only data and
+    must never cost a Work Item.
+    """
+    res = {}
+    cursor = None
+    seen_cursors = set()
+    for _ in range(ENRICHMENT_MAX_PAGES):
+        params = {"limit": ENRICHMENT_PAGE_LIMIT}
+        if cursor is not None:
+            params["cursor"] = cursor
+        payload, errorcode = call_ws_api_v3(
+            f"projects/{project_uuid}/dependencies/findings/security", params)
+        if errorcode != 0:
+            return res
+        findings = try_or_error(lambda: payload["response"], None)
+        if not findings:
+            return res
+        res.update(build_index(findings))
+        if len(findings) < int(ENRICHMENT_PAGE_LIMIT):
+            return res
+        cursor = try_or_error(lambda: payload["additionalData"]["cursor"], None)
+        # The cursor is documented as pointing at the last item retrieved, so it is present
+        # on the final page too. A missing or repeated cursor is the only reliable stop.
+        if cursor is None or cursor == "" or cursor in seen_cursors:
+            return res
+        seen_cursors.add(cursor)
+    logger.warning(f"[{fn()}] Enrichment for Mend project {project_uuid} hit the "
+                   f"{ENRICHMENT_MAX_PAGES}-page cap; some findings were not read.")
+    return res
 
 
 def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", project: str = "", cmd_type: str = "?",
