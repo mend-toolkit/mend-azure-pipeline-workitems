@@ -91,7 +91,7 @@ def decorate_policy_violations(sorted_libs: list, index: dict):
                 continue
             candidates += 1
             values = index.get((cve, lib_uuid))
-            if not values:
+            if values is None:
                 continue
             matched += 1
             if "reachability" in values:

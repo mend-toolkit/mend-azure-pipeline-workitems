@@ -75,6 +75,18 @@ def test_decorate_survives_malformed_input():
     assert en.decorate_policy_violations([{}, {"policyViolations": None}], {}) == (0, 0, None)
 
 
+def test_an_empty_but_real_match_still_counts_as_matched():
+    # index.get returns {} when the join hit but Mend sent no enrichment fields for that
+    # finding. Counting it as unmatched would make the caller's "matched 0 of N" warning
+    # — which exists to detect a wrong join key — fire on a perfectly correct join.
+    libs = [{"library": {"keyUuid": "lib-a"},
+             "policyViolations": [{"vulnerability": {"name": "CVE-1"}}]}]
+    candidates, matched, max_epss = en.decorate_policy_violations(
+        libs, {("CVE-1", "lib-a"): {}})
+    assert (candidates, matched, max_epss) == (1, 1, None)
+    assert "reachability" not in libs[0]["policyViolations"][0]
+
+
 def test_format_reachability_covers_every_state():
     for raw, shown in [("REACHABLE", "Reachable"),
                        ("POTENTIALLY_REACHABLE", "Potentially Reachable"),
