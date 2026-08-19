@@ -53,6 +53,8 @@ updated_wi = []
 run_failed = False
 mend_v2_session = None  # SessionInfo dict from POST /api/v2.0/login; JWT lives 10 minutes
 entities_rows = None    # one /entities sweep per run, shared by tags and UUID resolution
+enrichment_disabled = False  # set for the rest of a run once resolution comes back empty
+project_uuid_map = {}   # Mend 1.4 project token -> 3.0 project uuid, resolved once per run
 
 
 def fn():
@@ -438,6 +440,41 @@ def resolve_project_uuids(tokens: list) -> dict:
             uuid_by_name[key] = uuid_
     return {token: uuid_by_name[name] for token, name in names.items()
             if name in uuid_by_name and name not in collided}
+
+
+def enrichment_enabled() -> bool:
+    return conf.enrichment.lower() == "true" and not enrichment_disabled
+
+
+def prepare_enrichment(tokens: list):
+    """Resolve every project token to a 3.0 uuid once, before the create_wi loop.
+
+    Resolution costs getAllProducts plus one getAllProjects per product, so it happens once
+    per run rather than once per project. A total failure disables enrichment for the rest
+    of the run: the alternative is repeating a doomed login for each of ~400 projects.
+    """
+    global project_uuid_map, enrichment_disabled
+    if not enrichment_enabled():
+        return
+    project_uuid_map = try_or_error(lambda: resolve_project_uuids(list(tokens)), {})
+    if not project_uuid_map:
+        enrichment_disabled = True
+        logger.warning(f"[{fn()}] MEND_ENRICHMENT is on but no Mend project resolved to a "
+                       f"3.0 project id. Reachability, EPSS and exploitability will be "
+                       f"blank on every work item this run.")
+
+
+def enrich_project(prj_token: str) -> dict:
+    """Enrichment index for one Mend project, or {} if unavailable for any reason.
+
+    Display-only data must never cost a Work Item, so every failure path returns {}.
+    """
+    if not enrichment_enabled():
+        return {}
+    project_uuid = project_uuid_map.get(prj_token, "")
+    if not project_uuid:
+        return {}
+    return try_or_error(lambda: fetch_project_enrichment(project_uuid), {})
 
 
 def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST", agent_info_login=False):
@@ -1666,6 +1703,8 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
         logger.error(f"{unknown} destinations were not found in the organization. If they "
                      f"exist, the PAT may lack visibility into them.")
 
+    prepare_enrichment([token for target in targets.values() for token, _ in target])
+
     # Populated as targets SUCCEED, not up front: the reverse sync uses this list to decide
     # whose Lastrun to advance, and a failed target must not have its window closed.
     routed_targets = []
@@ -1727,6 +1766,7 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
         return (f"Aborted: could not read existing work items in Azure project "
                 f"'{conf.azure_project}'. Skipping to avoid creating duplicates. "
                 f"Lastrun will not advance; this window will be retried.")
+    prepare_enrichment(res)
     for prj_el in res:
         logger.info(create_wi(prj_el, st_date, end_date, custom_flds, wi_type))
 
