@@ -63,6 +63,32 @@ def test_no_enrichment_keys_are_added_when_the_flag_is_off():
         f"expected exactly 2 'if enrich_on:' guards in the row block, got {block.count('if enrich_on:')}"
 
 
+def test_vul_data_enrich_html_is_empty_string_when_flag_is_off():
+    """Both MEND_DEPENDENCY branches splice `enrich_html` into vul_data (the CVE's
+    expandable detail section when MEND_DEPENDENCY=true, the flat per-CVE description when
+    it's false). test_no_enrichment_keys_are_added_when_the_flag_is_off already covers the
+    table-row gating; this is the other half of the same invariant -- with the flag off,
+    the description must be byte-identical to before this feature -- for the two vul_data
+    sites. There is no create_wi test harness to drive this behaviourally, so this asserts
+    on the source structure, same style as test_url_must_remain_the_last_row_key.
+    """
+    src = core.__file__
+    with open(src, encoding="utf-8") as fh:
+        body = fh.read()
+
+    guarded_sites = re.findall(
+        r'enrich_html\s*=\s*\(f"<br><b>Reachability:</b>.*?"\)\s*\\?\s*\n\s*if enrich_on else ""',
+        body, re.DOTALL)
+    assert len(guarded_sites) == 2, (
+        f"expected exactly 2 'enrich_html = (...) if enrich_on else \"\"' sites, one per "
+        f"MEND_DEPENDENCY branch, got {len(guarded_sites)}")
+
+    spliced = body.count("enrich_html + \\")
+    assert spliced == 2, (
+        f"expected both vul_data sites to splice the guarded enrich_html variable, "
+        f"got {spliced}")
+
+
 def test_decoration_failure_cannot_cost_work_items():
     libs = [{"library": {"keyUuid": "lib-a"},
              "policyViolations": [{"vulnerability": {"name": "CVE-1"}}]}]

@@ -107,7 +107,7 @@ Set `MEND_ENRICHMENT: true` to add three extra risk signals to each work item, r
 > **_IMPORTANT_**: `MEND_ENRICHMENT: true` requires `MEND_EMAIL` to also be set — Mend API 3.0, like API 2.0, authenticates with an email plus `MEND_USERKEY`, unlike the 1.4 API which needs only the key. If `MEND_EMAIL` is missing, the integration aborts at startup and names `MEND_EMAIL` in the error, before making any HTTP call.
 
 When enabled, the three values appear on every **vulnerability** work item — license policy violations carry no CVE and so gain nothing, in either `MEND_DEPENDENCY` mode. Where the values land depends on `MEND_DEPENDENCY`:
-- `MEND_DEPENDENCY: true` (default) — as three additional columns in the CVE table, and as three additional lines in each CVE's expandable detail section.
+- `MEND_DEPENDENCY: true` (default) — as three additional columns in the CVE table, and as three additional lines in each CVE's expandable detail section. The exploit-code-maturity column's header is the short **`Exploit`**; only the expandable detail line spells it out as `Exploit Code Maturity:`.
 - `MEND_DEPENDENCY: false` — there is no table and no expandable section (each CVE is its own work item), so the three lines land directly in the flat description.
 
 >**_NOTE_**: `Reachability Unavailable` and `-` are not the same thing, and should not be read as such. `Reachability Unavailable` means Mend answered and has no reachability analysis for that library. `-` means this tool could not retrieve the value at all (for example, a failed or partial API 3.0 lookup). The same distinction applies to exploitability: `No` means Mend reports no known exploit for that vulnerability, while `-` means the lookup failed.

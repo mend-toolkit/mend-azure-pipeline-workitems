@@ -64,6 +64,19 @@ def test_resolution_failure_disables_enrichment_for_the_rest_of_the_run():
     assert resolve.call_count == 1
 
 
+def test_an_empty_token_list_does_not_warn_or_disable_enrichment(caplog):
+    """MINOR 6: a quiet window where nothing was modified is not a resolution failure.
+    Warning here would train operators to ignore the line that means something when it
+    actually fires."""
+    with mock.patch.object(core, "conf", _on()), \
+         mock.patch.object(core, "resolve_project_uuids") as resolve, \
+         caplog.at_level("WARNING"):
+        core.prepare_enrichment([])
+    resolve.assert_not_called()
+    assert core.enrichment_disabled is False
+    assert not caplog.records
+
+
 def test_enrichment_never_raises_out_of_enrich_project():
     core.project_uuid_map = {"tok-1": "uuid-1"}
     with mock.patch.object(core, "conf", _on()), \

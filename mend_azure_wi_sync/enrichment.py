@@ -110,7 +110,17 @@ def decorate_policy_violations(sorted_libs: list, index: dict):
             # violation has none, and creating one would put vulnerability fields on a
             # Work Item that describes a license.
             if threat and isinstance(_get(policy_el, "vulnerability"), dict):
-                policy_el["vulnerability"]["threatAssessment"] = threat
+                # Merge onto whatever 1.4 already sent under this key rather than replacing
+                # it outright — a MEND_CUSTOMFIELDS dot-path reading another sub-key here
+                # must not silently start seeing "No content" once enrichment is on. Only
+                # merge into an existing dict; anything else (absent, or an unexpected
+                # non-dict value from 1.4) is set outright, since there is nothing sane to
+                # merge onto.
+                existing = policy_el["vulnerability"].get("threatAssessment")
+                if isinstance(existing, dict):
+                    existing.update(threat)
+                else:
+                    policy_el["vulnerability"]["threatAssessment"] = threat
     return candidates, matched, max_epss
 
 
@@ -136,7 +146,10 @@ def format_epss(policy_el: dict) -> str:
         return NO_DATA
     try:
         return f"{float(raw) * 100:.1f}%"
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: float() of a very large JSON integer (e.g. from a malformed
+        # payload) overflows rather than raising ValueError, and this formatter is called
+        # unguarded from inside create_wi.
         return NO_DATA
 
 

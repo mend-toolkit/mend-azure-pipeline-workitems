@@ -57,6 +57,8 @@ entities_rows = None    # one /entities sweep per run, shared by tags and UUID r
 enrichment_disabled = False  # set for the rest of a run once resolution comes back empty
 project_uuid_map = {}   # Mend 1.4 project token -> 3.0 project uuid, resolved once per run
 epss_unit_warned = False
+resolved_project_names = None  # token -> (productName, projectName), one sweep per run,
+                                # shared by fetch_project_tags and resolve_project_uuids
 
 
 def fn():
@@ -285,10 +287,21 @@ def _resolve_project_names(tokens: list):
     requested token is resolved or the products run out — a handful of calls, not one per
     project. Returns None on any Mend API failure: a partial map here would silently make a
     real project look untagged rather than surface as an error.
+
+    Memoized for the run, the same way _fetch_entities_rows is: when routing and enrichment
+    are both on this is called twice (fetch_project_tags, then resolve_project_uuids) with
+    the second call's tokens always a subset of the first's, so a cached successful sweep
+    answers both without a second getAllProducts + getAllProjects pass. Only a successful
+    (non-None) result is cached — a failed sweep must keep failing loudly, not get papered
+    over by a stale empty cache.
     """
+    global resolved_project_names
     wanted = set(tokens)
     if not wanted:
         return {}
+    if resolved_project_names is not None:
+        return {token: resolved_project_names[token] for token in wanted
+                if token in resolved_project_names}
     resolved = {}
     try:
         products = json.loads(call_ws_api(data=json.dumps(
@@ -321,6 +334,7 @@ def _resolve_project_names(tokens: list):
             prj_token = try_or_error(lambda: prj["projectToken"], "")
             if prj_token and prj_token in wanted:
                 resolved[prj_token] = (prd_name, try_or_error(lambda: prj["projectName"], ""))
+    resolved_project_names = resolved
     return resolved
 
 
@@ -464,6 +478,10 @@ def prepare_enrichment(tokens: list):
     """
     global project_uuid_map, enrichment_disabled
     if not enrichment_enabled():
+        return
+    if not tokens:
+        # A quiet window with nothing modified is not a resolution failure — warning here
+        # trains operators to ignore the line that means something when it fires.
         return
     project_uuid_map = try_or_error(lambda: resolve_project_uuids(list(tokens)), {})
     if not project_uuid_map:
@@ -650,12 +668,22 @@ def call_ws_api_v3(api: str, params: dict = None):
     # Same (payload, errorcode) convention as call_ws_api_v2. Mend 3.0 accepts the JWT
     # minted by the 2.0 login, so there is deliberately no separate 3.0 login path — but
     # 3.0 lives on the same API host as 2.0, not on the 1.4 SCA app host.
-    global mend_v2_session
+    global mend_v2_session, enrichment_disabled
     url = f"{extract_url(conf.api_url)}/api/v3.0/{api}"
     payload, errorcode = _get_v2(url, mend_v2_token(), params)
     if errorcode in (401, 403):
         mend_v2_session = None
         payload, errorcode = _get_v2(url, mend_v2_token(), params)
+    if errorcode in (401, 403):
+        # A persistent 401/403 after the retry means either the org lacks a 3.0
+        # entitlement or the login itself is failing -- neither recovers mid-run. Stop
+        # here rather than repeating a doomed login + retry for every remaining project
+        # (~400 projects * 3 calls * 2 logins, per the design's §7 failure mode), and
+        # stop clobbering the shared 2.0 JWT cache that routing depends on.
+        if not enrichment_disabled:
+            logger.warning(f"[{fn()}] Mend 3.0 returned {errorcode}; disabling enrichment for "
+                           f"the rest of this run. Reachability, EPSS and exploitability will be blank.")
+        enrichment_disabled = True
     if errorcode != 0:
         logger.error(f"[{fn()}] Mend 3.0 call to '{api}' failed: {payload}")
         errorcode = 2
@@ -1367,13 +1395,13 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         prj_lib_hierarchy = try_or_error(lambda: get_prj_lib_hierarchy()["libraries"], [])
         prj_licenses = try_or_error(lambda: get_prj_licenses(), [])
         prj_lib_locations = try_or_error(lambda: get_lib_locations(), [])
-        enrichment_index = enrich_project(prj_token)
         enrich_on = bool(enrichment_enabled())
         prd_name = ws_prj[0]
         prj_name = ws_prj[1]
         status_op = "created"
         count_item = 0
         sorted_libs = sorted(ws_prj[2:], key=lambda x: (x["library"]["keyId"], -len(x["policyViolations"])))
+        enrichment_index = enrich_project(prj_token) if sorted_libs else {}
         if enrichment_index:
             safe_decorate(sorted_libs, enrichment_index)
         for prj_el in sorted_libs:

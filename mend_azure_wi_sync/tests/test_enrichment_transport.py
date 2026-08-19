@@ -55,3 +55,34 @@ def test_a_persistent_failure_collapses_to_errorcode_2():
          mock.patch.object(core, "_get_v2", return_value=({"message": "nope"}, 500)):
         payload, errorcode = core.call_ws_api_v3("a")
     assert errorcode == 2
+
+
+def test_a_persistent_403_disables_enrichment_for_the_rest_of_the_run(caplog):
+    """IMPORTANT 2: an org with 2.0 access but no 3.0 entitlement 403s on every 3.0 call.
+    Without this, ~400 projects each cost a doomed login + retry, and the shared 2.0 JWT
+    cache routing depends on gets repeatedly invalidated by call_ws_api_v3's own retry."""
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "_post_v2_login", return_value=(SESSION, 0)), \
+         mock.patch.object(core, "_get_v2", return_value=({"message": "denied"}, 403)):
+        with caplog.at_level("WARNING"):
+            core.call_ws_api_v3("a")
+    assert core.enrichment_disabled is True
+    assert len([r for r in caplog.records if "disabling enrichment" in r.message]) == 1
+
+
+def test_the_disable_warning_logs_only_once_across_repeated_403s(caplog):
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "_post_v2_login", return_value=(SESSION, 0)), \
+         mock.patch.object(core, "_get_v2", return_value=({"message": "denied"}, 403)):
+        with caplog.at_level("WARNING"):
+            core.call_ws_api_v3("a")
+            core.call_ws_api_v3("b")
+    assert len([r for r in caplog.records if "disabling enrichment" in r.message]) == 1
+
+
+def test_a_success_does_not_disable_enrichment():
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "_post_v2_login", return_value=(SESSION, 0)), \
+         mock.patch.object(core, "_get_v2", return_value=({"response": []}, 0)):
+        core.call_ws_api_v3("a")
+    assert core.enrichment_disabled is False

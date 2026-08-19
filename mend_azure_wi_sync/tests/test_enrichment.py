@@ -63,6 +63,21 @@ def test_decorate_writes_values_onto_matching_violations_only():
     assert (candidates, matched, max_epss) == (2, 1, 0.92)
 
 
+def test_decorate_merges_threat_assessment_rather_than_replacing_it():
+    """MINOR 4: a MEND_CUSTOMFIELDS user reading a sub-path 1.4 already sent under
+    threatAssessment must not silently start seeing 'No content' once enrichment decorates
+    the same key."""
+    libs = [{"library": {"keyUuid": "lib-a"},
+            "policyViolations": [{"vulnerability": {
+                "name": "CVE-1",
+                "threatAssessment": {"someExisting1_4Field": "keep-me"}}}]}]
+    en.decorate_policy_violations(libs, en.build_index([_finding("CVE-1", "lib-a")]))
+    threat = libs[0]["policyViolations"][0]["vulnerability"]["threatAssessment"]
+    assert threat["someExisting1_4Field"] == "keep-me"
+    assert threat["epssPercentage"] == 0.92
+    assert threat["exploitCodeMaturity"] == "FUNCTIONAL"
+
+
 def test_decorate_never_creates_a_vulnerability_key():
     # A license policy violation has no vulnerability. Inventing one would render
     # vulnerability fields on a Work Item that describes a license.
@@ -104,6 +119,13 @@ def test_format_epss_renders_zero_as_a_real_score():
     assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": 0.924}}}) == "92.4%"
     assert en.format_epss({}) == en.NO_DATA
     assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": "x"}}}) == en.NO_DATA
+
+
+def test_format_epss_survives_an_overflowing_value():
+    # MINOR 7: float() of a very large JSON integer raises OverflowError, not ValueError,
+    # and this formatter is called unguarded from inside create_wi.
+    huge = 10 ** 400
+    assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": huge}}}) == en.NO_DATA
 
 
 def test_format_exploit_distinguishes_no_from_nothing():

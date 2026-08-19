@@ -192,6 +192,25 @@ def test_case_insensitive_tag_routes_to_the_canonical_azure_project_casing():
     assert "Platform" in core.routed_targets
 
 
+def test_routing_wires_prepare_enrichment_with_the_routed_token_list():
+    """IMPORTANT 3: prepare_enrichment must actually be called from the routed path, or
+    every enabled customer silently gets three columns of '-' with all tests green."""
+    conf = _conf()
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "prepare_enrichment") as prepare:
+        _patches(conf)
+        try:
+            core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    prepare.assert_called_once()
+    (called_tokens,), _ = prepare.call_args
+    # tok-c is untagged and never reaches a routing target; tok-a/tok-b do.
+    assert set(called_tokens) == {"tok-a", "tok-b"}
+
+
 def test_aborts_when_the_project_list_cannot_be_read():
     conf = _conf()
     with mock.patch.object(core, "create_wi") as create:

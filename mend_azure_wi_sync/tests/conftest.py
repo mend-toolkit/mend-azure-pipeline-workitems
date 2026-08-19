@@ -53,7 +53,7 @@ def reset_core_globals():
     from mend_azure_wi_sync import core
     saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session,
              core.run_failed, core.routed_targets, core.entities_rows, core.enrichment_disabled,
-             core.project_uuid_map, core.epss_unit_warned)
+             core.project_uuid_map, core.epss_unit_warned, core.resolved_project_names)
     core.exist_wis = []
     core.updated_wi = []
     core.global_errors = 0
@@ -64,7 +64,8 @@ def reset_core_globals():
     core.enrichment_disabled = False
     core.project_uuid_map = {}
     core.epss_unit_warned = False
+    core.resolved_project_names = None
     yield
     (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session,
      core.run_failed, core.routed_targets, core.entities_rows, core.enrichment_disabled,
-     core.project_uuid_map, core.epss_unit_warned) = saved
+     core.project_uuid_map, core.epss_unit_warned, core.resolved_project_names) = saved

@@ -263,6 +263,42 @@ def test_resolve_project_names_returns_none_when_a_projects_call_fails():
         assert core._resolve_project_names(["tok-a"]) is None
 
 
+def test_resolve_project_names_is_memoized_for_the_run():
+    """MINOR 5: when routing and enrichment are both on, this runs twice per run (once from
+    fetch_project_tags, once from resolve_project_uuids). A cached sweep must answer both,
+    the same way _fetch_entities_rows already does for /entities, or 'once per run' in
+    prepare_enrichment's docstring is only true with routing off."""
+    import json as _json
+    products = {"products": [{"productName": "Product A", "productToken": "prd-a"}]}
+    prd_a_projects = {"projects": [{"projectName": "Project A", "projectToken": "tok-a"},
+                                   {"projectName": "Project B", "projectToken": "tok-b"}]}
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api",
+                           side_effect=[_json.dumps(products), _json.dumps(prd_a_projects)]) as api:
+        first = core._resolve_project_names(["tok-a", "tok-b"])
+        # A narrower second call (as resolve_project_uuids issues after fetch_project_tags'
+        # broader one) must be answered from the cache, not trigger a second sweep.
+        second = core._resolve_project_names(["tok-a"])
+    assert first == {"tok-a": ("Product A", "Project A"), "tok-b": ("Product A", "Project B")}
+    assert second == {"tok-a": ("Product A", "Project A")}
+    assert api.call_count == 2          # one sweep: products + one product's projects
+
+
+def test_a_failed_sweep_is_not_cached():
+    """The all-or-nothing convention: a None result must not be cached, or a transient
+    failure would poison every subsequent call for the rest of the run with an empty map."""
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value="not json"):
+        assert core._resolve_project_names(["tok-a"]) is None
+    import json as _json
+    products = {"products": [{"productName": "Product A", "productToken": "prd-a"}]}
+    prd_a_projects = {"projects": [{"projectName": "Project A", "projectToken": "tok-a"}]}
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api",
+                           side_effect=[_json.dumps(products), _json.dumps(prd_a_projects)]):
+        assert core._resolve_project_names(["tok-a"]) == {"tok-a": ("Product A", "Project A")}
+
+
 def test_resolve_project_names_leaves_unfound_tokens_out_of_the_map():
     """A token that belongs to no product in the org is simply absent from the map, not an
     error — fetch_project_tags treats that as no name, hence no tags, not a failure."""
