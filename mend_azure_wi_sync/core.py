@@ -430,14 +430,21 @@ def resolve_project_uuids(tokens: list) -> dict:
         return {}
     uuid_by_name = {}
     collided = set()
+    seen = set()
     for row in rows:
         key = (try_or_error(lambda: row["product"]["name"], ""),
                try_or_error(lambda: row["project"]["name"], ""))
         uuid_ = try_or_error(lambda: row["project"]["uuid"], "")
-        if key in uuid_by_name:
+        if key in seen:
+            # A duplicate (product, project) pair makes the join ambiguous. Refuse it
+            # outright rather than guessing — resolving to the wrong project would
+            # attribute another repo's reachability data to this one.
             collided.add(key)
-        elif uuid_:
-            uuid_by_name[key] = uuid_
+            uuid_by_name.pop(key, None)
+        else:
+            seen.add(key)
+            if uuid_:
+                uuid_by_name[key] = uuid_
     return {token: uuid_by_name[name] for token, name in names.items()
             if name in uuid_by_name and name not in collided}
 

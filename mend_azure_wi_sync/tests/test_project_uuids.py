@@ -73,3 +73,16 @@ def test_the_entities_sweep_runs_once_per_run():
         core.resolve_project_uuids(["tok-1"])
         core.fetch_project_tags(["tok-1"])
     assert call.call_count == 1
+
+
+def test_a_collision_is_detected_even_when_the_first_row_has_no_uuid():
+    # The collision guard must key on having SEEN the name pair, not on having stored a
+    # uuid for it. Otherwise an empty first row hides the duplicate and the second row's
+    # uuid is returned as if unique — enrichment would then be fetched from the wrong
+    # Mend project and attributed to the wrong repo's work items.
+    rows = [_row("Prod", "Proj", ""), _row("Prod", "Proj", "uuid-2")]
+    with mock.patch.object(core, "conf", mock.MagicMock(ws_org_token="ot")), \
+         mock.patch.object(core, "_resolve_project_names",
+                           return_value={"tok-1": ("Prod", "Proj")}), \
+         mock.patch.object(core, "call_ws_api_v2", return_value=(_payload(rows), 0)):
+        assert core.resolve_project_uuids(["tok-1"]) == {}
