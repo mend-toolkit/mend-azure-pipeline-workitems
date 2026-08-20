@@ -31,7 +31,7 @@ It utilizes Mend's [Issue Tracking API](https://docs.mend.io/bundle/integrations
 <br />
 
 ## Prerequisites
-* Python 3.9+
+* Python 3.12+
 * Azure DevOps Services or Server instance
 * Azure DevOps service user Personal Access Token (PAT) with **Read & write** permissions for both "Work Items" and the "Project and Team" scopes on any organization where you want to run the integration.
 * Azure DevOps service user added to a group with the following permissions in the project: **Create tag definition** and **View permissions for this node** 
