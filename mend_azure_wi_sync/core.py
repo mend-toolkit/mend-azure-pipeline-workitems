@@ -1895,6 +1895,9 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
     # whose Lastrun to advance, and a failed target must not have its window closed.
     routed_targets = []
     synced = 0
+    state = fetch_project_tag_state()
+    reset_on = conf.reset.lower() == "true"
+    max_hours = try_or_error(lambda: int(conf.maxlookback), 720)
     for azure_project in sorted(targets):
         # Each Azure project is its own failure boundary: one bad target must not cost the
         # other 106. Backlog #6 owns turning this into a real per-target result object.
@@ -1907,11 +1910,16 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
             exist_wis = []
             logger.error(f"Skipping Azure project '{azure_project}': could not read "
                          f"existing work items. Lastrun will not advance for it.")
+            for token, _ in targets[azure_project]:
+                apply_tag_ops(token, tag_ops(VERDICT_FAILED, end_date))
             continue
         for token, route in targets[azure_project]:
             conf.reponame = route.repo
-            verdict, message = create_wi(token, st_date, end_date, custom_flds, wi_type)
+            project_start = window_start(token, state, end_date, max_hours, reset_on,
+                                         reset_back_time)
+            verdict, message = create_wi(token, project_start, end_date, custom_flds, wi_type)
             logger.info(message)
+            apply_tag_ops(token, tag_ops(verdict, end_date))
             synced += 1
         routed_targets.append(azure_project)
         # Deliberately NO set_lastrun here. Lastrun is read by the reverse sync, which runs
@@ -1934,6 +1942,7 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     floor = selection_floor(state, st_date, end_date, max_hours, reset_on, reset_back_time)
     logger.info("Getting a modified project list")
     modified_projects = get_prj_list_modified(floor, end_date)
+    candidates = build_selection(modified_projects, state)
     logger.info(f"Selection mode: {'tag-based routing' if conf.routing.lower() == 'true' else 'token list'}")
     # Logged on both branches, before routing returns: without it a pipeline log cannot
     # answer "did enrichment run?", and 'off' is reached silently by an unexpanded
@@ -1943,7 +1952,7 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
         else "unavailable — windows fall back to MEND_MAXLOOKBACK"
     logger.info(f"Sync state: {sync_state_desc}; window floor {floor} -> {end_date}")
     if conf.routing.lower() == "true":
-        return run_sync_routed(modified_projects, floor, end_date, custom_flds, wi_type)
+        return run_sync_routed(candidates, floor, end_date, custom_flds, wi_type)
     if conf.wsproducttoken:
         expanded = expand_product_tokens(conf.wsproducttoken)
         if expanded is None:
@@ -1953,7 +1962,6 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
 
     if conf.wsprojecttoken:
         res.extend(conf.wsprojecttoken.split(","))
-    candidates = build_selection(modified_projects, state)
     res = set(candidates).intersection(res) if res else candidates
     res = list(set(res) - set(conf.wsexcludetoken.split(",")))
     #deleted_items = get_deleted_items()

@@ -92,3 +92,68 @@ def test_a_failed_project_outside_product_project_scope_is_not_synced():
     state = {"tok-failed": {"lastrun": "2026-01-01 00:00:00", "failed": "2026-08-19 11:00:00"}}
     _, create, _ = _run(_conf(wsprojecttoken="tok-other"), state, [])
     assert create.call_args_list == []
+
+
+ROUTE_TAGS_PAYMENTS = [{"key": "azure-project", "value": "Payments"},
+                       {"key": "azure-repo", "value": "api"},
+                       {"key": "azure-branch", "value": "refs/heads/main"}]
+
+
+def test_the_routed_path_applies_tag_ops_per_mend_project():
+    core.project_tag_state = {"tok-1": {"lastrun": "2026-08-20 11:00:00"}}
+    with mock.patch.object(core, "conf", _conf(routing="true", branches="main",
+                                               azure_project="Book", azure_area="", reponame="")), \
+         mock.patch.object(core, "fetch_project_tags",
+                           return_value={"tok-1": ROUTE_TAGS_PAYMENTS}), \
+         mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "prepare_enrichment"), \
+         mock.patch.object(core, "create_wi",
+                           return_value=(syncstate.VERDICT_OK, "done")) as create, \
+         mock.patch.object(core, "apply_tag_ops") as ops:
+        core.run_sync_routed(["tok-1"], "2026-08-01 00:00:00", TODATE, [], "Task")
+    assert create.call_args.args[1] == "2026-08-20 11:00:00"
+    ops.assert_called_once_with("tok-1", [
+        ("save", syncstate.TAG_LASTRUN, TODATE),
+        ("remove", syncstate.TAG_FAILED, ""),
+    ])
+
+
+def test_a_failed_project_is_retried_under_routing():
+    """Without this the retry queue is dead on the path the client actually uses: run_sync_routed
+    received raw modified_projects and never unioned the failure tags."""
+    core.project_tag_state = {"tok-stale": {"lastrun": "2026-01-01 00:00:00",
+                                           "failed": "2026-08-19 11:00:00"}}
+    with mock.patch.object(core, "conf", _conf(routing="true", branches="main",
+                                               azure_project="Book", azure_area="", reponame="")), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=[]), \
+         mock.patch.object(core, "fetch_project_tags",
+                           return_value={"tok-stale": ROUTE_TAGS_PAYMENTS}), \
+         mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "prepare_enrichment"), \
+         mock.patch.object(core, "create_wi",
+                           return_value=(syncstate.VERDICT_OK, "done")) as create, \
+         mock.patch.object(core, "apply_tag_ops"):
+        core.run_sync(st_date="", end_date=TODATE, custom_flds=[], wi_type="Task")
+    assert [c.args[0] for c in create.call_args_list] == ["tok-stale"]
+
+
+def test_an_unroutable_project_gets_no_tag_writes_at_all():
+    """Retrying a project whose destination does not exist cannot succeed, so it must never
+    enter the retry queue — a human has to fix the tag first."""
+    route_tags_missing = [{"key": "azure-project", "value": "Missing"},
+                          {"key": "azure-repo", "value": "api"},
+                          {"key": "azure-branch", "value": "refs/heads/main"}]
+    core.project_tag_state = {}
+    with mock.patch.object(core, "conf", _conf(routing="true", branches="main",
+                                               azure_project="Book", azure_area="", reponame="")), \
+         mock.patch.object(core, "fetch_project_tags", return_value={"tok-1": route_tags_missing}), \
+         mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "prepare_enrichment"), \
+         mock.patch.object(core, "create_wi") as create, \
+         mock.patch.object(core, "apply_tag_ops") as ops:
+        core.run_sync_routed(["tok-1"], "2026-08-01 00:00:00", TODATE, [], "Task")
+    create.assert_not_called()
+    ops.assert_not_called()
