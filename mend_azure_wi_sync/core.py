@@ -1928,15 +1928,22 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     global exist_wis, global_errors, run_failed
     run_failed = False
     res = []
+    state = fetch_project_tag_state()
+    reset_on = conf.reset.lower() == "true"
+    max_hours = try_or_error(lambda: int(conf.maxlookback), 720)
+    floor = selection_floor(state, st_date, end_date, max_hours, reset_on, reset_back_time)
     logger.info("Getting a modified project list")
-    modified_projects = get_prj_list_modified(st_date, end_date)
+    modified_projects = get_prj_list_modified(floor, end_date)
     logger.info(f"Selection mode: {'tag-based routing' if conf.routing.lower() == 'true' else 'token list'}")
     # Logged on both branches, before routing returns: without it a pipeline log cannot
     # answer "did enrichment run?", and 'off' is reached silently by an unexpanded
     # $(MEND_ENRICHMENT) as well as by an explicit false.
     logger.info(f"Enrichment: {'on' if enrichment_enabled() else 'off'} (MEND_ENRICHMENT)")
+    sync_state_desc = "Mend project tags" if tag_state_available \
+        else "unavailable — windows fall back to MEND_MAXLOOKBACK"
+    logger.info(f"Sync state: {sync_state_desc}; window floor {floor} -> {end_date}")
     if conf.routing.lower() == "true":
-        return run_sync_routed(modified_projects, st_date, end_date, custom_flds, wi_type)
+        return run_sync_routed(modified_projects, floor, end_date, custom_flds, wi_type)
     if conf.wsproducttoken:
         expanded = expand_product_tokens(conf.wsproducttoken)
         if expanded is None:
@@ -1957,10 +1964,13 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
         return (f"Aborted: could not read existing work items in Azure project "
                 f"'{conf.azure_project}'. Skipping to avoid creating duplicates. "
                 f"Lastrun will not advance; this window will be retried.")
+    res = build_selection(res, state)
     prepare_enrichment(res)
     for prj_el in res:
-        verdict, message = create_wi(prj_el, st_date, end_date, custom_flds, wi_type)
+        project_start = window_start(prj_el, state, end_date, max_hours, reset_on, reset_back_time)
+        verdict, message = create_wi(prj_el, project_start, end_date, custom_flds, wi_type)
         logger.info(message)
+        apply_tag_ops(prj_el, tag_ops(verdict, end_date))
 
     return f"{len(res)} project(s) processed" if res else "Nothing to create/update"
 

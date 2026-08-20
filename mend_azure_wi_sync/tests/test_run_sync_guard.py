@@ -14,6 +14,7 @@ def test_run_sync_aborts_when_existing_items_cannot_be_read():
     with mock.patch.object(core, "get_prj_list_modified", return_value=["prj-token-1"]), \
          mock.patch.object(core, "get_exist_wi", return_value=None), \
          mock.patch.object(core, "create_wi") as create_wi, \
+         mock.patch.object(core, "fetch_project_tag_state", return_value={}), \
          mock.patch.object(core, "conf", _conf()):
         before = core.global_errors
         result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
