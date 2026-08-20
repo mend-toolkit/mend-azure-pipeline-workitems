@@ -19,6 +19,9 @@ def test_a_failed_mend_fetch_verdicts_failed():
                                           "2026-08-20 12:00:00", [], "Task")
     assert verdict == syncstate.VERDICT_FAILED
     assert "tok-1" in message
+    # A failed fetch never reaches item_failed's success branch, so nothing is recorded
+    # for the reverse sync to visit.
+    assert core.synced_projects == []
 
 
 def test_a_genuinely_empty_window_verdicts_ok():
@@ -27,13 +30,18 @@ def test_a_genuinely_empty_window_verdicts_ok():
     # cannot be mock.patch.object'd on `core`. fetch_prj_policy returning a project with no
     # libraries (ws_prj[2:] == []) means the create/update loop body never runs, so the only
     # thing that needs to succeed is the underlying call_ws_api plumbing those helpers share.
-    with mock.patch.object(core, "conf", _conf()), \
+    conf = _conf()
+    with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "fetch_prj_policy", return_value=["Prod", "Proj"]), \
          mock.patch.object(core, "call_ws_api", return_value='{"libraries": []}'):
         verdict, message = core.create_wi("tok-1", "2026-08-01 00:00:00",
                                           "2026-08-20 12:00:00", [], "Task")
     assert verdict == syncstate.VERDICT_OK
     assert "No Task work items" in message
+    # create_wi is the only place that resolves (product, project) names for the reverse
+    # sync's WIQL tag filter; a successful pass must record exactly (token, "Prod/Proj",
+    # the Azure project it wrote to) so update_wi_in_thread can find it.
+    assert core.synced_projects == [("tok-1", "Prod/Proj", conf.azure_project)]
 
 
 def test_an_unexpected_exception_verdicts_failed():
@@ -95,6 +103,12 @@ def test_a_failed_work_item_write_verdicts_failed():
                                           "2026-08-20 12:00:00", [], "Task")
     assert verdict == syncstate.VERDICT_FAILED
     assert "No Task work items" in message
+    # item_failed was set True inside create_wi_content's errcode==1 branch, and the
+    # function still reaches this same end-of-function return (no early exit) -- so this
+    # is the case that actually depends on the `if not item_failed:` guard around the
+    # synced_projects append, unlike test_a_failed_mend_fetch_verdicts_failed above (which
+    # returns before that line is ever reached). See the report's hoist experiment.
+    assert core.synced_projects == []
 
 
 def test_an_azure_api_exception_during_write_verdicts_failed():
