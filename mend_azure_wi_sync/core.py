@@ -15,6 +15,8 @@ from enrichment import (build_index, decorate_policy_violations, format_epss,
                         format_exploit, format_reachability)
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
+from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_REVSYNC, VERDICT_FAILED, VERDICT_OK,
+                       build_selection, parse_tag_map, selection_floor, tag_ops, window_start)
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -58,6 +60,9 @@ enrichment_disabled = False  # set for the rest of a run once resolution comes b
 project_uuid_map = {}   # Mend 1.4 project token -> 3.0 project uuid, resolved once per run
 resolved_project_names = None  # token -> (productName, projectName), one sweep per run,
                                 # shared by fetch_project_tags and resolve_project_uuids
+project_tag_state = None      # one getOrganizationProjectTags sweep per run
+tag_state_available = True    # False once any tag call fails; drives the once-per-run warning
+TAG_WARNED = False            # WARNING_MSG-style guard so 400 projects log one error, not 400
 
 
 def fn():
@@ -253,6 +258,80 @@ def fetch_prj_policy(prj_token: str, sdate: str, edate: str):
         rt_res = [f"[{ex()}] Process getting Policy issues failed: ", f"{err}"]
 
     return rt_res
+
+
+def _warn_tag_state_once(detail: str):
+    """One error per run, not one per project. set_lastrun's per-call increment is exactly the
+    trap this avoids: 400 identical failures would drown the error count."""
+    global TAG_WARNED, tag_state_available, global_errors
+    tag_state_available = False
+    if TAG_WARNED:
+        return
+    TAG_WARNED = True
+    global_errors += 1
+    logger.error(f"[{fn()}] Could not persist sync state as Mend project tags ({detail}). "
+                f"Windows fall back to MEND_MAXLOOKBACK and overlapping work is repeated each "
+                f"run. Check that MEND_USERKEY may save project tags.")
+
+
+def _tag_call(request_type: str, prj_token: str, key: str, value: str) -> bool:
+    body = {"requestType": request_type,
+            "userKey": conf.ws_user_key,
+            "orgToken": conf.ws_org_token,
+            "projectToken": prj_token,
+            "tagKey": key,
+            "tagValue": value}
+    payload = try_or_error(lambda: json.loads(call_ws_api(data=json.dumps(body))), None)
+    if not isinstance(payload, dict) or "projectTags" not in payload:
+        _warn_tag_state_once(f"{request_type} on {prj_token}")
+        return False
+    return True
+
+
+def save_project_tag(prj_token: str, key: str, value: str) -> bool:
+    return _tag_call("saveProjectTag", prj_token, key, value)
+
+
+def remove_project_tag(prj_token: str, key: str) -> bool:
+    # removeProjectTag takes the same tagKey/tagValue pair as save; the value is not matched on.
+    return _tag_call("removeProjectTag", prj_token, key, "")
+
+
+def apply_tag_ops(prj_token: str, ops: list):
+    """Apply an ordered op list from syncstate.tag_ops, stopping if an advance fails.
+
+    A failed advance must not be followed by clearing TAG_FAILED: that would drop the project
+    from the retry queue while its watermark still points at a window we never read.
+    """
+    for op, key, value in ops or []:
+        if op == "save":
+            if not save_project_tag(prj_token, key, value):
+                return
+        elif op == "remove":
+            remove_project_tag(prj_token, key)
+
+
+def fetch_project_tag_state() -> dict:
+    """{token: {lastrun, failed, revsync}} for the whole org, read once per run.
+
+    Memoised the way _fetch_entities_rows is. An unreadable sweep returns {} and marks state
+    unavailable rather than raising: every window then falls back to the clamp, which is correct
+    but repeats work, so the operator needs the warning and the run needs to continue.
+    """
+    global project_tag_state
+    if project_tag_state is not None:
+        return project_tag_state
+    body = {"requestType": "getOrganizationProjectTags",
+            "userKey": conf.ws_user_key,
+            "orgToken": conf.ws_org_token}
+    payload = try_or_error(lambda: json.loads(call_ws_api(data=json.dumps(body))), None)
+    rows = try_or_error(lambda: payload["projectTags"], None)
+    if rows is None:
+        _warn_tag_state_once("getOrganizationProjectTags")
+        project_tag_state = {}
+        return project_tag_state
+    project_tag_state = parse_tag_map(rows)
+    return project_tag_state
 
 
 def get_prj_list_modified(fromdate: str, todate: str):
