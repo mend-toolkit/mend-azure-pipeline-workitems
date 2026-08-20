@@ -34,10 +34,21 @@ It utilizes Mend's [Issue Tracking API](https://docs.mend.io/bundle/integrations
 * Python 3.9+
 * Azure DevOps Services or Server instance
 * Azure DevOps service user Personal Access Token (PAT) with **Read & write** permissions for both "Work Items" and the "Project and Team" scopes on any organization where you want to run the integration.
-* Azure DevOps service user added to a group with the following permissions in the project: **Create tag definition**, **Manage project properties** and **View permissions for this node** 
+* Azure DevOps service user added to a group with the following permissions in the project: **Create tag definition** and **View permissions for this node** 
 	* The user needs to be added to the team for each area path you wish to create work items for.
 * Mend SCA [Issue Tracking policies](#mend-sca)
 * Mend SCA service user with associated with a [role assignment](https://docs.mend.io/bundle/sca_user_guide/page/managing_groups.html#Assigning-a-Role-to-a-Group) of either **Organization Administrator** or **Organization Auditor**  
+
+The PAT needs **Work Items (Read, write & manage)** and **Project and Team (Read)**.
+
+*Manage project properties* is **no longer required.** Sync state is stored as tags on the Mend
+project (`azure-wi-lastrun`, `azure-wi-failed`, `azure-wi-revsync`), so the `MEND_USERKEY` must be
+permitted to save project tags instead. If tag writes fail, the tool still runs correctly — every
+window falls back to `MEND_MAXLOOKBACK` and overlapping work is repeated each run, with one error
+logged per run explaining why.
+
+**Onboarding a new organization:** run once with `MEND_RESET=true` to pick up existing findings,
+then leave it unset. Tags carry the state from then on.
 <br />
 
 ## Planning your Work Items Setup
@@ -52,7 +63,7 @@ See [Azure Pipeline Variables](#azure-pipeline-variables) for details.
 ## Azure DevOps Setup
 1. Create a [Personal Access Token (PAT)](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate) with **Read & write** permissions for the **Work Items** scope and **Project and Team** scope
 2. Create a new Azure pipeline from the example file [examples/mend-azure-wi-sync.yml](./examples/mend-azure-wi-sync.yml)
-3. Make sure the user you created the PAT for has the following permissions in each repository where workitems are needed: **Create tag definition**, **Manage project properties** and **View permissions for this node** 
+3. Make sure the user you created the PAT for has the following permissions in each repository where workitems are needed: **Create tag definition** and **View permissions for this node** 
 4. Set up the appropriate environment variables/secrets for the pipeline. The minimum requirements for these variables are: `MEND_URL`, `MEND_USERKEY`, `MEND_APIKEY`, `MEND_AZUREPAT`, and `MEND_RESET`. We recommend also setting `MEND_PRODUCTTOKEN`, `MEND_PROJECTTOKEN`, and/or `MEND_EXCLUDETOKEN` as detailed above. The `MEND_RESET` variable should be configured to allow users to override its value
 5. **For your first scan, the integration requires `MEND_RESET` to be true for initial workitem creation. For all other scans, this variable can be set to false**
 <br />
@@ -97,6 +108,7 @@ The following variables can be placed into the pipeline where the integration is
 | `MEND_PROXY`             | string  |    No    | Empty String <br /> | The Proxy URL. The right format is <proxy_ip>:<proxy_port>. In case of a proxy requires Basic Authentication the format should be like this <proxy_username>:<proxy_password>@<proxy_ip>:<proxy_port>.If http:// or https:// prefix is not provided, the prefix http:// will be used by default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `MEND_ALERT`             | boolean |   No*    | True | Whether to include ignored vulnerabilities. Set to false for exclude ignored vulnerabilities.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `MEND_ENRICHMENT`        | boolean |    No    | `false` | When `true`, adds Reachability, EPSS score and Exploit Code Maturity to each work item, read from Mend API 3.0. **Requires `MEND_EMAIL`** — the integration aborts at startup naming `MEND_EMAIL` if it is missing, before making any HTTP call. See [Enrichment: Reachability, EPSS and Exploit Code Maturity](#enrichment-reachability-epss-and-exploit-code-maturity) below. |
+| `MEND_MAXLOOKBACK`       | integer |    No    | `720` | Maximum hours to look back for any single Mend project when its stored sync state is missing or stale. Bounds the cost of a project that keeps failing. Set higher if repos may go unscanned for longer than 30 days. |
 
 >**_NOTE_**: `azure-wi-sync` would accept all environment variables with either `MEND_` or `WS_` prefix. For the Azure DevOps settings (`*AZUREURI`, `*AZUREPAT`, `*AZUREPROJECT`, `*AZUREAREA`, `*AZURETYPE`), if both prefixes are set for the same setting, the `WS_` variable wins.
 <br />

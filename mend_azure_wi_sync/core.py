@@ -1895,7 +1895,8 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
             run_failed = True
             exist_wis = []
             logger.error(f"Skipping Azure project '{azure_project}': could not read "
-                         f"existing work items. Lastrun will not advance for it.")
+                         f"existing work items. Per-project sync state will not advance for it, "
+                         f"so this window will be retried on the next run.")
             for token, _ in targets[azure_project]:
                 apply_tag_ops(token, tag_ops(VERDICT_FAILED, end_date))
             continue
@@ -1955,7 +1956,7 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
         exist_wis = []
         return (f"Aborted: could not read existing work items in Azure project "
                 f"'{conf.azure_project}'. Skipping to avoid creating duplicates. "
-                f"Lastrun will not advance; this window will be retried.")
+                f"Per-project sync state will not advance; this window will be retried.")
     prepare_enrichment(res)
     for prj_el in res:
         project_start = window_start(prj_el, state, end_date, max_hours, reset_on, reset_back_time)
