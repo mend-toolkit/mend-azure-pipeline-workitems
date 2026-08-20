@@ -60,17 +60,51 @@ def _parse(stamp):
         return None
 
 
-def clamp(stamp, now_stamp, max_hours) -> str:
-    """The later of `stamp` and `now_stamp - max_hours`.
-
-    Bounds the cost of a project that keeps failing: its window widens to the clamp and stops,
-    instead of growing without limit. A missing or unparseable stamp yields the clamp, which is
-    the wide-and-safe answer for "I do not know when this last synced".
-    """
+def _floor(now_stamp, max_hours):
+    """`now_stamp - max_hours` as a datetime. The one place the lookback bound is computed."""
     now = _parse(now_stamp) or datetime.datetime.now()
-    floor = now - datetime.timedelta(hours=int(max_hours))
+    return now - datetime.timedelta(hours=int(max_hours))
+
+
+def clamp(stamp, now_stamp, max_hours) -> str:
+    """The later of `stamp` and `now_stamp - max_hours`. The flooring primitive.
+
+    For values the tool DERIVES for itself — the selection floor, a MEND_RESET window — where
+    flooring only bounds cost. It must never be applied to a stored per-project watermark:
+    moving a present watermark forward skips the gap between it and the new start, and the
+    following OK verdict then closes that gap permanently. Use keep_or_clamp for those.
+    A missing or unparseable stamp yields the floor, which is the wide-and-safe answer for
+    "I do not know when this last synced".
+    """
     own = _parse(stamp)
+    floor = _floor(now_stamp, max_hours)
     return (max(own, floor) if own else floor).strftime(TS_FORMAT)
+
+
+def keep_or_clamp(stamp, now_stamp, max_hours) -> str:
+    """A stored watermark exactly as stored, however old; only an absent one is floored.
+
+    A watermark present but older than max_hours means this project genuinely has not synced
+    since then — a project whose work item writes keep being rejected keeps a frozen watermark
+    and is retried every run. Flooring it would hand it a window starting after its own
+    watermark, and the OK verdict on the run where the operator finally fixes the cause would
+    write `lastrun = todate` over the gap, losing everything in it forever.
+    """
+    own = _parse(stamp)
+    if own is None:
+        return clamp(None, now_stamp, max_hours)
+    return own.strftime(TS_FORMAT)
+
+
+def is_stale(stamp, now_stamp, max_hours) -> bool:
+    """True when `stamp` is present and older than the max_hours floor.
+
+    keep_or_clamp honours such a watermark, so the resulting window is wider than
+    MEND_MAXLOOKBACK and the operator has to be told which project widened it. This module
+    stays pure (routing.py and enrichment.py hold no logger either), so the caller logs.
+    """
+    own = _parse(stamp)
+    return bool(own and own < _floor(now_stamp, max_hours))
 
 
 def window_start(token, state, todate, max_hours, reset, reset_hours) -> str:
@@ -79,22 +113,28 @@ def window_start(token, state, todate, max_hours, reset, reset_hours) -> str:
         # MEND_RESET is the explicit full-history escape hatch and ignores stored state entirely.
         return clamp(None, todate, reset_hours)
     own = (state or {}).get(token) or {}
-    return clamp(own.get("lastrun"), todate, max_hours)
+    return keep_or_clamp(own.get("lastrun"), todate, max_hours)
 
 
 def selection_floor(state, seed, todate, max_hours, reset, reset_hours) -> str:
     """The fromDateTime for the one global get_prj_list_modified call.
 
-    max(), not min(): every project that did not succeed carries TAG_FAILED and is unioned into
-    the selection regardless, so narrowing the modified-projects query cannot lose work.
+    min(), not max(). Only an ATTEMPTED project gets a verdict, so a project that was selected
+    and never reached — job timeout, cancellation, OOM, any exception outside create_wi's try —
+    carries no new tag at all. `max` would advance the floor past the moment that project was
+    last scanned, and getOrganizationLastModifiedProjects can then never return it again: it was
+    scanned before the floor. `min` can never be later than any project's own window start, and
+    because every OK verdict writes `lastrun = todate`, it converges on `max` after one full
+    pass. It is floored at max_hours because selecting a project whose window start is the
+    clamped max lookback anyway buys nothing but ~5 Mend calls and a tag write.
     """
     if reset:
         return clamp(None, todate, reset_hours)
     stamps = [s for s in (_parse((v or {}).get("lastrun")) for v in (state or {}).values()) if s]
     if stamps:
-        return max(stamps).strftime(TS_FORMAT)
+        return clamp(min(stamps).strftime(TS_FORMAT), todate, max_hours)
     return seed.strip() if isinstance(seed, str) and seed.strip() \
-        else clamp(None, todate, reset_hours)
+        else clamp(None, todate, max_hours)
 
 
 def build_selection(modified, state) -> list:
@@ -108,10 +148,25 @@ def build_selection(modified, state) -> list:
     return sorted(set(modified or []) | set(retry))
 
 
-def tag_ops(verdict, todate) -> list:
-    """Verdict -> ordered (op, key, value) tuples. Empty when the project was never attempted."""
+def failed_stamp(token, state) -> str:
+    """The TAG_FAILED value the read-once state map holds for one project, "" when it holds none."""
+    return ((state or {}).get(token) or {}).get("failed") or ""
+
+
+def tag_ops(verdict, todate, stored_failed="") -> list:
+    """Verdict -> ordered (op, key, value) tuples. Empty when the project was never attempted.
+
+    The remove is emitted ONLY when the state map actually carried a TAG_FAILED value, and
+    carries that value rather than "". Whether removeProjectTag tolerates an absent key, and
+    whether it matches on tagValue, are both unverified; on the worst reading an unconditional
+    remove errors on every healthy run, which would falsely report the sync state unavailable
+    and burn the once-per-run warning budget that every genuine save failure needs.
+    """
     if verdict == VERDICT_OK:
-        return [("save", TAG_LASTRUN, todate), ("remove", TAG_FAILED, "")]
+        ops = [("save", TAG_LASTRUN, todate)]
+        if isinstance(stored_failed, str) and stored_failed.strip():
+            ops.append(("remove", TAG_FAILED, stored_failed.strip()))
+        return ops
     if verdict == VERDICT_FAILED:
         return [("save", TAG_FAILED, todate)]
     return []

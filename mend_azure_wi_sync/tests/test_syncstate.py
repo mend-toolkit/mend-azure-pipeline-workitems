@@ -49,9 +49,32 @@ def test_clamp_keeps_a_recent_stamp():
     assert syncstate.clamp("2026-08-20 11:00:00", NOW, 720) == "2026-08-20 11:00:00"
 
 
-def test_clamp_floors_an_old_stamp():
+def test_clamp_floors_an_old_stamp_because_it_is_the_derived_value_primitive():
+    """clamp() still floors — it is what the selection floor and the MEND_RESET window are
+    built from, where flooring only bounds cost. What changed is that no per-project window
+    goes through it any more: see keep_or_clamp below."""
     # 720 hours before NOW is 2026-07-21 12:00:00
     assert syncstate.clamp("2020-01-01 00:00:00", NOW, 720) == "2026-07-21 12:00:00"
+
+
+def test_keep_or_clamp_never_moves_a_present_watermark_forward():
+    """A stored watermark is a fact about what has been read, not a cost knob. Flooring it
+    would skip everything between it and the floor, and the next OK verdict would write
+    lastrun = todate over that gap, losing it permanently."""
+    assert syncstate.keep_or_clamp("2020-01-01 00:00:00", NOW, 720) == "2020-01-01 00:00:00"
+
+
+def test_keep_or_clamp_floors_only_an_absent_or_unparseable_watermark():
+    for bad in (None, "", "not-a-date", "2026-13-45 99:99:99"):
+        assert syncstate.keep_or_clamp(bad, NOW, 720) == "2026-07-21 12:00:00"
+
+
+def test_is_stale_flags_only_a_present_watermark_older_than_the_lookback():
+    assert syncstate.is_stale("2020-01-01 00:00:00", NOW, 720) is True
+    assert syncstate.is_stale("2026-08-20 11:00:00", NOW, 720) is False
+    # Absent is not stale: it goes to the clamp, which is already the widest sane window.
+    assert syncstate.is_stale(None, NOW, 720) is False
+    assert syncstate.is_stale("not-a-date", NOW, 720) is False
 
 
 def test_clamp_treats_missing_and_unparseable_as_the_floor():
@@ -62,6 +85,14 @@ def test_clamp_treats_missing_and_unparseable_as_the_floor():
 def test_window_start_uses_the_projects_own_watermark():
     state = {"tok-1": {"lastrun": "2026-08-20 11:00:00"}}
     assert syncstate.window_start("tok-1", state, NOW, 720, False, 87600) == "2026-08-20 11:00:00"
+
+
+def test_window_start_honours_a_stale_watermark_instead_of_narrowing_it():
+    """The persistently-failing project: its work item writes are rejected every run so its
+    watermark freezes. On the run where the operator finally fixes the cause, a narrowed
+    window would silently drop everything raised since the freeze."""
+    state = {"tok-1": {"lastrun": "2026-06-01 00:00:00"}}
+    assert syncstate.window_start("tok-1", state, NOW, 720, False, 87600) == "2026-06-01 00:00:00"
 
 
 def test_window_start_for_an_untagged_project_is_the_clamp_not_the_floor():
@@ -76,19 +107,45 @@ def test_reset_bypasses_the_tag_map_entirely():
     assert syncstate.window_start("tok-1", state, NOW, 720, True, 87600) == "2016-08-22 12:00:00"
 
 
-def test_selection_floor_is_the_newest_watermark():
+def test_selection_floor_is_the_oldest_watermark():
+    """Was max(). max() is only safe if every project that did not succeed carries a tag, and a
+    project selected but never reached carries none — so max() would advance the floor past a
+    window nobody read. min() converges on max() after one full pass anyway."""
     state = {
         "tok-1": {"lastrun": "2026-08-20 11:00:00"},
         "tok-2": {"lastrun": "2026-08-18 11:00:00"},
         "tok-3": {"failed": "2026-08-19 11:00:00"},
     }
-    assert syncstate.selection_floor(state, "", NOW, 720, False, 87600) == "2026-08-20 11:00:00"
+    assert syncstate.selection_floor(state, "", NOW, 720, False, 87600) == "2026-08-18 11:00:00"
 
 
-def test_selection_floor_falls_back_to_the_seed_then_to_a_full_window():
+def test_a_truncated_run_does_not_let_the_floor_skip_the_project_it_never_reached():
+    """The scenario the old max() lost: the run processed tok-done and was killed (timeout,
+    cancellation, OOM) before tok-untouched. tok-untouched got no tag of any kind, so nothing
+    unions it back in — only the floor can still select it, and only if the floor stayed
+    behind its last scan."""
+    state = {
+        "tok-done": {"lastrun": "2026-08-20 11:00:00"},
+        "tok-untouched": {"lastrun": "2026-08-14 09:00:00"},
+    }
+    assert syncstate.selection_floor(state, "", NOW, 720, False, 87600) == "2026-08-14 09:00:00"
+
+
+def test_the_selection_floor_is_still_bounded_by_the_lookback():
+    """min() over a project frozen years ago must not turn the org sweep into a 10-year query:
+    a project last modified before its own window start cannot yield anything its fetch would
+    return, so selecting it costs ~5 Mend calls and a tag write for nothing."""
+    state = {"tok-frozen": {"lastrun": "2020-01-01 00:00:00"}}
+    assert syncstate.selection_floor(state, "", NOW, 720, False, 87600) == "2026-07-21 12:00:00"
+
+
+def test_selection_floor_falls_back_to_the_seed_then_to_the_lookback():
     assert syncstate.selection_floor({}, "2026-08-01 00:00:00", NOW, 720, False, 87600) \
         == "2026-08-01 00:00:00"
-    assert syncstate.selection_floor({}, "", NOW, 720, False, 87600) == "2016-08-22 12:00:00"
+    # Cold start with no seed: MEND_MAXLOOKBACK, not the 10-year reset window. Every untagged
+    # project's own window is todate - max_hours, so a wider sweep can only select projects
+    # whose fetch is guaranteed to return nothing.
+    assert syncstate.selection_floor({}, "", NOW, 720, False, 87600) == "2026-07-21 12:00:00"
 
 
 def test_selection_floor_honours_reset():
@@ -116,11 +173,34 @@ def test_selection_with_no_state_is_just_the_modified_list():
 
 def test_success_advances_the_watermark_then_clears_the_retry_flag():
     """Order matters. Clearing before advancing risks losing the retry hint on a partial
-    failure; advancing first means a failed clear self-heals on the next run."""
+    failure; advancing first means a failed clear self-heals on the next run. The remove now
+    carries the value the org sweep read back, since removeProjectTag may match on it."""
+    assert syncstate.tag_ops(syncstate.VERDICT_OK, "2026-08-20 12:00:00",
+                             "2026-08-19 11:00:00") == [
+        ("save", syncstate.TAG_LASTRUN, "2026-08-20 12:00:00"),
+        ("remove", syncstate.TAG_FAILED, "2026-08-19 11:00:00"),
+    ]
+
+
+def test_success_on_a_healthy_project_does_not_remove_a_tag_that_is_not_there():
+    """The removeProjectTag-on-an-absent-key call was unconditional. If it errors, the
+    once-per-run warning fires on every healthy run: the run falsely reports its sync state
+    unavailable AND the warning budget is spent, masking every genuine save failure after it."""
+    for absent in ("", "   ", None):
+        assert syncstate.tag_ops(syncstate.VERDICT_OK, "2026-08-20 12:00:00", absent) == [
+            ("save", syncstate.TAG_LASTRUN, "2026-08-20 12:00:00"),
+        ]
     assert syncstate.tag_ops(syncstate.VERDICT_OK, "2026-08-20 12:00:00") == [
         ("save", syncstate.TAG_LASTRUN, "2026-08-20 12:00:00"),
-        ("remove", syncstate.TAG_FAILED, ""),
     ]
+
+
+def test_failed_stamp_reads_the_stored_retry_value_for_one_project():
+    state = {"tok-1": {"failed": "2026-08-19 11:00:00"}, "tok-2": {"lastrun": "x"}}
+    assert syncstate.failed_stamp("tok-1", state) == "2026-08-19 11:00:00"
+    assert syncstate.failed_stamp("tok-2", state) == ""
+    assert syncstate.failed_stamp("tok-absent", state) == ""
+    assert syncstate.failed_stamp("tok-1", None) == ""
 
 
 def test_failure_records_the_retry_flag_and_leaves_the_watermark_alone():

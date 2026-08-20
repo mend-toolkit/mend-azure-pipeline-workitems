@@ -38,10 +38,26 @@ def _run(conf, state, modified, verdict=syncstate.VERDICT_OK):
     return modified_call, create, ops
 
 
-def test_the_modified_query_uses_the_newest_watermark_as_its_floor():
-    state = {"tok-1": {"lastrun": "2026-08-20 11:00:00"}}
+def test_the_modified_query_uses_the_oldest_watermark_as_its_floor():
+    """Was the newest. A project selected but never reached carries no tag, so the newest
+    watermark can advance the org sweep past a window nobody read and Mend can never report
+    that project modified again."""
+    state = {"tok-1": {"lastrun": "2026-08-20 11:00:00"},
+             "tok-2": {"lastrun": "2026-08-19 08:00:00"}}
     modified_call, _, _ = _run(_conf(), state, ["tok-1"])
-    assert modified_call.call_args.args[0] == "2026-08-20 11:00:00"
+    assert modified_call.call_args.args[0] == "2026-08-19 08:00:00"
+
+
+def test_a_stale_watermark_keeps_its_wide_window_and_says_so(caplog):
+    """The persistently-failing project. Narrowing its window to MEND_MAXLOOKBACK would skip
+    everything raised since it froze, and the OK verdict on the run where the operator finally
+    fixes the cause would then close that gap for good."""
+    state = {"tok-frozen": {"lastrun": "2026-06-01 00:00:00"}}
+    with caplog.at_level("WARNING"):
+        _, create, _ = _run(_conf(), state, ["tok-frozen"])
+    assert create.call_args.args[1] == "2026-06-01 00:00:00"
+    assert any("MEND_MAXLOOKBACK" in r.getMessage() and "tok-frozen" in r.getMessage()
+               for r in caplog.records)
 
 
 def test_a_failed_project_is_retried_even_when_mend_says_unmodified():
@@ -60,11 +76,20 @@ def test_each_project_is_fetched_with_its_own_clamped_window():
     assert starts["tok-new"] == "2026-07-21 12:00:00"      # clamped, not the floor
 
 
-def test_success_advances_that_projects_watermark_and_clears_its_retry_flag():
+def test_success_on_a_healthy_project_only_advances_the_watermark():
+    """No retry tag was stored, so there is nothing to remove. The unconditional remove risked
+    an error on every healthy run, which would falsely report the sync state unavailable and
+    spend the once-per-run warning that a genuine save failure needs."""
     _, _, ops = _run(_conf(), {}, ["tok-1"])
+    ops.assert_called_once_with("tok-1", [("save", syncstate.TAG_LASTRUN, TODATE)])
+
+
+def test_success_after_a_failure_clears_the_retry_flag_using_the_stored_value():
+    state = {"tok-1": {"lastrun": "2026-08-20 11:00:00", "failed": "2026-08-19 11:00:00"}}
+    _, _, ops = _run(_conf(), state, ["tok-1"])
     ops.assert_called_once_with("tok-1", [
         ("save", syncstate.TAG_LASTRUN, TODATE),
-        ("remove", syncstate.TAG_FAILED, ""),
+        ("remove", syncstate.TAG_FAILED, "2026-08-19 11:00:00"),
     ])
 
 
@@ -113,10 +138,7 @@ def test_the_routed_path_applies_tag_ops_per_mend_project():
          mock.patch.object(core, "apply_tag_ops") as ops:
         core.run_sync_routed(["tok-1"], "2026-08-01 00:00:00", TODATE, [], "Task")
     assert create.call_args.args[1] == "2026-08-20 11:00:00"
-    ops.assert_called_once_with("tok-1", [
-        ("save", syncstate.TAG_LASTRUN, TODATE),
-        ("remove", syncstate.TAG_FAILED, ""),
-    ])
+    ops.assert_called_once_with("tok-1", [("save", syncstate.TAG_LASTRUN, TODATE)])
 
 
 def test_a_failed_project_is_retried_under_routing():

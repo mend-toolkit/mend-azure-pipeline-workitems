@@ -16,8 +16,8 @@ from enrichment import (build_index, decorate_policy_violations, format_epss,
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_REVSYNC, VERDICT_FAILED, VERDICT_OK,
-                       build_selection, clamp, parse_tag_map, selection_floor, tag_ops,
-                       window_start)
+                       build_selection, clamp, failed_stamp, is_stale, keep_or_clamp,
+                       parse_tag_map, selection_floor, tag_ops, window_start)
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -284,9 +284,11 @@ def save_project_tag(prj_token: str, key: str, value: str) -> bool:
     return _tag_call("saveProjectTag", prj_token, key, value)
 
 
-def remove_project_tag(prj_token: str, key: str) -> bool:
-    # removeProjectTag takes the same tagKey/tagValue pair as save; the value is not matched on.
-    return _tag_call("removeProjectTag", prj_token, key, "")
+def remove_project_tag(prj_token: str, key: str, value: str = "") -> bool:
+    # removeProjectTag takes the same tagKey/tagValue pair as save. Whether it matches on the
+    # value is unverified, so callers pass the value the org sweep actually read back rather
+    # than assuming "" is accepted.
+    return _tag_call("removeProjectTag", prj_token, key, value)
 
 
 def apply_tag_ops(prj_token: str, ops: list):
@@ -300,7 +302,24 @@ def apply_tag_ops(prj_token: str, ops: list):
             if not save_project_tag(prj_token, key, value):
                 return
         elif op == "remove":
-            remove_project_tag(prj_token, key)
+            remove_project_tag(prj_token, key, value)
+
+
+def project_window(prj_token: str, state: dict, todate: str, max_hours, reset_on: bool) -> str:
+    """window_start, plus the warning a stale watermark owes the operator.
+
+    A stored watermark is used as stored however old (syncstate.keep_or_clamp): flooring it
+    would skip everything between it and the floor, and the next OK verdict would close that
+    gap for good. The price is a window wider than MEND_MAXLOOKBACK, which must not be silent.
+    """
+    start = window_start(prj_token, state, todate, max_hours, reset_on, reset_back_time)
+    if not reset_on and is_stale((state or {}).get(prj_token, {}).get("lastrun"),
+                                 todate, max_hours):
+        logger.warning(f"[{fn()}] Mend project {prj_token} last synced {start}, which is older "
+                      f"than MEND_MAXLOOKBACK ({max_hours}h), so its window is wider than that "
+                      f"limit. Narrowing it would permanently discard everything raised in "
+                      f"between. Expect extra idempotent work until it succeeds once.")
+    return start
 
 
 def fetch_project_tag_state() -> dict:
@@ -976,10 +995,19 @@ def check_wi_id(id: str, project_name: str):
 
 
 def clamp_revsync(prj_token, state, todate, max_hours, reset_on):
-    """window_start reads TAG_LASTRUN; the reverse direction needs TAG_REVSYNC."""
+    """window_start reads TAG_LASTRUN; the reverse direction needs TAG_REVSYNC.
+
+    Same rule as project_window: a stored watermark is honoured however old, because narrowing
+    it would drop the work item changes in between and the next success would write over them.
+    """
     if reset_on:
         return clamp(None, todate, reset_back_time)
-    return clamp((state.get(prj_token) or {}).get("revsync"), todate, max_hours)
+    stored = (state.get(prj_token) or {}).get("revsync")
+    if is_stale(stored, todate, max_hours):
+        logger.warning(f"[{fn()}] Mend project {prj_token} last pushed work item state "
+                      f"{stored}, older than MEND_MAXLOOKBACK ({max_hours}h). Its reverse "
+                      f"window stays that wide rather than skipping the gap.")
+    return keep_or_clamp(stored, todate, max_hours)
 
 
 def update_wi_for_project(prj_token: str, project_tag: str, todate: str):
@@ -1898,15 +1926,15 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
                          f"existing work items. Per-project sync state will not advance for it, "
                          f"so this window will be retried on the next run.")
             for token, _ in targets[azure_project]:
-                apply_tag_ops(token, tag_ops(VERDICT_FAILED, end_date))
+                apply_tag_ops(token, tag_ops(VERDICT_FAILED, end_date,
+                                             failed_stamp(token, state)))
             continue
         for token, route in targets[azure_project]:
             conf.reponame = route.repo
-            project_start = window_start(token, state, end_date, max_hours, reset_on,
-                                         reset_back_time)
+            project_start = project_window(token, state, end_date, max_hours, reset_on)
             verdict, message = create_wi(token, project_start, end_date, custom_flds, wi_type)
             logger.info(message)
-            apply_tag_ops(token, tag_ops(verdict, end_date))
+            apply_tag_ops(token, tag_ops(verdict, end_date, failed_stamp(token, state)))
             synced += 1
 
     conf.azure_project = original_azure_project
@@ -1959,10 +1987,10 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
                 f"Per-project sync state will not advance; this window will be retried.")
     prepare_enrichment(res)
     for prj_el in res:
-        project_start = window_start(prj_el, state, end_date, max_hours, reset_on, reset_back_time)
+        project_start = project_window(prj_el, state, end_date, max_hours, reset_on)
         verdict, message = create_wi(prj_el, project_start, end_date, custom_flds, wi_type)
         logger.info(message)
-        apply_tag_ops(prj_el, tag_ops(verdict, end_date))
+        apply_tag_ops(prj_el, tag_ops(verdict, end_date, failed_stamp(prj_el, state)))
 
     return f"{len(res)} project(s) processed" if res else "Nothing to create/update"
 

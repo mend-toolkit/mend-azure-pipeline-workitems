@@ -63,6 +63,15 @@ def test_removing_a_tag_uses_the_remove_request_type():
     assert json.loads(api.call_args.kwargs["data"])["requestType"] == "removeProjectTag"
 
 
+def test_removing_a_tag_sends_the_stored_value_when_it_has_one():
+    """Whether removeProjectTag matches on tagValue is unverified, so the caller passes what
+    the org sweep actually read back rather than betting on "" being ignored."""
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value='{"projectTags": {}}') as api:
+        core.remove_project_tag("tok-1", syncstate.TAG_FAILED, "2026-08-19 11:00:00")
+    assert json.loads(api.call_args.kwargs["data"])["tagValue"] == "2026-08-19 11:00:00"
+
+
 def test_a_failed_write_returns_false_and_warns_only_once(caplog):
     """400 identical errors per run would make the error count meaningless."""
     with mock.patch.object(core, "conf", _conf()), \
@@ -87,8 +96,9 @@ def test_apply_tag_ops_runs_saves_and_removes_in_order():
          mock.patch.object(core, "save_project_tag",
                            side_effect=lambda t, k, v: calls.append(("save", k)) or True), \
          mock.patch.object(core, "remove_project_tag",
-                           side_effect=lambda t, k: calls.append(("remove", k)) or True):
-        core.apply_tag_ops("tok-1", syncstate.tag_ops(syncstate.VERDICT_OK, "2026-08-20 12:00:00"))
+                           side_effect=lambda t, k, v="": calls.append(("remove", k)) or True):
+        core.apply_tag_ops("tok-1", syncstate.tag_ops(syncstate.VERDICT_OK, "2026-08-20 12:00:00",
+                                                     "2026-08-19 11:00:00"))
     assert calls == [("save", syncstate.TAG_LASTRUN), ("remove", syncstate.TAG_FAILED)]
 
 
@@ -99,6 +109,7 @@ def test_apply_tag_ops_skips_the_clear_when_the_advance_failed():
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "save_project_tag", return_value=False), \
          mock.patch.object(core, "remove_project_tag",
-                           side_effect=lambda t, k: calls.append(k) or True):
-        core.apply_tag_ops("tok-1", syncstate.tag_ops(syncstate.VERDICT_OK, "2026-08-20 12:00:00"))
+                           side_effect=lambda t, k, v="": calls.append(k) or True):
+        core.apply_tag_ops("tok-1", syncstate.tag_ops(syncstate.VERDICT_OK, "2026-08-20 12:00:00",
+                                                     "2026-08-19 11:00:00"))
     assert calls == []

@@ -65,6 +65,20 @@ def test_a_failed_reverse_wiql_does_not_advance_the_watermark():
     assert core.sync_had_fatal_error() is True
 
 
+def test_a_stale_revsync_watermark_is_honoured_not_narrowed(caplog):
+    """Same rule as the forward window: narrowing a present watermark would drop the work item
+    changes between it and the new start, and the next success would write over them."""
+    core.project_tag_state = {"tok-1": {"revsync": "2026-06-01 00:00:00"}}
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_azure_api", return_value=({"workItems": []}, 0)) as api, \
+         mock.patch.object(core, "save_project_tag", return_value=True), \
+         caplog.at_level("WARNING"):
+        core.update_wi_for_project("tok-1", "Prod/Proj", TODATE)
+    assert "2026-06-01 00:00:00" in api.call_args.kwargs["data"]["query"]
+    assert any("MEND_MAXLOOKBACK" in r.getMessage() and "tok-1" in r.getMessage()
+               for r in caplog.records)
+
+
 def test_no_azure_project_properties_call_is_made():
     """The permission this design exists to drop must not be reached from the reverse path."""
     core.project_tag_state = {}
