@@ -11,6 +11,11 @@ sys.path.append(os.path.dirname(__file__))
 TAG_LASTRUN = "azure-wi-lastrun"
 TAG_FAILED = "azure-wi-failed"
 TAG_REVSYNC = "azure-wi-revsync"
+# Carries "{azure_project}|{product}/{project}" -- the address the reverse sync needs to visit
+# this Mend project on its own, independent of whether the forward sync touched it this run
+# (core.reverse_targets). Written only when it differs from what is already stored, so steady
+# state is zero writes.
+TAG_PROJECT = "azure-wi-project"
 
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -21,6 +26,7 @@ _TAG_FIELDS = {
     TAG_LASTRUN: "lastrun",
     TAG_FAILED: "failed",
     TAG_REVSYNC: "revsync",
+    TAG_PROJECT: "project",
 }
 
 

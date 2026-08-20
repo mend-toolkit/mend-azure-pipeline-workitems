@@ -5,13 +5,17 @@ from mend_azure_wi_sync import syncstate
 
 # The reverse sync used to be scoped per Azure project (visiting every project the
 # forward sync routed to, via the now-removed `routed_targets` list, and closing each
-# target's window with a single project-wide Lastrun property). It is now scoped per
-# Mend project: create_wi appends (token, "Product/Project", azure_project) to
-# `synced_projects` on success, and update_wi_in_thread walks that list, scoping each
-# WIQL query to the project's own tag and advancing only that project's revsync tag
-# (core.update_wi_for_project). These tests are rewritten against that contract; the
-# old per-Azure-project / per-target Lastrun assertions are deliberately obsolete
-# (spec decision 6).
+# target's window with a single project-wide Lastrun property), then per Mend project but
+# gated on `synced_projects` -- this run's forward successes.
+#
+# That gating was itself a regression (spec 5.6.1): it meant a dormant or archived repo,
+# never touched by this run's forward sync, was never revisited, and a work item closed
+# there never reached Mend. update_wi_in_thread now walks `core.reverse_targets(state)`,
+# which reads every project the read-once Mend project tag map has a stored
+# `azure-wi-project` ("{azure_project}|{product}/{project}") address for -- independent of
+# `synced_projects`, which now only supplies the address for `save_project_addr` (core.py)
+# to persist. These tests are rewritten against that contract; the old per-Azure-project /
+# per-target Lastrun assertions remain deliberately obsolete (spec decision 6).
 
 
 def _conf(**kw):
@@ -20,9 +24,9 @@ def _conf(**kw):
     return mock.MagicMock(**base)
 
 
-def test_reverse_sync_visits_every_synced_mend_project():
-    core.synced_projects = [("tok-1", "Prod/Platform", "Platform"),
-                            ("tok-2", "Prod/Tools", "Tools")]
+def test_reverse_sync_visits_every_project_with_a_stored_address():
+    core.project_tag_state = {"tok-1": {"project": "Platform|Prod/Platform"},
+                              "tok-2": {"project": "Tools|Prod/Tools"}}
     seen = []
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "update_wi_for_project",
@@ -32,8 +36,8 @@ def test_reverse_sync_visits_every_synced_mend_project():
 
 
 def test_reverse_sync_points_conf_azure_project_at_each_targets_own_azure_project():
-    core.synced_projects = [("tok-1", "Prod/Platform", "Platform"),
-                            ("tok-2", "Prod/Tools", "Tools")]
+    core.project_tag_state = {"tok-1": {"project": "Platform|Prod/Platform"},
+                              "tok-2": {"project": "Tools|Prod/Tools"}}
     seen_azure_project = []
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "update_wi_for_project",
@@ -44,8 +48,8 @@ def test_reverse_sync_points_conf_azure_project_at_each_targets_own_azure_projec
 
 
 def test_reverse_sync_restores_the_original_project():
-    core.synced_projects = [("tok-1", "Prod/Platform", "Platform"),
-                            ("tok-2", "Prod/Tools", "Tools")]
+    core.project_tag_state = {"tok-1": {"project": "Platform|Prod/Platform"},
+                              "tok-2": {"project": "Tools|Prod/Tools"}}
     conf = _conf()
     with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "update_wi_for_project", return_value="ok"):
@@ -53,8 +57,8 @@ def test_reverse_sync_restores_the_original_project():
     assert conf.azure_project == "Bookkeeping"
 
 
-def test_reverse_sync_is_skipped_when_nothing_synced_this_run():
-    core.synced_projects = []
+def test_reverse_sync_is_skipped_when_no_project_has_a_stored_address():
+    core.project_tag_state = {}
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "update_wi_for_project") as inner:
         result = core.update_wi_in_thread()
@@ -62,14 +66,18 @@ def test_reverse_sync_is_skipped_when_nothing_synced_this_run():
     assert "skipped" in result.lower()
 
 
-def test_reverse_sync_skips_a_target_with_an_unresolved_project_tag():
-    """An empty, leading-slash, or trailing-slash tag means the product/project name
-    failed to resolve. Querying with it would match nothing, or (worse) everything —
-    so that target must be skipped rather than passed to update_wi_for_project."""
-    core.synced_projects = [("tok-bad-1", "", "Platform"),
-                            ("tok-bad-2", "/Proj", "Platform"),
-                            ("tok-bad-3", "Prod/", "Platform"),
-                            ("tok-good", "Prod/Proj", "Platform")]
+def test_reverse_sync_skips_a_target_with_a_malformed_stored_address():
+    """An empty Azure project half, an empty tag half, or a tag half with a leading or
+    trailing "/" means the stored address is unusable. Querying with it would match
+    nothing, or (worse) everything -- so that target must be skipped rather than passed to
+    update_wi_for_project, and never guessed at (e.g. falling back to conf.azure_project)."""
+    core.project_tag_state = {
+        "tok-bad-1": {"project": "|Prod/Proj"},
+        "tok-bad-2": {"project": "Platform|"},
+        "tok-bad-3": {"project": "Platform|/Proj"},
+        "tok-bad-4": {"project": "Platform|Prod/"},
+        "tok-good": {"project": "Platform|Prod/Proj"},
+    }
     seen = []
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "update_wi_for_project",
@@ -81,11 +89,11 @@ def test_reverse_sync_skips_a_target_with_an_unresolved_project_tag():
 def test_the_per_target_results_are_joined_into_one_report():
     """update_wi_for_project owns advancing its own project's revsync tag on success or
     withholding it on failure (see test_reverse_sync_state.py); update_wi_in_thread's
-    job is just to call it once per synced Mend project and report each result — it no
+    job is just to call it once per addressed Mend project and report each result -- it no
     longer gates one target's watermark write on another's outcome, because there is no
     longer a single shared watermark to gate."""
-    core.synced_projects = [("tok-1", "Prod/Platform", "Platform"),
-                            ("tok-2", "Prod/Tools", "Tools")]
+    core.project_tag_state = {"tok-1": {"project": "Platform|Prod/Platform"},
+                              "tok-2": {"project": "Tools|Prod/Tools"}}
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "update_wi_for_project",
                            side_effect=["Updated 1 work item(s) for Prod/Platform",
@@ -100,8 +108,8 @@ def test_a_failed_targets_reverse_sync_does_not_block_a_healthy_targets_watermar
     exercises the real function) advances a project's own revsync tag independently of
     any other project in the same run -- there is no longer a single shared watermark for
     one failure to withhold from everyone else."""
-    core.synced_projects = [("tok-fail", "Prod/Fail", "AzureFail"),
-                            ("tok-ok", "Prod/Ok", "AzureOk")]
+    core.project_tag_state = {"tok-fail": {"project": "AzureFail|Prod/Fail"},
+                              "tok-ok": {"project": "AzureOk|Prod/Ok"}}
 
     def fake_call_azure_api(*a, **kw):
         if kw.get("project") == "AzureFail":
@@ -109,7 +117,6 @@ def test_a_failed_targets_reverse_sync_does_not_block_a_healthy_targets_watermar
         return {"workItems": []}, 0
 
     with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "fetch_project_tag_state", return_value={}), \
          mock.patch.object(core, "call_azure_api", side_effect=fake_call_azure_api), \
          mock.patch.object(core, "save_project_tag", return_value=True) as save:
         core.update_wi_in_thread()
@@ -118,15 +125,16 @@ def test_a_failed_targets_reverse_sync_does_not_block_a_healthy_targets_watermar
     assert save.call_args.args[0] == "tok-ok"
 
 
-def test_the_non_routed_path_populates_synced_projects_so_the_reverse_sync_runs():
-    """Guards the wiring the old (now-removed) test_reverse_sync_without_routing_runs_once
-    locked down: a non-routed run_sync must leave something in synced_projects for
-    update_wi_in_thread to act on, or the reverse sync silently no-ops every run.
-    create_wi is mocked here -- its own append contract (token, "Product/Project",
-    conf.azure_project), guarded on `not item_failed`, is covered directly against the
-    real function by test_create_wi_verdict.py -- but its side_effect performs that same
-    append, so this test exercises the real run_sync -> synced_projects ->
-    update_wi_in_thread wiring end to end."""
+def test_the_non_routed_path_persists_an_address_the_reverse_sync_can_later_use():
+    """Guards the new wiring end to end: create_wi's unconditional append to
+    `synced_projects` -> `save_project_addr` (core.py) writing TAG_PROJECT -> a later run's
+    update_wi_in_thread reading that address back out of the tag map and visiting it,
+    without any dependence on `synced_projects` at that point. create_wi is mocked here --
+    its own append contract, decoupled from item_failed by this task, is covered directly
+    against the real function by test_create_wi_verdict.py -- but its side_effect performs
+    that same append, so this test exercises the real
+    run_sync -> synced_projects -> save_project_addr -> tag map -> update_wi_in_thread
+    wiring end to end."""
     conf = mock.MagicMock(routing="false", wsproducttoken="", wsprojecttoken="",
                           wsexcludetoken="", azure_project="Bookkeeping", utc_delta=0)
 
@@ -134,16 +142,27 @@ def test_the_non_routed_path_populates_synced_projects_so_the_reverse_sync_runs(
         core.synced_projects.append((token, f"Prod/{token}", conf.azure_project))
         return syncstate.VERDICT_OK, "done"
 
+    saved_tags = {}
+
+    def fake_save_project_tag(token, key, value):
+        saved_tags.setdefault(token, {})[key] = value
+        return True
+
     with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "get_prj_list_modified", return_value=["tok-1"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
          mock.patch.object(core, "fetch_project_tag_state", return_value={}), \
-         mock.patch.object(core, "save_project_tag", return_value=True), \
+         mock.patch.object(core, "save_project_tag", side_effect=fake_save_project_tag), \
          mock.patch.object(core, "create_wi", side_effect=fake_create_wi):
         core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
 
-    assert core.synced_projects  # non-empty: the reverse sync now has something to do
+    # save_project_addr found tok-1 in synced_projects and, since the (mocked-empty) tag
+    # map held no address yet, persisted one.
+    assert saved_tags["tok-1"][syncstate.TAG_PROJECT] == "Bookkeeping|Prod/tok-1"
 
+    # A later run reads that address back out of the tag map -- no synced_projects
+    # involved -- and visits the project.
+    core.project_tag_state = {"tok-1": {"project": saved_tags["tok-1"][syncstate.TAG_PROJECT]}}
     with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "update_wi_for_project", return_value="ok") as inner:
         result = core.update_wi_in_thread()

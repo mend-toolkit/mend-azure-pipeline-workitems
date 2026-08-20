@@ -214,3 +214,8 @@ def test_no_verdict_writes_nothing():
     retrying it cannot succeed until a human fixes its tag."""
     assert syncstate.tag_ops(None, "2026-08-20 12:00:00") == []
     assert syncstate.tag_ops("", "2026-08-20 12:00:00") == []
+
+
+def test_the_project_tag_is_parsed_into_the_state_map():
+    rows = [{"token": "tok-1", "tags": {"azure-wi-project": "Payments|Prod/Proj"}}]
+    assert syncstate.parse_tag_map(rows) == {"tok-1": {"project": "Payments|Prod/Proj"}}

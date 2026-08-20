@@ -68,10 +68,9 @@ def test_a_failed_reverse_sync_wiql_query_sets_the_fatal_flag():
     """A failed WIQL query in the reverse sync must never be treated as 'no more work items
     changed' — that would let the project's revsync tag advance past updates that were
     never actually read."""
-    core.synced_projects = [("tok-1", "Prod/Proj", "AzureTestProject")]
+    core.project_tag_state = {"tok-1": {"project": "AzureTestProject|Prod/Proj"}}
     with mock.patch.object(core, "call_azure_api", return_value=({"message": "boom"}, 2)), \
          mock.patch.object(core, "save_project_tag") as save, \
-         mock.patch.object(core, "fetch_project_tag_state", return_value={}), \
          mock.patch.object(core, "conf", _reverse_conf()):
         before = core.global_errors
         core.update_wi_in_thread()
@@ -84,10 +83,9 @@ def test_a_failed_reverse_sync_wiql_query_sets_the_fatal_flag():
 def test_a_genuinely_empty_reverse_sync_result_is_not_treated_as_a_failure():
     """A successful WIQL query that legitimately finds nothing changed must not be
     confused with a failed one — that distinction is the entire point of this fix."""
-    core.synced_projects = [("tok-1", "Prod/Proj", "AzureTestProject")]
+    core.project_tag_state = {"tok-1": {"project": "AzureTestProject|Prod/Proj"}}
     with mock.patch.object(core, "call_azure_api", return_value=({"workItems": []}, 0)), \
          mock.patch.object(core, "save_project_tag", return_value=True), \
-         mock.patch.object(core, "fetch_project_tag_state", return_value={}), \
          mock.patch.object(core, "conf", _reverse_conf()):
         before = core.global_errors
         result = core.update_wi_in_thread()
@@ -112,14 +110,13 @@ def test_run_sync_wires_prepare_enrichment_with_the_resolved_project_list():
 
 def test_a_failed_reverse_sync_hydration_batch_sets_the_fatal_flag():
     """A failed wit/workitems hydration call must not silently drop that page of updates."""
-    core.synced_projects = [("tok-1", "Prod/Proj", "AzureTestProject")]
+    core.project_tag_state = {"tok-1": {"project": "AzureTestProject|Prod/Proj"}}
     wiql_page = ({"workItems": [{"id": 1}]}, 0)
     failed_hydration = ({"message": "boom"}, 2)
     empty_next_page = ({"workItems": []}, 0)
     with mock.patch.object(core, "call_azure_api",
                            side_effect=[wiql_page, failed_hydration, empty_next_page]), \
          mock.patch.object(core, "save_project_tag") as save, \
-         mock.patch.object(core, "fetch_project_tag_state", return_value={}), \
          mock.patch.object(core, "conf", _reverse_conf()):
         before = core.global_errors
         core.update_wi_in_thread()

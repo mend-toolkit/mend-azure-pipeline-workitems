@@ -186,6 +186,7 @@ def test_case_insensitive_tag_routes_to_the_canonical_azure_project_casing():
          mock.patch.object(core, "fetch_project_tags", return_value=tags), \
          mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "save_project_tag", return_value=True), \
          mock.patch.object(core, "create_wi", side_effect=fake_create_wi):
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -244,6 +245,7 @@ def test_a_failed_target_does_not_stop_the_others():
         return syncstate.VERDICT_OK, "done"
 
     with mock.patch.object(core, "get_exist_wi", side_effect=[None, []]), \
+         mock.patch.object(core, "save_project_tag", return_value=True), \
          mock.patch.object(core, "create_wi", side_effect=fake_create_wi) as create:
         _patches(conf)
         try:

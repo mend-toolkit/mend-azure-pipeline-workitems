@@ -90,7 +90,8 @@ def test_a_failed_work_item_write_verdicts_failed():
     `nonlocal item_failed` in create_wi_content -- without it, Python would create a fresh
     local there and this test would silently see VERDICT_OK instead (verified manually by
     deleting that line; see the report for that experiment's output)."""
-    with mock.patch.object(core, "conf", _conf_with_library()), \
+    conf = _conf_with_library()
+    with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "fetch_prj_policy",
                            return_value=["Prod", "Proj", _prj_el_with_one_cve()]), \
          mock.patch.object(core, "call_ws_api",
@@ -104,11 +105,12 @@ def test_a_failed_work_item_write_verdicts_failed():
     assert verdict == syncstate.VERDICT_FAILED
     assert "No Task work items" in message
     # item_failed was set True inside create_wi_content's errcode==1 branch, and the
-    # function still reaches this same end-of-function return (no early exit) -- so this
-    # is the case that actually depends on the `if not item_failed:` guard around the
-    # synced_projects append, unlike test_a_failed_mend_fetch_verdicts_failed above (which
-    # returns before that line is ever reached). See the report's hoist experiment.
-    assert core.synced_projects == []
+    # function still reaches this same end-of-function return (no early exit). Per spec
+    # 5.6.1 the append is now unconditional: a forward write failure says nothing about
+    # whether this project's *existing* work items changed state, so the reverse sync must
+    # still be able to find and visit it. (Previously this asserted `== []`, guarded by an
+    # `if not item_failed:` around the append that this task removed.)
+    assert core.synced_projects == [("tok-1", "Prod/Proj", conf.azure_project)]
 
 
 def test_an_azure_api_exception_during_write_verdicts_failed():

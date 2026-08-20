@@ -15,9 +15,10 @@ from enrichment import (build_index, decorate_policy_violations, format_epss,
                         format_exploit, format_reachability)
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
-from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_REVSYNC, VERDICT_FAILED, VERDICT_OK,
-                       build_selection, clamp, failed_stamp, is_stale, keep_or_clamp,
-                       parse_tag_map, selection_floor, tag_ops, window_start)
+from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_PROJECT, TAG_REVSYNC, VERDICT_FAILED,
+                       VERDICT_OK, build_selection, clamp, failed_stamp, is_stale,
+                       keep_or_clamp, parse_tag_map, selection_floor, tag_ops, window_start)
+from syncstate import _parse as _parse_timestamp
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -326,6 +327,25 @@ def record_verdict(prj_token: str, verdict: str, todate: str, state: dict):
         logger.error(f"[{fn()}] Mend project {prj_token} did not sync completely. Its sync state "
                     f"is not advanced and it will be retried on the next run.")
     apply_tag_ops(prj_token, tag_ops(verdict, todate, failed_stamp(prj_token, state)))
+
+
+def save_project_addr(prj_token: str, state: dict):
+    """Persist TAG_PROJECT for one Mend project, but only when the value differs from what
+    the read-once tag map already holds -- zero writes in steady state.
+
+    Sourced from `synced_projects` (populated unconditionally by create_wi, regardless of
+    verdict) rather than recomputed, so the stored address always matches the exact tag
+    string create_wi wrote onto the work items themselves. A project create_wi never reached
+    this run (job timeout, exception outside its try) has no synced_projects entry, so this
+    is a no-op for it -- there is nothing yet to address, and the previously stored address
+    (if any) is left untouched.
+    """
+    project_tag = next((tag for token, tag, _ in synced_projects if token == prj_token), "")
+    if not project_tag:
+        return
+    desired = f"{conf.azure_project}|{project_tag}"
+    if (state.get(prj_token) or {}).get("project") != desired:
+        save_project_tag(prj_token, TAG_PROJECT, desired)
 
 
 def project_window(prj_token: str, state: dict, todate: str, max_hours, reset_on: bool) -> str:
@@ -1030,10 +1050,16 @@ def clamp_revsync(prj_token, state, todate, max_hours, reset_on):
 
     Same rule as project_window: a stored watermark is honoured however old, because narrowing
     it would drop the work item changes in between and the next success would write over them.
+
+    An absent (or unparseable) watermark is the "first-ever reverse sync" case and must not be
+    floored at MEND_MAXLOOKBACK -- that would silently start only 30 days back. It looks back
+    reset_back_time instead, once per project.
     """
     if reset_on:
         return clamp(None, todate, reset_back_time)
     stored = (state.get(prj_token) or {}).get("revsync")
+    if _parse_timestamp(stored) is None:
+        return clamp(None, todate, reset_back_time)
     if is_stale(stored, todate, max_hours):
         logger.warning(f"[{fn()}] Mend project {prj_token} last pushed work item state "
                       f"{stored}, older than MEND_MAXLOOKBACK ({max_hours}h). Its reverse "
@@ -1147,28 +1173,52 @@ def update_wi_for_project(prj_token: str, project_tag: str, todate: str):
         return f"[{ex()}] Update Mend's data failed: {err}"
 
 
+def reverse_targets(state: dict) -> list:
+    """[(token, azure_project, project_tag)] for every project the tag map has an address for.
+
+    Deliberately independent of this run's forward outcome (spec 5.6.1): a dormant or archived
+    repo's closed work items must still reach Mend, so this walks the whole read-once tag map
+    rather than `synced_projects` (which only supplies the address create_wi resolves this run,
+    for save_project_addr to persist).
+
+    A malformed or half-empty stored value -- an empty Azure project, an empty tag half, or a
+    tag half that would make the WIQL "CONTAINS" clause match every project (a leading or
+    trailing "/") -- is skipped and logged, never guessed at nor defaulted to conf.azure_project:
+    guessing here risks pushing an unrelated work item's state to the wrong Mend project.
+    """
+    out = []
+    for token, entry in sorted((state or {}).items()):
+        stored = (entry or {}).get("project") or ""
+        if not stored:
+            continue
+        azure_project, _, project_tag = stored.partition("|")
+        if not azure_project or not project_tag or project_tag.startswith("/") \
+                or project_tag.endswith("/"):
+            logger.error(f"[{fn()}] Skipping reverse sync for {token}: malformed "
+                         f"{TAG_PROJECT} value '{stored}'.")
+            continue
+        out.append((token, azure_project, project_tag))
+    return out
+
+
 def update_wi_in_thread():
     # Kept under the original name because azure_wi_sync.py imports it by that name.
-    # The reverse sync is scoped per Mend project (not per Azure project) so its watermark
-    # can live on that project as a tag; synced_projects (populated by create_wi) is the
-    # only source of the {product}/{project} tag strings that scoping needs.
+    # Visits every Mend project the tag map has an address for, every run -- not this run's
+    # forward outcome, and not get_prj_list_modified. That is what closes the regression
+    # against pre-branch behaviour: a quiet/dormant repo whose work items get closed must
+    # still be pushed back to Mend even though nothing about it changed on the forward side.
     global conf
     if conf is None:
         conf = startup()
         conf.update_properties()
-    if not synced_projects:
+    targets = reverse_targets(fetch_project_tag_state())
+    if not targets:
         return "Nothing was synced this run; reverse sync skipped."
     original_azure_project = conf.azure_project
     todate = (datetime.datetime.now() +
               datetime.timedelta(hours=conf.utc_delta)).strftime("%Y-%m-%d %H:%M:%S")
     results = []
-    for prj_token, project_tag, azure_project in synced_projects:
-        if not project_tag or project_tag.startswith("/") or project_tag.endswith("/"):
-            # An unresolved product or project name would produce a tag clause that matches
-            # nothing or, worse, matches everything. Skip rather than query with it.
-            logger.error(f"[{fn()}] Skipping reverse sync for {prj_token}: "
-                         f"unresolved project tag '{project_tag}'.")
-            continue
+    for prj_token, azure_project, project_tag in targets:
         conf.azure_project = azure_project
         results.append(f"{project_tag}: {update_wi_for_project(prj_token, project_tag, todate)}")
     conf.azure_project = original_azure_project
@@ -1552,7 +1602,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             policy_lic_name = try_or_error(
                 lambda: prj_el['policy']['name'][prj_el['policy']['name'].find("]") + 1:].strip(), "")
             tags = build_wi_tags(f"{prd_name}/{prj_name}",
-                                 Tags.get_el_by_name(prj_el["policy"]["policyMatch"]["type"]),
+                                 Tags.get_el_by_name(policy_type),
                                  conf.routing, conf.reponame)
             key_uuid = try_or_error(lambda: prj_el['library']['keyUuid'], "")
             path_dep, path_lib = get_pathes(key_uuid)
@@ -1788,9 +1838,12 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         message = f"{count_item} {conf.azure_type} work items created/updated for Mend project " \
                   f"'{prj_name}' (Product '{prd_name}')" if count_item > 0 else \
             f"No {conf.azure_type} work items {status_op} for Mend project '{prj_name}' (Product '{prd_name}')"
-        if not item_failed:
-            # The reverse sync queries by this exact tag, and only create_wi resolves the names.
-            synced_projects.append((prj_token, f"{prd_name}/{prj_name}", conf.azure_project))
+        # Written unconditionally: a forward work-item write failure says nothing about
+        # whether this project's existing work items changed state (spec 5.6.1). Only
+        # create_wi resolves the (product, project) tag string the reverse sync needs; the
+        # reverse sync's own project_failed flag still withholds its watermark on a reverse
+        # failure.
+        synced_projects.append((prj_token, f"{prd_name}/{prj_name}", conf.azure_project))
         return (VERDICT_FAILED if item_failed else VERDICT_OK), message
     except Exception as err:
         return VERDICT_FAILED, f"[{ex()}] Work item creation failed: {err}"
@@ -1993,6 +2046,7 @@ def run_sync_routed(modified_projects: list, end_date: str, custom_flds: list,
             verdict, message = create_wi(token, project_start, end_date, custom_flds, wi_type)
             logger.info(message)
             record_verdict(token, verdict, end_date, state)
+            save_project_addr(token, state)
             synced += 1
 
     conf.azure_project = original_azure_project
@@ -2050,6 +2104,7 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
         verdict, message = create_wi(prj_el, project_start, end_date, custom_flds, wi_type)
         logger.info(message)
         record_verdict(prj_el, verdict, end_date, state)
+        save_project_addr(prj_el, state)
 
     return f"{len(res)} project(s) processed" if res else "Nothing to create/update"
 
