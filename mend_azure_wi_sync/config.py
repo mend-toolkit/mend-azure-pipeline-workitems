@@ -53,6 +53,7 @@ class varenvs(Enum):  # Lit of Env.variables
     wsemail = ("WS_EMAIL", "MEND_EMAIL")
     wsapiurl = ("WS_APIURL", "MEND_APIURL")
     wsenrichment = ("WS_ENRICHMENT", "MEND_ENRICHMENT")
+    wsmaxlookback = ("WS_MAXLOOKBACK", "MEND_MAXLOOKBACK")
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -122,6 +123,7 @@ class Config:
     email: str
     api_url: str
     enrichment: str
+    maxlookback: str
 
     def conf_json(self):
         return {
@@ -148,6 +150,7 @@ class Config:
             "wsrouting": self.routing,
             "wsbranches": self.branches,
             "wsenrichment": self.enrichment,
+            "wsmaxlookback": self.maxlookback,
         }
 
     def get_values(self):
@@ -173,6 +176,8 @@ class Config:
                     value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "enrichment":
                     value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "maxlookback":
+                    value = "720" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "branches":
                     value = "main,master" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "api_url":

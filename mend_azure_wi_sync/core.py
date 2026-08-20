@@ -143,6 +143,8 @@ def check_patterns():
         # The 2.0/3.0 login takes an email and has no default. Failing here costs one line;
         # failing at call time costs a doomed login attempt per project.
         res.append("MEND_EMAIL must be set when MEND_ENRICHMENT is enabled")
+    if try_or_error(lambda: int(conf.maxlookback) <= 0, True):
+        res.append(f"MEND_MAXLOOKBACK must be a positive number of hours, got '{conf.maxlookback}'")
     return res
 
 
@@ -1957,6 +1959,7 @@ def startup():
         email=varenvs.get_env("wsemail").strip(),
         api_url=varenvs.get_env("wsapiurl").strip(),
         enrichment=varenvs.get_env("wsenrichment").strip(),
+        maxlookback=varenvs.get_env("wsmaxlookback").strip(),
     )
     try:
         return conf
