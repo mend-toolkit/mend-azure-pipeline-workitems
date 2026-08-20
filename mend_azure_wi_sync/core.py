@@ -47,6 +47,10 @@ WARNING_MSG = False
 API_VERSION = "1.4"
 AGENT_INFO = {"agent": f"{__tool_name__.replace('_', '-')}", "agentVersion": __version__}
 DEFAULT_PRIORITY = 2
+# The reverse sync selects only these two (see update_wi_for_project's tag clause), so a work
+# item created for any other policy match type can never round-trip to Mend. Creating one
+# orphans it, and #4 means nothing ever closes it.
+SUPPORTED_POLICY_TYPES = ("LICENSE", "VULNERABILITY_SCORE")
 uuid_pattern = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 token_pattern = r"^[0-9a-zA-Z]{64}$"
 azurearea = r"^[0-9a-zA-Z\s\-_]+$"
@@ -1533,11 +1537,16 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         prj_name = ws_prj[1]
         status_op = "created"
         count_item = 0
+        skipped_types = {}
         sorted_libs = sorted(ws_prj[2:], key=lambda x: (x["library"]["keyId"], -len(x["policyViolations"])))
         enrichment_index = enrich_project(prj_token) if sorted_libs else {}
         if enrichment_index:
             safe_decorate(sorted_libs, enrichment_index)
         for prj_el in sorted_libs:
+            policy_type = try_or_error(lambda: prj_el["policy"]["policyMatch"]["type"], "")
+            if policy_type not in SUPPORTED_POLICY_TYPES:
+                skipped_types[policy_type or "unknown"] = skipped_types.get(policy_type or "unknown", 0) + 1
+                continue
             lib_url = prj_el["library"]["url"]
             lib_name = prj_el["library"]["filename"]
             policy_lic_name = try_or_error(
@@ -1769,6 +1778,12 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                        f"<br><b> Library home page: " \
                                        f"</b><a href='{lib_home_page}'>{lib_home_page}</a>" + vul_data + lic_data
                                 create_wi_content(issue_id=issue_id)
+
+        if skipped_types:
+            detail = ", ".join(f"{name} x{count}" for name, count in sorted(skipped_types.items()))
+            logger.info(f"Skipped {sum(skipped_types.values())} violation(s) with unsupported "
+                        f"policy type(s) for Mend project '{prj_name}': {detail}. Only "
+                        f"{' and '.join(SUPPORTED_POLICY_TYPES)} produce work items.")
 
         message = f"{count_item} {conf.azure_type} work items created/updated for Mend project " \
                   f"'{prj_name}' (Product '{prd_name}')" if count_item > 0 else \
