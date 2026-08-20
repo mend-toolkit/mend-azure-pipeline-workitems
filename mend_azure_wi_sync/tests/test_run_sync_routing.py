@@ -26,8 +26,7 @@ def _patches(conf, known={"Platform", "Tools"}):
     for p in (mock.patch.object(core, "conf", conf),
               mock.patch.object(core, "get_prj_list_modified", return_value=list(TAGS)),
               mock.patch.object(core, "fetch_project_tags", return_value=TAGS),
-              mock.patch.object(core, "list_azure_projects", return_value=known),
-              mock.patch.object(core, "set_lastrun", return_value=0)):  # not called here; guards regressions
+              mock.patch.object(core, "list_azure_projects", return_value=known)):
         p.start()
 
 
@@ -104,8 +103,7 @@ def test_run_is_not_fatal_when_every_outcome_is_a_deliberate_skip():
          mock.patch.object(core, "fetch_project_tags", return_value=tags), \
          mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
-         mock.patch.object(core, "set_lastrun", return_value=0):
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:
@@ -125,8 +123,7 @@ def test_run_is_still_fatal_when_zero_routed_outcomes_are_genuine():
          mock.patch.object(core, "fetch_project_tags", return_value=tags), \
          mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
-         mock.patch.object(core, "set_lastrun", return_value=0):
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:
@@ -150,8 +147,7 @@ def test_collided_token_reaches_a_loud_outcome_not_the_quiet_no_target_bucket():
          mock.patch.object(core, "list_azure_projects", return_value={"Platform", "Tools"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
          mock.patch.object(core, "create_wi",
-                           side_effect=lambda t, *a, **k: created.append(t) or (syncstate.VERDICT_OK, "done")), \
-         mock.patch.object(core, "set_lastrun", return_value=0):
+                           side_effect=lambda t, *a, **k: created.append(t) or (syncstate.VERDICT_OK, "done")):
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:
@@ -190,8 +186,7 @@ def test_case_insensitive_tag_routes_to_the_canonical_azure_project_casing():
          mock.patch.object(core, "fetch_project_tags", return_value=tags), \
          mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", side_effect=fake_create_wi), \
-         mock.patch.object(core, "set_lastrun", return_value=0):
+         mock.patch.object(core, "create_wi", side_effect=fake_create_wi):
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:

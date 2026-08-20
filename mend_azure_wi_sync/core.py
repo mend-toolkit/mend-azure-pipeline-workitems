@@ -154,42 +154,29 @@ def check_patterns():
     return res
 
 
-def get_lastrun(time_delta: int, reset: str):
-    if reset.lower() == "true":
-        last_run = (datetime.datetime.now() + datetime.timedelta(hours=time_delta) -
-                    datetime.timedelta(hours=reset_back_time)).strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        azure_prj_id = get_azure_prj_id(conf.azure_project)
-        if azure_prj_id:
-            r, errorcode = call_azure_api(api_type="GET", api=f"projects/{azure_prj_id}/properties", data={},
-                                          version="7.0-preview", cmd_type="?keys=Lastrun&", header="application/json")
-        last_run = try_or_error(lambda: r["value"][0]["value"],
-                                (datetime.datetime.now() + datetime.timedelta(hours=time_delta) -
-                                 datetime.timedelta(hours=reset_back_time)).strftime("%Y-%m-%d %H:%M:%S"))
-    return last_run
+def migration_seed() -> str:
+    """Best-effort read of the legacy Azure `Lastrun` property, for one purpose only.
 
-
-def set_lastrun(lastrun: str):
-    global global_errors
-    azure_prj_id = get_azure_prj_id(conf.azure_project)
-    errorcode = 2
-    if azure_prj_id:
-        data = [{
-            "op": "add",
-            "path": "/Lastrun",
-            "value": f"{lastrun}"
-        }]
-
-        r, errorcode = call_azure_api(api_type="PATCH", api="projects/{" + azure_prj_id + "}/properties", data=data,
-                                      version="7.0-preview")
-        if errorcode > 0:
-            info_el = r.pop()
-            logger.error(f"[{fn()}] {info_el}")
-            global_errors += 1
-    else:
-        logger.error(f"The Azure Project {conf.azure_project} was not found")
-        global_errors += 1
-    return errorcode
+    On the first run after upgrading, no project carries tags yet, so the selection floor would
+    fall back to a full window. Seeding it from the old property keeps that upgrade cheap. This
+    is the ONLY remaining reference to Azure project properties: it never exits, never sets
+    run_failed, and returns "" on any failure. Removable once every deployment has run once.
+    """
+    # Must consult tag state itself: main() calls this BEFORE run_sync, so the module global is
+    # still None at this point and a bare truthiness check would never skip the Azure call.
+    # fetch_project_tag_state is memoised, so this is the same one sweep run_sync will reuse.
+    if fetch_project_tag_state():
+        return ""
+    azure_prj_id = try_or_error(lambda: get_azure_prj_id(conf.azure_project), "")
+    if not azure_prj_id:
+        return ""
+    r, errorcode = call_azure_api(api_type="GET", api=f"projects/{azure_prj_id}/properties",
+                                  data={}, version="7.0-preview",
+                                  cmd_type="?keys=Lastrun&", header="application/json")
+    if errorcode != 0:
+        logger.info("No legacy Lastrun property available to seed from; using MEND_MAXLOOKBACK.")
+        return ""
+    return try_or_error(lambda: r["value"][0]["value"], "")
 
 
 azure_project_page = 100

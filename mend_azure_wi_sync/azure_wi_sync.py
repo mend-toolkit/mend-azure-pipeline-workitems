@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _version import __tool_name__, __version__, __description__
-from core import run_sync, update_wi_in_thread, startup, get_lastrun, set_lastrun, load_wi_json, AGENT_INFO, \
+from core import run_sync, update_wi_in_thread, startup, migration_seed, load_wi_json, AGENT_INFO, \
     check_patterns, sync_had_fatal_error, error_count
 
 logger = logging.getLogger(__tool_name__)
@@ -35,9 +35,6 @@ def main():
         logger.error(f"The Workitem type {conf.azure_type} was not found")
         exit(-1)
     conf.utc_delta = int((datetime.datetime.utcnow()-datetime.datetime.now()).total_seconds()/3600)  # in hours
-    last_run = get_lastrun(conf.utc_delta, conf.reset)
-    if set_lastrun(lastrun=last_run) == 2:  # Serious error
-        exit(-1)
     logger.info("Sync process started")
     if conf.reset.lower() != "true":
         logger.warning("MEND_RESET parameter set to FALSE, only creating work items since last ran scan")
@@ -53,18 +50,15 @@ def main():
 
     now = datetime.datetime.now() + datetime.timedelta(hours=conf.utc_delta)
     todate = now.strftime("%Y-%m-%d %H:%M:%S")
-    time_sync = (now-datetime.datetime.strptime(last_run, "%Y-%m-%d %H:%M:%S")).total_seconds()/3600  # in hours
-    time_sync = time_sync if time_sync > 1 else 1  # Minimal sync time period is 1 hour
-    logger.info(run_sync((now - datetime.timedelta(hours=time_sync)).strftime("%Y-%m-%d %H:%M:%S"),
-                     todate, wi_fields, wi_type))
+    # No write probe and no exit: sync state lives in Mend project tags now, so a missing
+    # *Manage project properties* permission is no longer fatal — or needed.
+    logger.info(run_sync(migration_seed(), todate, wi_fields, wi_type))
     logger.info(update_wi_in_thread())
-    now = datetime.datetime.now() + datetime.timedelta(hours=conf.utc_delta)
     if sync_had_fatal_error():
         logger.error("Not advancing Lastrun: the sync did not complete. "
                      "This window will be retried on the next run.")
         logger.error("Sync process FAILED. Please look at the log.")
         exit(1)
-    set_lastrun(now.strftime("%Y-%m-%d %H:%M:%S"))
     errors = error_count()
     if errors == 0:
         logger.info("Sync process completed successfully")
