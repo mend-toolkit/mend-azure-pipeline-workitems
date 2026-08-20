@@ -42,3 +42,72 @@ def test_an_unexpected_exception_verdicts_failed():
         verdict, _ = core.create_wi("tok-1", "2026-08-01 00:00:00",
                                     "2026-08-20 12:00:00", [], "Task")
     assert verdict == syncstate.VERDICT_FAILED
+
+
+def _prj_el_with_one_cve():
+    """A minimally plausible policy-violation library, shaped to reach create_wi_content
+    through the real (unmocked) nested closures: one CVE, no license violation, nothing
+    ignored, nothing already existing in Azure."""
+    return {
+        "library": {"url": "http://example.com/lib", "filename": "lib-1.0.jar",
+                    "keyUuid": "uuid-1", "keyId": 1},
+        "policy": {"name": "[X] Some Policy", "policyMatch": {"type": "VULNERABILITY_SCORE"}},
+        "policyViolations": [
+            {"violationType": "VULNERABILITY", "issueUuid": "issue-1",
+             "vulnerability": {"name": "CVE-2024-1234", "severity": "high",
+                                "cvss3_score": 9.8, "score": 9.8, "description": "desc",
+                                "url": "http://example.com/cve", "publishDate": "2024-01-01",
+                                "topFix": {"url": "http://example.com/fix", "date": "2024-02-01",
+                                           "type": "upgrade", "fixResolution": "upgrade to 2.0"}}}
+        ],
+    }
+
+
+def _conf_with_library():
+    # ws_user_key must be a real string (not a bare MagicMock attribute) so the nested
+    # get_prj_lib_hierarchy/get_prj_licenses/get_lib_locations closures' json.dumps(...)
+    # calls succeed instead of silently falling back via try_or_error. priority/description/
+    # azure_area are pinned to plain falsy/known values so this test exercises the item_failed
+    # mechanism and nothing incidental to it.
+    return mock.MagicMock(azure_type="Task", dependency="false", wsalert="true",
+                          enrichment="false", reponame="", routing="false",
+                          ws_user_key="uk-123", description="", priority="false",
+                          azure_area="", azure_project="TestProj")
+
+
+def test_a_failed_work_item_write_verdicts_failed():
+    """Covers the per-item failure mechanism itself (the design's central guarantee): a
+    non-empty sorted_libs reaches create_wi_content, whose errcode == 1 branch sets
+    item_failed. That assignment only reaches this function's return value because of
+    `nonlocal item_failed` in create_wi_content -- without it, Python would create a fresh
+    local there and this test would silently see VERDICT_OK instead (verified manually by
+    deleting that line; see the report for that experiment's output)."""
+    with mock.patch.object(core, "conf", _conf_with_library()), \
+         mock.patch.object(core, "fetch_prj_policy",
+                           return_value=["Prod", "Proj", _prj_el_with_one_cve()]), \
+         mock.patch.object(core, "call_ws_api",
+                           return_value='{"libraries": [], "libraryLocations": []}'), \
+         mock.patch.object(core, "call_azure_api",
+                           return_value=({"message": "boom"}, 1)), \
+         mock.patch.object(core, "exist_wis", []), \
+         mock.patch.object(core, "updated_wi", []):
+        verdict, message = core.create_wi("tok-1", "2026-08-01 00:00:00",
+                                          "2026-08-20 12:00:00", [], "Task")
+    assert verdict == syncstate.VERDICT_FAILED
+    assert "No Task work items" in message
+
+
+def test_an_azure_api_exception_during_write_verdicts_failed():
+    """Covers the third item_failed mutation site: the nested `except Exception` handler
+    inside create_wi_content, exercised separately from the errcode == 1 branch above."""
+    with mock.patch.object(core, "conf", _conf_with_library()), \
+         mock.patch.object(core, "fetch_prj_policy",
+                           return_value=["Prod", "Proj", _prj_el_with_one_cve()]), \
+         mock.patch.object(core, "call_ws_api",
+                           return_value='{"libraries": [], "libraryLocations": []}'), \
+         mock.patch.object(core, "call_azure_api", side_effect=Exception("boom")), \
+         mock.patch.object(core, "exist_wis", []), \
+         mock.patch.object(core, "updated_wi", []):
+        verdict, message = core.create_wi("tok-1", "2026-08-01 00:00:00",
+                                          "2026-08-20 12:00:00", [], "Task")
+    assert verdict == syncstate.VERDICT_FAILED
