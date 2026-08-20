@@ -7,8 +7,10 @@
 # Excluded Local/User Directories
 _archive/
 _misc/
+docs/
 local/
 log/
+research/
 target/
 
 # Excluded Files - Extensions
@@ -31,3 +33,5 @@ local-env.*
 /.idea/
 
 /out/
+.venv/
+.env.local

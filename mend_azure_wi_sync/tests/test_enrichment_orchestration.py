@@ -82,3 +82,34 @@ def test_enrichment_never_raises_out_of_enrich_project():
     with mock.patch.object(core, "conf", _on()), \
          mock.patch.object(core, "fetch_project_enrichment", side_effect=TypeError("boom")):
         assert core.enrich_project("tok-1") == {}
+
+
+def _run_sync_conf(**kw):
+    """run_sync needs the token-list branch, so routing must not read as 'true'."""
+    return mock.MagicMock(routing="false", wsproducttoken="", wsprojecttoken="",
+                          wsexcludetoken="", **kw)
+
+
+def _run_sync(caplog, conf):
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=["tok-1"]), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "prepare_enrichment"), \
+         caplog.at_level("INFO"):
+        core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_run_sync_logs_that_enrichment_is_on(caplog):
+    """A pipeline log could not answer 'did enrichment run?' either way, which is what made
+    the MEND_AZURETYPE: BUG description loss take three exchanges to diagnose."""
+    messages = _run_sync(caplog, _run_sync_conf(enrichment="true"))
+    assert any("Enrichment: on" in el for el in messages)
+
+
+def test_run_sync_logs_that_enrichment_is_off(caplog):
+    """Off is the default and the silent-inert case — an unexpanded $(MEND_ENRICHMENT)
+    normalizes to 'false', so the off line is the one that actually earns its keep."""
+    messages = _run_sync(caplog, _run_sync_conf(enrichment="false"))
+    assert any("Enrichment: off" in el for el in messages)

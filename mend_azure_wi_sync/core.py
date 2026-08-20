@@ -1834,6 +1834,10 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     logger.info("Getting a modified project list")
     modified_projects = get_prj_list_modified(st_date, end_date)
     logger.info(f"Selection mode: {'tag-based routing' if conf.routing.lower() == 'true' else 'token list'}")
+    # Logged on both branches, before routing returns: without it a pipeline log cannot
+    # answer "did enrichment run?", and 'off' is reached silently by an unexpanded
+    # $(MEND_ENRICHMENT) as well as by an explicit false.
+    logger.info(f"Enrichment: {'on' if enrichment_enabled() else 'off'} (MEND_ENRICHMENT)")
     if conf.routing.lower() == "true":
         return run_sync_routed(modified_projects, st_date, end_date, custom_flds, wi_type)
     if conf.wsproducttoken:
