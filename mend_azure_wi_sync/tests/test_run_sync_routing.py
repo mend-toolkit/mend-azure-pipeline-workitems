@@ -175,14 +175,22 @@ def test_case_insensitive_tag_routes_to_the_canonical_azure_project_casing():
                           {"key": "azure-repo", "value": "api"},
                           {"key": "azure-branch", "value": "refs/heads/main"}]}
     seen_azure_project = []
+
+    def fake_create_wi(token, *a, **kw):
+        # Stands in for create_wi, which is the only place that appends to
+        # synced_projects (core.py). Recording conf.azure_project here mirrors that
+        # real behaviour so this test can still assert on the canonical casing that
+        # flows through to what the reverse sync will later query against.
+        seen_azure_project.append(conf.azure_project)
+        core.synced_projects.append((token, f"Product/{token}", conf.azure_project))
+        return syncstate.VERDICT_OK, "done"
+
     with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "get_prj_list_modified", return_value=list(tags)), \
          mock.patch.object(core, "fetch_project_tags", return_value=tags), \
          mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi",
-                           side_effect=lambda t, *a, **k: seen_azure_project.append(conf.azure_project)
-                           or (syncstate.VERDICT_OK, "done")), \
+         mock.patch.object(core, "create_wi", side_effect=fake_create_wi), \
          mock.patch.object(core, "set_lastrun", return_value=0):
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -191,7 +199,9 @@ def test_case_insensitive_tag_routes_to_the_canonical_azure_project_casing():
 
     assert seen_azure_project == ["Platform"]   # canonical Azure casing, not the raw "platform" tag
     assert "1 of 1" in result
-    assert "Platform" in core.routed_targets
+    # synced_projects (create_wi's contract) carries the canonical Azure casing that the
+    # reverse sync scopes its WIQL to — this supersedes the old routed_targets list.
+    assert any(p[2] == "Platform" for p in core.synced_projects)
 
 
 def test_routing_wires_prepare_enrichment_with_the_routed_token_list():
@@ -230,8 +240,16 @@ def test_a_failed_target_does_not_stop_the_others():
     # Platform first so this exercises the failure-isolation and Lastrun-safety paths, not
     # just "some target failed, some target didn't".
     conf = _conf()
+
+    def fake_create_wi(token, *a, **kw):
+        # Stands in for create_wi, which is the only place that appends to
+        # synced_projects (core.py) — the list the reverse sync now walks instead of
+        # the removed routed_targets.
+        core.synced_projects.append((token, f"Product/{token}", conf.azure_project))
+        return syncstate.VERDICT_OK, "done"
+
     with mock.patch.object(core, "get_exist_wi", side_effect=[None, []]), \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")) as create:
+         mock.patch.object(core, "create_wi", side_effect=fake_create_wi) as create:
         _patches(conf)
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -240,10 +258,12 @@ def test_a_failed_target_does_not_stop_the_others():
     assert create.call_count == 1
     # The failure must be visible to main() via the fatal-error signal...
     assert core.sync_had_fatal_error() is True
-    # ...and the failed target must never appear in routed_targets: Task 12 uses that list
-    # to decide whose Lastrun to advance, and a failed target's window must stay open.
-    assert "Platform" not in core.routed_targets
-    assert "Tools" in core.routed_targets
+    # ...and the failed target's Azure project must never appear among synced_projects:
+    # its Mend project window must stay open for retry, and the reverse sync (which now
+    # walks synced_projects instead of the removed routed_targets) must not visit it.
+    tracked_azure_projects = {p[2] for p in core.synced_projects}
+    assert "Platform" not in tracked_azure_projects
+    assert "Tools" in tracked_azure_projects
 
 
 def test_conf_azure_project_is_restored():

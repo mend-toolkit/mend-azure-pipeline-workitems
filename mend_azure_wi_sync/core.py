@@ -16,7 +16,8 @@ from enrichment import (build_index, decorate_policy_violations, format_epss,
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_REVSYNC, VERDICT_FAILED, VERDICT_OK,
-                       build_selection, parse_tag_map, selection_floor, tag_ops, window_start)
+                       build_selection, clamp, parse_tag_map, selection_floor, tag_ops,
+                       window_start)
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -51,7 +52,7 @@ token_pattern = r"^[0-9a-zA-Z]{64}$"
 azurearea = r"^[0-9a-zA-Z\s\-_]+$"
 global_errors = 0
 exist_wis = []
-routed_targets = []
+synced_projects = []   # [(prj_token, "Product/Project", azure_project)] appended by create_wi
 updated_wi = []
 run_failed = False
 mend_v2_session = None  # SessionInfo dict from POST /api/v2.0/login; JWT lives 10 minutes
@@ -987,21 +988,36 @@ def check_wi_id(id: str, project_name: str):
         return 0
 
 
-def update_wi_for_project():
+def clamp_revsync(prj_token, state, todate, max_hours, reset_on):
+    """window_start reads TAG_LASTRUN; the reverse direction needs TAG_REVSYNC."""
+    if reset_on:
+        return clamp(None, todate, reset_back_time)
+    return clamp((state.get(prj_token) or {}).get("revsync"), todate, max_hours)
+
+
+def update_wi_for_project(prj_token: str, project_tag: str, todate: str):
     global conf, global_errors, run_failed
     if conf is None:
         conf = startup()
         conf.update_properties()
+    state = fetch_project_tag_state()
+    reset_on = conf.reset.lower() == "true"
+    max_hours = try_or_error(lambda: int(conf.maxlookback), 720)
+    # Scoped to one Mend project so its watermark can live on that project as a tag. The extra
+    # tag clause also shrinks every result set, which relieves the 20,000-row WIQL cap (#5).
+    since = clamp_revsync(prj_token, state, todate, max_hours, reset_on)
     try:
-        logger.info("Start to update Mend’s data")
+        logger.info(f"Start to update Mend's data for {project_tag}")
         first_id = 0
         executed_wi = 0
+        project_failed = False
         tag_lic = Tags.get_el_by_name("LICENSE")
         tag_vul = Tags.get_el_by_name("VULNERABILITY_SCORE")
         while True:
             data = {"query": f'select [System.Id] From WorkItems Where '
-                             f'[System.ChangedDate] > "{get_lastrun(conf.utc_delta, conf.reset)}" And '
+                             f'[System.ChangedDate] > "{since}" And '
                              f'[System.TeamProject] = "{conf.azure_project}" And [System.Id] > {first_id} '
+                             f'AND ([System.Tags] CONTAINS "{project_tag}") '
                              f'AND (([System.Tags] CONTAINS "{tag_lic}") or ([System.Tags] CONTAINS "{tag_vul}")) '
                              f'And [System.State] <> "Removed" AND [System.State] <> "Deleted" '
                              f'ORDER BY [System.Id]'}
@@ -1012,6 +1028,7 @@ def update_wi_for_project():
                 logger.error(f"[{fn()}] Reverse sync WIQL query failed: {r}")
                 global_errors += 1
                 run_failed = True
+                project_failed = True
                 break
             results_wi = r["workItems"]
             if not results_wi:
@@ -1029,6 +1046,7 @@ def update_wi_for_project():
                     logger.error(f"[{fn()}] Reverse sync hydration failed for ids {id_str}: {wi}")
                     global_errors += 1
                     run_failed = True
+                    project_failed = True
                 if errcode == 0:
                     for wq_el in wi['value']:
                         issue_id = wq_el['id']
@@ -1039,10 +1057,10 @@ def update_wi_for_project():
                             # Now Vulnerability and License violation are produced only
                             try:
                                 uuid = ""
-                                prj_token = ""
+                                wi_prj_token = ""
                                 for wq_el_rel_ in wq_el['relations']:
                                     if wq_el_rel_['rel'] == "Hyperlink":
-                                        prj_token = try_or_error(lambda: wq_el_rel_['attributes']['comment'].split(",")[0], "")
+                                        wi_prj_token = try_or_error(lambda: wq_el_rel_['attributes']['comment'].split(",")[0], "")
                                         uuid = try_or_error(lambda: wq_el_rel_['attributes']['comment'].split(",")[1], "")
 
                                 wq_el_url = wq_el['url'][0:wq_el['url'].find("apis")] + f"workitems/edit/{issue_id}"
@@ -1053,12 +1071,12 @@ def update_wi_for_project():
                                                "created": wq_el['fields']['System.CreatedDate']
                                                }]
                                 try:
-                                    if uuid and prj_token:
+                                    if uuid and wi_prj_token:
                                         data = json.dumps(
                                             {"requestType": "updateExternalIntegrationIssues",
                                              "userKey": conf.ws_user_key,
                                              "orgToken": conf.ws_org_token,
-                                             "projectToken": prj_token,
+                                             "projectToken": wi_prj_token,
                                              "wsPolicyIssueItemUuid": uuid,
                                              "externalIssues": ext_issues
                                              })
@@ -1070,7 +1088,9 @@ def update_wi_for_project():
                                 executed_wi += 1
                             except Exception as err:
                                 pass
-        return f"Updated {executed_wi} corresponded Mend's item(s)"
+        if not project_failed:
+            save_project_tag(prj_token, TAG_REVSYNC, todate)
+        return f"Updated {executed_wi} work item(s) for {project_tag}"
     except Exception as err:
         global_errors += 1
         run_failed = True
@@ -1079,49 +1099,28 @@ def update_wi_for_project():
 
 def update_wi_in_thread():
     # Kept under the original name because azure_wi_sync.py imports it by that name.
-    # Under routing the forward sync visits many Azure projects; the reverse sync must
-    # visit the same set, since its WIQL is scoped to conf.azure_project.
+    # The reverse sync is scoped per Mend project (not per Azure project) so its watermark
+    # can live on that project as a tag; synced_projects (populated by create_wi) is the
+    # only source of the {product}/{project} tag strings that scoping needs.
     global conf
     if conf is None:
         conf = startup()
         conf.update_properties()
-    if conf.routing.lower() != "true":
-        return update_wi_for_project()
-    if not routed_targets:
-        # Routing is on but the forward sync routed nothing this run — a quiet window, or
-        # everything branch-filtered. Do NOT fall back to conf.azure_project: that would
-        # sync one bookkeeping project and silently skip the other 106.
-        return "Routing enabled but no targets were synced; reverse sync skipped."
-
+    if not synced_projects:
+        return "Nothing was synced this run; reverse sync skipped."
     original_azure_project = conf.azure_project
+    todate = (datetime.datetime.now() +
+              datetime.timedelta(hours=conf.utc_delta)).strftime("%Y-%m-%d %H:%M:%S")
     results = []
-    for azure_project in routed_targets:
-        conf.azure_project = azure_project
-        failed_before = run_failed
-        result = update_wi_for_project()
-        results.append(f"{azure_project}: {result}")
-        if run_failed and not failed_before:
-            # This target's own reverse sync failed (WIQL, hydration, or an exception).
-            # Its watermark must stay put so the retry can recover the missed window —
-            # otherwise the global watermark being withheld (below) cannot help this
-            # target, because its per-target watermark already moved.
-            logger.error(f"Not advancing Lastrun for {azure_project}: its reverse sync "
-                         f"did not complete.")
+    for prj_token, project_tag, azure_project in synced_projects:
+        if not project_tag or project_tag.startswith("/") or project_tag.endswith("/"):
+            # An unresolved product or project name would produce a tag clause that matches
+            # nothing or, worse, matches everything. Skip rather than query with it.
+            logger.error(f"[{fn()}] Skipping reverse sync for {prj_token}: "
+                         f"unresolved project tag '{project_tag}'.")
             continue
-        # Only now is this target's window safe to close: the forward sync created its work
-        # items and the reverse sync has just read the old watermark.
-        # utc_delta, like every other reader and writer of this property (azure_wi_sync.py:54,
-        # :61 and get_lastrun at core.py:116/:124). Without it the watermark is written in a
-        # different timezone from the one it is compared against — merely wasteful west of
-        # UTC, but silently lossy east of it.
-        try:
-            stamp = datetime.datetime.now() + datetime.timedelta(hours=conf.utc_delta)
-            set_lastrun(stamp.strftime("%Y-%m-%d %H:%M:%S"))
-        except Exception as err:
-            # Don't let one target's watermark write take down the rest of the loop — a bad
-            # write here just means that target's window is retried next run, not that every
-            # subsequent routed target gets skipped and conf.azure_project is left dangling.
-            logger.error(f"[{ex()}] Failed to advance Lastrun for {azure_project}: {err}")
+        conf.azure_project = azure_project
+        results.append(f"{project_tag}: {update_wi_for_project(prj_token, project_tag, todate)}")
     conf.azure_project = original_azure_project
     return "; ".join(results)
 
@@ -1470,7 +1469,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
     def is_ignored(cve, ignored):
         return cve in ignored
 
-    global conf, global_errors, exist_wis, updated_wi, count_item
+    global conf, global_errors, exist_wis, updated_wi, count_item, synced_projects
     try:
         item_failed = False
         ws_prj = fetch_prj_policy(prj_token, sdate, edate)
@@ -1728,6 +1727,9 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         message = f"{count_item} {conf.azure_type} work items created/updated for Mend project " \
                   f"'{prj_name}' (Product '{prd_name}')" if count_item > 0 else \
             f"No {conf.azure_type} work items {status_op} for Mend project '{prj_name}' (Product '{prd_name}')"
+        if not item_failed:
+            # The reverse sync queries by this exact tag, and only create_wi resolves the names.
+            synced_projects.append((prj_token, f"{prd_name}/{prj_name}", conf.azure_project))
         return (VERDICT_FAILED if item_failed else VERDICT_OK), message
     except Exception as err:
         return VERDICT_FAILED, f"[{ex()}] Work item creation failed: {err}"
@@ -1785,7 +1787,7 @@ def expand_product_tokens(producttoken: str) -> list:
 
 def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom_flds: list,
                     wi_type: str):
-    global exist_wis, global_errors, routed_targets, run_failed
+    global exist_wis, global_errors, run_failed
     # conf.azure_project, conf.reponame and conf.azure_area are all re-pointed per target
     # below and must be restored: main() still uses conf.azure_project for bookkeeping, and
     # create_area mutates azure_area cumulatively.
@@ -1891,9 +1893,6 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
 
     prepare_enrichment([token for target in targets.values() for token, _ in target])
 
-    # Populated as targets SUCCEED, not up front: the reverse sync uses this list to decide
-    # whose Lastrun to advance, and a failed target must not have its window closed.
-    routed_targets = []
     synced = 0
     state = fetch_project_tag_state()
     reset_on = conf.reset.lower() == "true"
@@ -1921,10 +1920,6 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
             logger.info(message)
             apply_tag_ops(token, tag_ops(verdict, end_date))
             synced += 1
-        routed_targets.append(azure_project)
-        # Deliberately NO set_lastrun here. Lastrun is read by the reverse sync, which runs
-        # after this (azure_wi_sync.py:60). Writing it now would close the window before it
-        # is read and the reverse sync would push nothing back to Mend. Task 12 writes it.
 
     conf.azure_project = original_azure_project
     conf.reponame = original_reponame
@@ -1933,8 +1928,9 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
 
 
 def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
-    global exist_wis, global_errors, run_failed
+    global exist_wis, global_errors, run_failed, synced_projects
     run_failed = False
+    synced_projects = []
     res = []
     state = fetch_project_tag_state()
     reset_on = conf.reset.lower() == "true"

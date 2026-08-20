@@ -52,7 +52,7 @@ def reset_core_globals():
     """core.py holds mutable module globals that leak between tests."""
     from mend_azure_wi_sync import core
     saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session,
-             core.run_failed, core.routed_targets, core.entities_rows, core.enrichment_disabled,
+             core.run_failed, core.synced_projects, core.entities_rows, core.enrichment_disabled,
              core.project_uuid_map, core.resolved_project_names, core.project_tag_state,
              core.tag_state_available, core.TAG_WARNED)
     core.exist_wis = []
@@ -60,7 +60,7 @@ def reset_core_globals():
     core.global_errors = 0
     core.mend_v2_session = None
     core.run_failed = False
-    core.routed_targets = []
+    core.synced_projects = []
     core.entities_rows = None
     core.enrichment_disabled = False
     core.project_uuid_map = {}
@@ -70,6 +70,6 @@ def reset_core_globals():
     core.TAG_WARNED = False
     yield
     (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session,
-     core.run_failed, core.routed_targets, core.entities_rows, core.enrichment_disabled,
+     core.run_failed, core.synced_projects, core.entities_rows, core.enrichment_disabled,
      core.project_uuid_map, core.resolved_project_names, core.project_tag_state,
      core.tag_state_available, core.TAG_WARNED) = saved
