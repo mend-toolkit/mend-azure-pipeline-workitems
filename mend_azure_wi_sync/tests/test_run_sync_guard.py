@@ -1,6 +1,7 @@
 from unittest import mock
 
 from mend_azure_wi_sync import core
+from mend_azure_wi_sync import syncstate
 from mend_azure_wi_sync.core import sync_had_fatal_error, global_errors as frozen_counter
 
 
@@ -37,7 +38,7 @@ def test_a_clean_run_is_not_reported_as_fatal():
     core.run_failed = True
     with mock.patch.object(core, "get_prj_list_modified", return_value=["prj-token-1"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
          mock.patch.object(core, "conf", _conf()):
         core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
     assert core.sync_had_fatal_error() is False
@@ -85,7 +86,7 @@ def test_run_sync_wires_prepare_enrichment_with_the_resolved_project_list():
     or every enabled customer silently gets three columns of '-' with all tests green."""
     with mock.patch.object(core, "get_prj_list_modified", return_value=["prj-token-1"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
          mock.patch.object(core, "prepare_enrichment") as prepare, \
          mock.patch.object(core, "conf", _conf()):
         core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")

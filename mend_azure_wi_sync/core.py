@@ -1340,6 +1340,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         return f"/fields/Custom.{fld_name}"
 
     def create_wi_content(issue_id):
+        nonlocal item_failed
         global data, count_item, global_errors
         data = [
             {
@@ -1434,11 +1435,14 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 count_item += 1
                 logger.info(f"{conf.azure_type} {r['id']} {status_op}")
             elif errcode == 1:
+                item_failed = True
                 logger.warning(f"{conf.azure_type} creation/update failed: {r['message']}")
             else:
+                item_failed = True
                 info_el = r.pop()
                 logger.error(f"[{fn()}] {info_el}")
         except Exception as err:
+            item_failed = True
             logger.error(f"[{ex()}] Work item creation/update failed: {err}")
             global_errors += 1
 
@@ -1468,7 +1472,13 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
 
     global conf, global_errors, exist_wis, updated_wi, count_item
     try:
+        item_failed = False
         ws_prj = fetch_prj_policy(prj_token, sdate, edate)
+        if ws_prj is None:
+            # Absence of findings is a real answer; a failed fetch is not. Verdicting OK here
+            # would close this project's window having never read it.
+            return VERDICT_FAILED, (f"Mend policy fetch failed for project {prj_token}; "
+                                    f"nothing synced and its window stays open")
         ignore_alerts = get_ingnored_alerts(project=prj_token) if conf.wsalert.lower() == "false" else []
         prj_lib_hierarchy = try_or_error(lambda: get_prj_lib_hierarchy()["libraries"], [])
         prj_licenses = try_or_error(lambda: get_prj_licenses(), [])
@@ -1715,11 +1725,12 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                        f"</b><a href='{lib_home_page}'>{lib_home_page}</a>" + vul_data + lic_data
                                 create_wi_content(issue_id=issue_id)
 
-        return f"{count_item} {conf.azure_type} work items created/updated for Mend project " \
-               f"'{prj_name}' (Product '{prd_name}')" if count_item > 0 else \
+        message = f"{count_item} {conf.azure_type} work items created/updated for Mend project " \
+                  f"'{prj_name}' (Product '{prd_name}')" if count_item > 0 else \
             f"No {conf.azure_type} work items {status_op} for Mend project '{prj_name}' (Product '{prd_name}')"
+        return (VERDICT_FAILED if item_failed else VERDICT_OK), message
     except Exception as err:
-        return f"[{ex()}] Work item creation failed: {err}"
+        return VERDICT_FAILED, f"[{ex()}] Work item creation failed: {err}"
 
 
 def list_azure_projects():
@@ -1899,7 +1910,8 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
             continue
         for token, route in targets[azure_project]:
             conf.reponame = route.repo
-            logger.info(create_wi(token, st_date, end_date, custom_flds, wi_type))
+            verdict, message = create_wi(token, st_date, end_date, custom_flds, wi_type)
+            logger.info(message)
             synced += 1
         routed_targets.append(azure_project)
         # Deliberately NO set_lastrun here. Lastrun is read by the reverse sync, which runs
@@ -1947,7 +1959,8 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
                 f"Lastrun will not advance; this window will be retried.")
     prepare_enrichment(res)
     for prj_el in res:
-        logger.info(create_wi(prj_el, st_date, end_date, custom_flds, wi_type))
+        verdict, message = create_wi(prj_el, st_date, end_date, custom_flds, wi_type)
+        logger.info(message)
 
     return f"{len(res)} project(s) processed" if res else "Nothing to create/update"
 

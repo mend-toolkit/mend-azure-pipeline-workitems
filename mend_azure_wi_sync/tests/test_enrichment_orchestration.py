@@ -3,6 +3,7 @@ from unittest import mock
 import pytest
 
 from mend_azure_wi_sync import core
+from mend_azure_wi_sync import syncstate
 
 
 @pytest.fixture(autouse=True)
@@ -94,7 +95,7 @@ def _run_sync(caplog, conf):
     with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "get_prj_list_modified", return_value=["tok-1"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
          mock.patch.object(core, "prepare_enrichment"), \
          caplog.at_level("INFO"):
         core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")

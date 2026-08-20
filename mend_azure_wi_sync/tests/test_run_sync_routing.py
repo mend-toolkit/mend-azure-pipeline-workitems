@@ -1,6 +1,7 @@
 from unittest import mock
 
 from mend_azure_wi_sync import core
+from mend_azure_wi_sync import syncstate
 
 
 def _conf(routing="true", exclude="", product="", project=""):
@@ -34,7 +35,7 @@ def test_routing_off_does_not_call_the_tag_api():
     with mock.patch.object(core, "conf", _conf(routing="false")), \
          mock.patch.object(core, "get_prj_list_modified", return_value=["tok-a"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
          mock.patch.object(core, "fetch_project_tags") as tags:
         core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
     tags.assert_not_called()
@@ -43,7 +44,7 @@ def test_routing_off_does_not_call_the_tag_api():
 def test_routing_on_syncs_each_azure_target_once():
     conf = _conf()
     with mock.patch.object(core, "get_exist_wi", return_value=[]) as exist, \
-         mock.patch.object(core, "create_wi", return_value="done"):
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
         _patches(conf)
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -59,7 +60,7 @@ def test_excluded_token_is_never_synced_and_is_reported_distinctly():
     created = []
     with mock.patch.object(core, "get_exist_wi", return_value=[]), \
          mock.patch.object(core, "create_wi",
-                           side_effect=lambda t, *a, **k: created.append(t) or "done"):
+                           side_effect=lambda t, *a, **k: created.append(t) or (syncstate.VERDICT_OK, "done")):
         _patches(conf)
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -75,7 +76,7 @@ def test_untagged_project_is_never_synced():
     created = []
     with mock.patch.object(core, "get_exist_wi", return_value=[]), \
          mock.patch.object(core, "create_wi",
-                           side_effect=lambda t, *a, **k: created.append(t) or "done"):
+                           side_effect=lambda t, *a, **k: created.append(t) or (syncstate.VERDICT_OK, "done")):
         _patches(conf)
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -103,7 +104,7 @@ def test_run_is_not_fatal_when_every_outcome_is_a_deliberate_skip():
          mock.patch.object(core, "fetch_project_tags", return_value=tags), \
          mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
          mock.patch.object(core, "set_lastrun", return_value=0):
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -124,7 +125,7 @@ def test_run_is_still_fatal_when_zero_routed_outcomes_are_genuine():
          mock.patch.object(core, "fetch_project_tags", return_value=tags), \
          mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
          mock.patch.object(core, "set_lastrun", return_value=0):
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -149,7 +150,7 @@ def test_collided_token_reaches_a_loud_outcome_not_the_quiet_no_target_bucket():
          mock.patch.object(core, "list_azure_projects", return_value={"Platform", "Tools"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
          mock.patch.object(core, "create_wi",
-                           side_effect=lambda t, *a, **k: created.append(t) or "done"), \
+                           side_effect=lambda t, *a, **k: created.append(t) or (syncstate.VERDICT_OK, "done")), \
          mock.patch.object(core, "set_lastrun", return_value=0):
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -180,7 +181,8 @@ def test_case_insensitive_tag_routes_to_the_canonical_azure_project_casing():
          mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
          mock.patch.object(core, "create_wi",
-                           side_effect=lambda t, *a, **k: seen_azure_project.append(conf.azure_project) or "done"), \
+                           side_effect=lambda t, *a, **k: seen_azure_project.append(conf.azure_project)
+                           or (syncstate.VERDICT_OK, "done")), \
          mock.patch.object(core, "set_lastrun", return_value=0):
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -197,7 +199,7 @@ def test_routing_wires_prepare_enrichment_with_the_routed_token_list():
     every enabled customer silently gets three columns of '-' with all tests green."""
     conf = _conf()
     with mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value="done"), \
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
          mock.patch.object(core, "prepare_enrichment") as prepare:
         _patches(conf)
         try:
@@ -229,7 +231,7 @@ def test_a_failed_target_does_not_stop_the_others():
     # just "some target failed, some target didn't".
     conf = _conf()
     with mock.patch.object(core, "get_exist_wi", side_effect=[None, []]), \
-         mock.patch.object(core, "create_wi", return_value="done") as create:
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")) as create:
         _patches(conf)
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -247,7 +249,7 @@ def test_a_failed_target_does_not_stop_the_others():
 def test_conf_azure_project_is_restored():
     conf = _conf()
     with mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value="done"):
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
         _patches(conf)
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
