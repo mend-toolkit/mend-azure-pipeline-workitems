@@ -165,7 +165,7 @@ def test_the_routed_path_applies_tag_ops_per_mend_project():
          mock.patch.object(core, "create_wi",
                            return_value=(syncstate.VERDICT_OK, "done")) as create, \
          mock.patch.object(core, "apply_tag_ops") as ops:
-        core.run_sync_routed(["tok-1"], "2026-08-01 00:00:00", TODATE, [], "Task")
+        core.run_sync_routed(["tok-1"], TODATE, [], "Task")
     assert create.call_args.args[1] == "2026-08-20 11:00:00"
     ops.assert_called_once_with("tok-1", [("save", syncstate.TAG_LASTRUN, TODATE)])
 
@@ -205,7 +205,7 @@ def test_an_unroutable_project_gets_no_tag_writes_at_all():
          mock.patch.object(core, "prepare_enrichment"), \
          mock.patch.object(core, "create_wi") as create, \
          mock.patch.object(core, "apply_tag_ops") as ops:
-        core.run_sync_routed(["tok-1"], "2026-08-01 00:00:00", TODATE, [], "Task")
+        core.run_sync_routed(["tok-1"], TODATE, [], "Task")
     create.assert_not_called()
     ops.assert_not_called()
 
@@ -251,3 +251,49 @@ def test_a_failed_project_outside_scope_is_not_synced_under_routing():
          mock.patch.object(core, "apply_tag_ops"):
         core.run_sync(st_date="", end_date=TODATE, custom_flds=[], wi_type="Task")
     assert create.call_args_list == []
+
+
+def test_a_retry_only_window_with_no_routable_target_is_loud_but_not_fatal(caplog):
+    """A failed project whose Azure destination is later renamed, deleted or lost to PAT
+    visibility yields considered-but-not-routed on every quiet run. Escalating that to
+    run_failed meant exit 1 hourly, forever, blaming MEND_BRANCHES — and it can never be
+    re-verdicted, because it never reaches create_wi. Only a manual tag edit would clear it."""
+    core.project_tag_state = {"tok-stale": {"lastrun": "2026-08-20 11:00:00",
+                                           "failed": "2026-08-19 11:00:00"}}
+    route_missing = [{"key": "azure-project", "value": "Deleted"},
+                     {"key": "azure-repo", "value": "api"},
+                     {"key": "azure-branch", "value": "refs/heads/main"}]
+    with mock.patch.object(core, "conf", _conf(routing="true", branches="main",
+                                               azure_project="Book", azure_area="", reponame="")), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=[]), \
+         mock.patch.object(core, "fetch_project_tags", return_value={"tok-stale": route_missing}), \
+         mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "prepare_enrichment"), \
+         mock.patch.object(core, "create_wi"), \
+         mock.patch.object(core, "apply_tag_ops"), \
+         caplog.at_level("ERROR"):
+        core.run_sync(st_date="", end_date=TODATE, custom_flds=[], wi_type="Task")
+    assert core.sync_had_fatal_error() is False
+    # Still loud: the diagnostic must survive, only the escalation goes.
+    assert any("nothing routed" in r.getMessage() for r in caplog.records)
+
+
+def test_fresh_work_that_routes_nowhere_is_still_fatal():
+    """The other half: an unroutable project Mend genuinely reported modified is a real
+    misconfiguration on a real window, and must keep exiting non-zero."""
+    core.project_tag_state = {}
+    route_missing = [{"key": "azure-project", "value": "Deleted"},
+                     {"key": "azure-repo", "value": "api"},
+                     {"key": "azure-branch", "value": "refs/heads/main"}]
+    with mock.patch.object(core, "conf", _conf(routing="true", branches="main",
+                                               azure_project="Book", azure_area="", reponame="")), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=["tok-fresh"]), \
+         mock.patch.object(core, "fetch_project_tags", return_value={"tok-fresh": route_missing}), \
+         mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "prepare_enrichment"), \
+         mock.patch.object(core, "create_wi"), \
+         mock.patch.object(core, "apply_tag_ops"):
+        core.run_sync(st_date="", end_date=TODATE, custom_flds=[], wi_type="Task")
+    assert core.sync_had_fatal_error() is True

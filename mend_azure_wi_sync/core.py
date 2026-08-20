@@ -361,6 +361,14 @@ def fetch_project_tag_state() -> dict:
         project_tag_state = {}
         return project_tag_state
     project_tag_state = parse_tag_map(rows)
+    if rows and not project_tag_state:
+        # Non-empty rows that yield no state means the row shape is not what parse_tag_map
+        # expects (gate 4.1.2 is unverified). Without this the run logs "Sync state: Mend
+        # project tags", every window silently falls to the clamp, no project is ever retried,
+        # and migration_seed re-reads the frozen legacy property forever. Deliberately no
+        # guessing at alternative key names: this exists to make a mismatch loud, not to
+        # paper over it.
+        _warn_tag_state_once("getOrganizationProjectTags returned rows in an unexpected shape")
     return project_tag_state
 
 
@@ -1823,8 +1831,8 @@ def expand_product_tokens(producttoken: str) -> list:
     return res
 
 
-def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom_flds: list,
-                    wi_type: str):
+def run_sync_routed(modified_projects: list, end_date: str, custom_flds: list,
+                    wi_type: str, retry_only=None):
     global exist_wis, global_errors, run_failed
     # conf.azure_project, conf.reponame and conf.azure_area are all re-pointed per target
     # below and must be restored: main() still uses conf.azure_project for bookkeeping, and
@@ -1903,17 +1911,30 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
     # scope-excluded, out-of-scope and branch-filtered are deliberate outcomes — the last
     # is "the normal state during rollout" per routing.py — so a run made up entirely of
     # those must not be fatal. Only count outcomes that actually reached a routing decision.
-    considered = [o for o in outcomes.values()
+    considered = [t for t, o in outcomes.items()
                   if o not in (SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_BRANCH)]
+    # A candidate that only got here because it carries azure-wi-failed is not fresh work.
+    # If its destination is later renamed, deleted or falls out of PAT visibility, a quiet
+    # window contains nothing else, it classifies SKIP_UNKNOWN, and the fatal below would
+    # exit 1 on every run forever — never re-verdicted, because it never reaches create_wi,
+    # so only a manual tag edit in Mend could clear it. Loud, yes; fatal, no.
+    fresh = [t for t in considered if t not in set(retry_only or [])]
     if considered and not routed:
-        # Zero coverage among projects that reached a routing decision is never normal.
-        # This must also be FATAL: logging at ERROR alone still lets main() advance the
-        # global watermark and print "completed successfully" with exit 0, because
-        # global_errors is imported by value.
         global_errors += 1
-        run_failed = True
-        logger.error(f"{report} — nothing routed. Check MEND_BRANCHES "
-                     f"('{conf.branches}') and the scan template's tag keys.")
+        if fresh:
+            # Zero coverage among projects that reached a routing decision is never normal.
+            # This must also be FATAL: logging at ERROR alone still lets main() advance the
+            # global watermark and print "completed successfully" with exit 0, because
+            # global_errors is imported by value.
+            run_failed = True
+            logger.error(f"{report} — nothing routed. Check MEND_BRANCHES "
+                         f"('{conf.branches}') and the scan template's tag keys.")
+        else:
+            logger.error(f"{report} — nothing routed, and every candidate this window came "
+                         f"from the retry queue ({TAG_FAILED}) rather than from a fresh scan. "
+                         f"Not failing the run: a retry entry whose destination no longer "
+                         f"exists would otherwise fail every run forever. Fix the routing "
+                         f"tags in Mend, or remove {TAG_FAILED} from the project(s) above.")
     elif outcomes and not routed:
         logger.warning(f"{report} — nothing routed this window.")
     else:
@@ -1986,7 +2007,8 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
         else "unavailable — windows fall back to MEND_MAXLOOKBACK"
     logger.info(f"Sync state: {sync_state_desc}; window floor {floor} -> {end_date}")
     if conf.routing.lower() == "true":
-        return run_sync_routed(candidates, floor, end_date, custom_flds, wi_type)
+        return run_sync_routed(candidates, end_date, custom_flds, wi_type,
+                               retry_only=set(candidates) - set(modified_projects or []))
     if conf.wsproducttoken:
         expanded = expand_product_tokens(conf.wsproducttoken)
         if expanded is None:

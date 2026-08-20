@@ -72,6 +72,32 @@ def test_removing_a_tag_sends_the_stored_value_when_it_has_one():
     assert json.loads(api.call_args.kwargs["data"])["tagValue"] == "2026-08-19 11:00:00"
 
 
+def test_rows_that_parse_to_nothing_are_reported_not_treated_as_no_state(caplog):
+    """A response shaped differently from {"token":…, "tags":{…}} left tag_state_available True,
+    so the run logged "Sync state: Mend project tags" while every window silently fell to the
+    clamp, nothing was ever retried, and migration_seed re-read the frozen legacy property
+    forever. No speculative key-name fallbacks: the point is to make a mismatch loud."""
+    unexpected = json.dumps({"projectTags": [{"projectToken": "tok-1",
+                                             "tags": [{"key": "azure-wi-lastrun"}]}]})
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value=unexpected), \
+         caplog.at_level("ERROR"):
+        assert core.fetch_project_tag_state() == {}
+    assert core.tag_state_available is False
+    assert any("unexpected shape" in r.getMessage() for r in caplog.records)
+
+
+def test_an_empty_org_with_no_tags_yet_is_not_reported_as_a_shape_problem(caplog):
+    """The first run after upgrade legitimately has no tagged project. That must stay quiet, or
+    the once-per-run warning budget is spent before any real failure can use it."""
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value=json.dumps({"projectTags": []})), \
+         caplog.at_level("ERROR"):
+        assert core.fetch_project_tag_state() == {}
+    assert core.tag_state_available is True
+    assert caplog.records == []
+
+
 def test_a_failed_write_returns_false_and_warns_only_once(caplog):
     """400 identical errors per run would make the error count meaningless."""
     with mock.patch.object(core, "conf", _conf()), \
