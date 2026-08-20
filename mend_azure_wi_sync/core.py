@@ -339,13 +339,22 @@ def save_project_addr(prj_token: str, state: dict):
     this run (job timeout, exception outside its try) has no synced_projects entry, so this
     is a no-op for it -- there is nothing yet to address, and the previously stored address
     (if any) is left untouched.
+
+    On a successful write, also updates `state` in place. `state` is the same dict object
+    fetch_project_tag_state() memoises as `project_tag_state`, so this lets the same run's
+    update_wi_in_thread (which reads that same memoised map) see the address a project was
+    just given, instead of the reverse sync skipping it until the following run. It also
+    means a token addressed twice in the same run short-circuits on the second call via the
+    "already differs" check above, rather than re-writing.
     """
     project_tag = next((tag for token, tag, _ in synced_projects if token == prj_token), "")
     if not project_tag:
         return
     desired = f"{conf.azure_project}|{project_tag}"
-    if (state.get(prj_token) or {}).get("project") != desired:
-        save_project_tag(prj_token, TAG_PROJECT, desired)
+    if (state.get(prj_token) or {}).get("project") == desired:
+        return
+    if save_project_tag(prj_token, TAG_PROJECT, desired):
+        state.setdefault(prj_token, {})["project"] = desired
 
 
 def project_window(prj_token: str, state: dict, todate: str, max_hours, reset_on: bool) -> str:
@@ -1184,7 +1193,9 @@ def reverse_targets(state: dict) -> list:
     A malformed or half-empty stored value -- an empty Azure project, an empty tag half, or a
     tag half that would make the WIQL "CONTAINS" clause match every project (a leading or
     trailing "/") -- is skipped and logged, never guessed at nor defaulted to conf.azure_project:
-    guessing here risks pushing an unrelated work item's state to the wrong Mend project.
+    guessing here risks pushing an unrelated work item's state to the wrong Mend project. Both
+    halves are stripped before validation, so a whitespace-padded half neither slips a padded
+    (non-matching) value into the WIQL clause nor a whitespace-only half past the emptiness check.
     """
     out = []
     for token, entry in sorted((state or {}).items()):
@@ -1192,6 +1203,7 @@ def reverse_targets(state: dict) -> list:
         if not stored:
             continue
         azure_project, _, project_tag = stored.partition("|")
+        azure_project, project_tag = azure_project.strip(), project_tag.strip()
         if not azure_project or not project_tag or project_tag.startswith("/") \
                 or project_tag.endswith("/"):
             logger.error(f"[{fn()}] Skipping reverse sync for {token}: malformed "
@@ -1213,7 +1225,7 @@ def update_wi_in_thread():
         conf.update_properties()
     targets = reverse_targets(fetch_project_tag_state())
     if not targets:
-        return "Nothing was synced this run; reverse sync skipped."
+        return "No Mend project has a stored reverse-sync address; reverse sync skipped."
     original_azure_project = conf.azure_project
     todate = (datetime.datetime.now() +
               datetime.timedelta(hours=conf.utc_delta)).strftime("%Y-%m-%d %H:%M:%S")

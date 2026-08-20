@@ -31,7 +31,7 @@ _TAG_FIELDS = {
 
 
 def parse_tag_map(rows) -> dict:
-    """Project tag rows -> {token: {lastrun, failed, revsync}}, keys present only when tagged.
+    """Project tag rows -> {token: {lastrun, failed, revsync, project}}, keys present only when tagged.
 
     Deliberately tolerant: a malformed row is skipped, never fatal. This runs over every project
     in the organization, so one bad row must not cost the whole run its state.

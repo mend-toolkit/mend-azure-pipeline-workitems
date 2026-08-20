@@ -168,3 +168,70 @@ def test_the_non_routed_path_persists_an_address_the_reverse_sync_can_later_use(
         result = core.update_wi_in_thread()
     inner.assert_called_once()
     assert "skipped" not in result.lower()
+
+
+def test_a_project_addressed_for_the_first_time_is_visited_in_the_same_run():
+    """Closes the day-one gap (fix round 1, item 2): before this fix, save_project_addr
+    wrote TAG_PROJECT to Mend but never updated the in-memory tag map
+    fetch_project_tag_state() memoises, so the SAME run's update_wi_in_thread (which reads
+    that same memoised map) would still see no address for a project addressed for the
+    first time this run, and skip it -- self-healing only on the following run. Exercises
+    the real run_sync -> save_project_addr -> update_wi_in_thread sequence exactly as
+    azure_wi_sync.py's main() calls them, back to back in one process, with no reset of
+    core.project_tag_state in between."""
+    conf = mock.MagicMock(routing="false", wsproducttoken="", wsprojecttoken="",
+                          wsexcludetoken="", azure_project="Bookkeeping", utc_delta=0)
+    core.project_tag_state = {}   # no stored address yet -- this project's first-ever run
+
+    def fake_create_wi(token, *a, **kw):
+        core.synced_projects.append((token, f"Prod/{token}", conf.azure_project))
+        return syncstate.VERDICT_OK, "done"
+
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=["tok-1"]), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "save_project_tag", return_value=True), \
+         mock.patch.object(core, "create_wi", side_effect=fake_create_wi):
+        core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+
+        # No reset of core.project_tag_state here: same run, same process.
+        with mock.patch.object(core, "update_wi_for_project", return_value="ok") as inner:
+            result = core.update_wi_in_thread()
+
+    inner.assert_called_once_with("tok-1", "Prod/tok-1", mock.ANY)
+    assert "skipped" not in result.lower()
+
+
+def test_save_project_addr_is_a_noop_when_the_stored_address_already_matches():
+    """The steady-state guarantee (fix round 1, item 1). Once azure-wi-project already
+    holds the address create_wi resolved this run, saving it again must not happen -- at
+    ~400 projects an unconditional write costs a saveProjectTag call every run for every
+    project, and it is unverified whether a repeated save on one key yields one row or a
+    duplicate. See the report's load-bearing proof: dropping the comparison leaves this
+    test (and only this test) failing."""
+    core.synced_projects = [("tok-1", "Prod/Proj", "Platform")]
+    state = {"tok-1": {"project": "Platform|Prod/Proj"}}
+    with mock.patch.object(core, "conf", _conf(azure_project="Platform")), \
+         mock.patch.object(core, "save_project_tag", return_value=True) as save:
+        core.save_project_addr("tok-1", state)
+    save.assert_not_called()
+
+
+def test_save_project_addr_writes_when_the_stored_address_differs():
+    core.synced_projects = [("tok-1", "Prod/Proj", "Platform")]
+    state = {"tok-1": {"project": "OldProject|Prod/Proj"}}
+    with mock.patch.object(core, "conf", _conf(azure_project="Platform")), \
+         mock.patch.object(core, "save_project_tag", return_value=True) as save:
+        core.save_project_addr("tok-1", state)
+    save.assert_called_once_with("tok-1", syncstate.TAG_PROJECT, "Platform|Prod/Proj")
+    assert state["tok-1"]["project"] == "Platform|Prod/Proj"
+
+
+def test_reverse_targets_strips_whitespace_from_a_padded_stored_address():
+    """Fix round 1, item 3: a padded address ("Platform| Prod/Proj ") must not carry that
+    padding into the WIQL tag clause, where it would match nothing. A half that is only
+    whitespace ("   ") must be treated as malformed, not pass the emptiness check because
+    it is technically non-empty before stripping."""
+    state = {"tok-1": {"project": "Platform| Prod/Proj "},
+             "tok-2": {"project": "Platform|   "}}
+    assert core.reverse_targets(state) == [("tok-1", "Platform", "Prod/Proj")]
