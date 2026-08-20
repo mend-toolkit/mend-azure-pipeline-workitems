@@ -255,7 +255,11 @@ def fetch_prj_policy(prj_token: str, sdate: str, edate: str):
             if try_or_error(lambda: rt_el_val['policy']['enabled'], False):
                 rt_res.append(rt_el_val)
     except Exception as err:
-        rt_res = [f"[{ex()}] Process getting Policy issues failed: ", f"{err}"]
+        # None, not a short list: create_wi reads rt_res[2:] as findings, so a two-element error
+        # return is indistinguishable from a project with no findings — which would advance that
+        # project's watermark past a window that was never read.
+        logger.error(f"[{ex()}] Process getting Policy issues failed for {prj_token}: {err}")
+        return None
 
     return rt_res
 
