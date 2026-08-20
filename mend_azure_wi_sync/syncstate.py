@@ -95,3 +95,23 @@ def selection_floor(state, seed, todate, max_hours, reset, reset_hours) -> str:
         return max(stamps).strftime(TS_FORMAT)
     return seed.strip() if isinstance(seed, str) and seed.strip() \
         else clamp(None, todate, reset_hours)
+
+
+def build_selection(modified, state) -> list:
+    """Projects to process: those Mend reports modified, plus those still flagged failed.
+
+    The union is the whole point. Without it a project whose work items failed is never revisited,
+    because Mend will not report it modified again until it is rescanned. Sorted so the run log is
+    diffable, the same reason routing.build_table sorts.
+    """
+    retry = [token for token, entry in (state or {}).items() if (entry or {}).get("failed")]
+    return sorted(set(modified or []) | set(retry))
+
+
+def tag_ops(verdict, todate) -> list:
+    """Verdict -> ordered (op, key, value) tuples. Empty when the project was never attempted."""
+    if verdict == VERDICT_OK:
+        return [("save", TAG_LASTRUN, todate), ("remove", TAG_FAILED, "")]
+    if verdict == VERDICT_FAILED:
+        return [("save", TAG_FAILED, todate)]
+    return []

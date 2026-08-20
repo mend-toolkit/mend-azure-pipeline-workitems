@@ -94,3 +94,43 @@ def test_selection_floor_falls_back_to_the_seed_then_to_a_full_window():
 def test_selection_floor_honours_reset():
     state = {"tok-1": {"lastrun": "2026-08-20 11:00:00"}}
     assert syncstate.selection_floor(state, "", NOW, 720, True, 87600) == "2016-08-22 12:00:00"
+
+
+def test_selection_unions_modified_with_the_retry_queue():
+    state = {
+        "tok-failed": {"failed": "2026-08-19 11:00:00"},
+        "tok-clean": {"lastrun": "2026-08-20 11:00:00"},
+    }
+    assert syncstate.build_selection(["tok-modified"], state) == ["tok-failed", "tok-modified"]
+
+
+def test_selection_deduplicates_and_sorts():
+    state = {"tok-a": {"failed": "2026-08-19 11:00:00"}}
+    assert syncstate.build_selection(["tok-b", "tok-a"], state) == ["tok-a", "tok-b"]
+
+
+def test_selection_with_no_state_is_just_the_modified_list():
+    assert syncstate.build_selection(["tok-b", "tok-a"], {}) == ["tok-a", "tok-b"]
+    assert syncstate.build_selection(None, None) == []
+
+
+def test_success_advances_the_watermark_then_clears_the_retry_flag():
+    """Order matters. Clearing before advancing risks losing the retry hint on a partial
+    failure; advancing first means a failed clear self-heals on the next run."""
+    assert syncstate.tag_ops(syncstate.VERDICT_OK, "2026-08-20 12:00:00") == [
+        ("save", syncstate.TAG_LASTRUN, "2026-08-20 12:00:00"),
+        ("remove", syncstate.TAG_FAILED, ""),
+    ]
+
+
+def test_failure_records_the_retry_flag_and_leaves_the_watermark_alone():
+    ops = syncstate.tag_ops(syncstate.VERDICT_FAILED, "2026-08-20 12:00:00")
+    assert ops == [("save", syncstate.TAG_FAILED, "2026-08-20 12:00:00")]
+    assert not any(key == syncstate.TAG_LASTRUN for _, key, _ in ops)
+
+
+def test_no_verdict_writes_nothing():
+    """An unroutable project never reaches create_wi, so it must never enter the retry queue —
+    retrying it cannot succeed until a human fixes its tag."""
+    assert syncstate.tag_ops(None, "2026-08-20 12:00:00") == []
+    assert syncstate.tag_ops("", "2026-08-20 12:00:00") == []
