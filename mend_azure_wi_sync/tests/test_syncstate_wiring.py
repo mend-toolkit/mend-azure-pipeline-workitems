@@ -78,3 +78,17 @@ def test_reset_ignores_stored_state_for_both_selection_and_windows():
     modified_call, create, _ = _run(_conf(reset="true"), state, ["tok-1"])
     assert modified_call.call_args.args[0] == "2016-08-22 12:00:00"
     assert create.call_args_list[0].args[1] == "2016-08-22 12:00:00"
+
+
+def test_a_failed_project_that_is_excluded_is_not_synced():
+    """Exclusion must win over retry: a stale failure tag must not defeat MEND_EXCLUDETOKEN."""
+    state = {"tok-failed": {"lastrun": "2026-01-01 00:00:00", "failed": "2026-08-19 11:00:00"}}
+    _, create, _ = _run(_conf(wsexcludetoken="tok-failed"), state, [])
+    assert create.call_args_list == []
+
+
+def test_a_failed_project_outside_product_project_scope_is_not_synced():
+    """A retry candidate outside a scoped MEND_PROJECTTOKEN pilot must not evaporate the scope."""
+    state = {"tok-failed": {"lastrun": "2026-01-01 00:00:00", "failed": "2026-08-19 11:00:00"}}
+    _, create, _ = _run(_conf(wsprojecttoken="tok-other"), state, [])
+    assert create.call_args_list == []

@@ -1953,7 +1953,8 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
 
     if conf.wsprojecttoken:
         res.extend(conf.wsprojecttoken.split(","))
-    res = set(modified_projects).intersection(res) if res else modified_projects
+    candidates = build_selection(modified_projects, state)
+    res = set(candidates).intersection(res) if res else candidates
     res = list(set(res) - set(conf.wsexcludetoken.split(",")))
     #deleted_items = get_deleted_items()
     exist_wis = get_exist_wi()
@@ -1964,7 +1965,6 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
         return (f"Aborted: could not read existing work items in Azure project "
                 f"'{conf.azure_project}'. Skipping to avoid creating duplicates. "
                 f"Lastrun will not advance; this window will be retried.")
-    res = build_selection(res, state)
     prepare_enrichment(res)
     for prj_el in res:
         project_start = window_start(prj_el, state, end_date, max_hours, reset_on, reset_back_time)
