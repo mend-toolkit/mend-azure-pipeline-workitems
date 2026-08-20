@@ -157,3 +157,46 @@ def test_an_unroutable_project_gets_no_tag_writes_at_all():
         core.run_sync_routed(["tok-1"], "2026-08-01 00:00:00", TODATE, [], "Task")
     create.assert_not_called()
     ops.assert_not_called()
+
+
+def test_a_failed_project_that_is_excluded_is_not_synced_under_routing():
+    """Permission beats retry under routing too: a stale failure tag alone must not defeat
+    MEND_EXCLUDETOKEN once routing is on. The retry union happens before the routed narrowing
+    block (Step 3a), so this locks in that the routed narrowing still applies to retried tokens."""
+    core.project_tag_state = {"tok-failed": {"lastrun": "2026-01-01 00:00:00",
+                                             "failed": "2026-08-19 11:00:00"}}
+    with mock.patch.object(core, "conf", _conf(routing="true", branches="main",
+                                               azure_project="Book", azure_area="", reponame="",
+                                               wsexcludetoken="tok-failed")), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=[]), \
+         mock.patch.object(core, "fetch_project_tags",
+                           return_value={"tok-failed": ROUTE_TAGS_PAYMENTS}), \
+         mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "prepare_enrichment"), \
+         mock.patch.object(core, "create_wi",
+                           return_value=(syncstate.VERDICT_OK, "done")) as create, \
+         mock.patch.object(core, "apply_tag_ops"):
+        core.run_sync(st_date="", end_date=TODATE, custom_flds=[], wi_type="Task")
+    assert create.call_args_list == []
+
+
+def test_a_failed_project_outside_scope_is_not_synced_under_routing():
+    """Same guarantee, the MEND_PROJECTTOKEN-scope variant: a retry candidate outside a scoped
+    pilot must not evaporate the scope once routing is on."""
+    core.project_tag_state = {"tok-failed": {"lastrun": "2026-01-01 00:00:00",
+                                             "failed": "2026-08-19 11:00:00"}}
+    with mock.patch.object(core, "conf", _conf(routing="true", branches="main",
+                                               azure_project="Book", azure_area="", reponame="",
+                                               wsprojecttoken="tok-other")), \
+         mock.patch.object(core, "get_prj_list_modified", return_value=[]), \
+         mock.patch.object(core, "fetch_project_tags",
+                           return_value={"tok-failed": ROUTE_TAGS_PAYMENTS}), \
+         mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "prepare_enrichment"), \
+         mock.patch.object(core, "create_wi",
+                           return_value=(syncstate.VERDICT_OK, "done")) as create, \
+         mock.patch.object(core, "apply_tag_ops"):
+        core.run_sync(st_date="", end_date=TODATE, custom_flds=[], wi_type="Task")
+    assert create.call_args_list == []
