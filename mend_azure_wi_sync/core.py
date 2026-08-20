@@ -305,6 +305,25 @@ def apply_tag_ops(prj_token: str, ops: list):
             remove_project_tag(prj_token, key, value)
 
 
+def record_verdict(prj_token: str, verdict: str, todate: str, state: dict):
+    """Persist one project's verdict and make a FAILED one visible in the run.
+
+    create_wi's message is deliberately byte-identical to the pre-change format, so a project
+    whose every work item write was rejected still returns a success-shaped "0 ... work items"
+    line. Without this the only trace of a wholly failed project is a tag in Mend: main() would
+    print "Sync process completed successfully" and exit 0.
+
+    run_failed is deliberately NOT set. One project's failure must not withhold every other
+    project's state — that all-or-nothing withhold is exactly what this design removed.
+    """
+    global global_errors
+    if verdict == VERDICT_FAILED:
+        global_errors += 1
+        logger.error(f"[{fn()}] Mend project {prj_token} did not sync completely. Its sync state "
+                    f"is not advanced and it will be retried on the next run.")
+    apply_tag_ops(prj_token, tag_ops(verdict, todate, failed_stamp(prj_token, state)))
+
+
 def project_window(prj_token: str, state: dict, todate: str, max_hours, reset_on: bool) -> str:
     """window_start, plus the warning a stale watermark owes the operator.
 
@@ -1105,7 +1124,11 @@ def update_wi_for_project(prj_token: str, project_tag: str, todate: str):
                                 pass
         if not project_failed:
             save_project_tag(prj_token, TAG_REVSYNC, todate)
-        return f"Updated {executed_wi} work item(s) for {project_tag}"
+            return f"Updated {executed_wi} work item(s) for {project_tag}"
+        # Same string on both paths made a project whose WIQL blew up indistinguishable from
+        # an empty success in the joined summary line.
+        return (f"Updated {executed_wi} work item(s) for {project_tag} before failing; "
+                f"its reverse sync state was not advanced and will be retried")
     except Exception as err:
         global_errors += 1
         run_failed = True
@@ -1926,15 +1949,14 @@ def run_sync_routed(modified_projects: list, st_date: str, end_date: str, custom
                          f"existing work items. Per-project sync state will not advance for it, "
                          f"so this window will be retried on the next run.")
             for token, _ in targets[azure_project]:
-                apply_tag_ops(token, tag_ops(VERDICT_FAILED, end_date,
-                                             failed_stamp(token, state)))
+                record_verdict(token, VERDICT_FAILED, end_date, state)
             continue
         for token, route in targets[azure_project]:
             conf.reponame = route.repo
             project_start = project_window(token, state, end_date, max_hours, reset_on)
             verdict, message = create_wi(token, project_start, end_date, custom_flds, wi_type)
             logger.info(message)
-            apply_tag_ops(token, tag_ops(verdict, end_date, failed_stamp(token, state)))
+            record_verdict(token, verdict, end_date, state)
             synced += 1
 
     conf.azure_project = original_azure_project
@@ -1990,7 +2012,7 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
         project_start = project_window(prj_el, state, end_date, max_hours, reset_on)
         verdict, message = create_wi(prj_el, project_start, end_date, custom_flds, wi_type)
         logger.info(message)
-        apply_tag_ops(prj_el, tag_ops(verdict, end_date, failed_stamp(prj_el, state)))
+        record_verdict(prj_el, verdict, end_date, state)
 
     return f"{len(res)} project(s) processed" if res else "Nothing to create/update"
 

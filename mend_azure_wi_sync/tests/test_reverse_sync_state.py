@@ -60,9 +60,21 @@ def test_a_failed_reverse_wiql_does_not_advance_the_watermark():
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "call_azure_api", return_value=({"message": "boom"}, 2)), \
          mock.patch.object(core, "save_project_tag") as save:
-        core.update_wi_for_project("tok-1", "Prod/Proj", TODATE)
+        result = core.update_wi_for_project("tok-1", "Prod/Proj", TODATE)
     save.assert_not_called()
     assert core.sync_had_fatal_error() is True
+    # Both paths used to return "Updated 0 work item(s) for X", so a project whose WIQL blew
+    # up read exactly like an empty success in the joined summary line.
+    assert "before failing" in result and "retried" in result
+
+
+def test_an_empty_success_still_reads_as_a_success():
+    core.project_tag_state = {}
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_azure_api", return_value=({"workItems": []}, 0)), \
+         mock.patch.object(core, "save_project_tag", return_value=True):
+        result = core.update_wi_for_project("tok-1", "Prod/Proj", TODATE)
+    assert result == "Updated 0 work item(s) for Prod/Proj"
 
 
 def test_a_stale_revsync_watermark_is_honoured_not_narrowed(caplog):

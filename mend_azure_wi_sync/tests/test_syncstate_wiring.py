@@ -13,6 +13,8 @@ def _reset_state():
     core.project_tag_state = None
     core.tag_state_available = True
     core.TAG_WARNED = False
+    core.global_errors = 0
+    core.run_failed = False
     yield
     core.project_tag_state = None
     core.tag_state_available = True
@@ -96,6 +98,33 @@ def test_success_after_a_failure_clears_the_retry_flag_using_the_stored_value():
 def test_failure_records_the_retry_flag_and_leaves_the_watermark():
     _, _, ops = _run(_conf(), {}, ["tok-1"], verdict=syncstate.VERDICT_FAILED)
     ops.assert_called_once_with("tok-1", [("save", syncstate.TAG_FAILED, TODATE)])
+
+
+def test_a_failed_verdict_is_visible_in_the_run(caplog):
+    """create_wi's message stays byte-identical, so a project whose every work item write was
+    rejected still returns a success-shaped "0 ... work items" line. Without an error here the
+    run printed "Sync process completed successfully" and exited 0, and the only trace of the
+    failure was a tag in Mend."""
+    core.global_errors = 0
+    with caplog.at_level("ERROR"):
+        _run(_conf(), {}, ["tok-1"], verdict=syncstate.VERDICT_FAILED)
+    assert core.error_count() == 1
+    assert any("tok-1" in r.getMessage() and "retried" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_one_projects_failure_does_not_fail_the_whole_run():
+    """Deliberate: run_failed would withhold nothing here (state is per project now) but would
+    turn any single flaky repo into a red pipeline and, worse, hide which projects did advance."""
+    core.run_failed = False
+    _run(_conf(), {}, ["tok-1"], verdict=syncstate.VERDICT_FAILED)
+    assert core.sync_had_fatal_error() is False
+
+
+def test_a_successful_verdict_adds_no_errors():
+    core.global_errors = 0
+    _run(_conf(), {}, ["tok-1"])
+    assert core.error_count() == 0
 
 
 def test_reset_ignores_stored_state_for_both_selection_and_windows():
