@@ -55,8 +55,9 @@ def main():
     logger.info(run_sync(migration_seed(), todate, wi_fields, wi_type))
     logger.info(update_wi_in_thread())
     if sync_had_fatal_error():
-        logger.error("Not advancing per-project sync state: the sync did not complete. "
-                     "This window will be retried on the next run.")
+        logger.error("The sync did not complete. Per-project sync state advanced only for the "
+                     "Mend projects that finished; the rest were left untouched and will be "
+                     "retried on the next run.")
         logger.error("Sync process FAILED. Please look at the log.")
         exit(1)
     errors = error_count()
