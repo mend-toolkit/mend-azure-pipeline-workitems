@@ -1,3 +1,4 @@
+import json
 from unittest import mock
 
 from mend_azure_wi_sync import core
@@ -63,6 +64,66 @@ def test_an_unreadable_sweep_fails_the_whole_call():
     untagged and route nothing, silently."""
     with mock.patch.object(core, "fetch_project_tag_state", return_value={}), \
          mock.patch.object(core, "tag_sweep_ok", False, create=True):
+        assert core.fetch_project_tags(["tok-1"]) is None
+
+
+LIVE_SHAPE = json.dumps({"projectTags": [
+    # Same fixture as test_syncstate_io.LIVE_SHAPE, copied rather than imported across test
+    # modules (tests/ is not a package). Verbatim from the live org (2026-08-21).
+    {"name": "AZ_IaC", "token": "tok-scan-only",
+     "tags": {"CTX": ["99ef77b0"], "commitId": ["fe39bbda"],
+              "repoFullName": ["DotNET-Demo/IaC@master"]}},
+    {"name": "Test", "token": "tok-untagged", "tags": {}},
+    {"name": "Test Workitems_master", "token": "tok-routed",
+     "tags": {"azure-wi-project": ["Test Pipeline Workitems|Test Pipeline Workitems/Test Workitems_master"],
+              "azure-branch": ["refs/heads/master"],
+              "azure-project": ["Test Pipeline Workitems"],
+              "azure-repo": ["Test Workitems"],
+              "azure-wi-lastrun": ["2026-08-21 14:36:34"]}}]})
+
+
+def test_fetch_project_tags_reads_the_real_sweep_end_to_end_without_the_2_0_transport():
+    """Every other test in this module patches core.project_raw_tags directly, so none of them
+    would notice `project_raw_tags = parse_raw_tags(rows)` being deleted from
+    fetch_project_tag_state -- they would stay green while every routed run in production died
+    at "nothing routed" because project_raw_tags stayed {}. This drives a real HTTP-shaped body
+    through fetch_project_tags with nothing patched but conf/call_ws_api/call_ws_api_v2, and
+    asserts the 2.0 transport (call_ws_api_v2) is never touched -- the join and its fan-out are
+    gone, not just unused for this token. Confirmed to fail (empty route, no azure_project) if
+    `project_raw_tags = parse_raw_tags(rows)` is commented out of fetch_project_tag_state."""
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value=LIVE_SHAPE), \
+         mock.patch.object(core, "call_ws_api_v2") as v2:
+        tags = core.fetch_project_tags(["tok-routed"])
+    v2.assert_not_called()
+    route = routing.parse_route(tags["tok-routed"])
+    assert route.azure_project == "Test Pipeline Workitems"
+    assert route.repo == "Test Workitems"
+    assert route.branch == "refs/heads/master"
+
+
+def test_an_unreadable_sweep_fails_the_whole_call_via_the_real_failure_path():
+    """test_an_unreadable_sweep_fails_the_whole_call above patches tag_sweep_ok directly, so it
+    would stay green if core.py:468's `tag_sweep_ok = False` assignment were deleted. This drives
+    the real unreadable-sweep branch of fetch_project_tag_state (call_ws_api returns a body with
+    no "projectTags" key) and asserts on the resulting None, not on a patched flag."""
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value='{"errorCode": 5000}'):
+        assert core.fetch_project_tags(["tok-1"]) is None
+
+
+def test_a_structurally_unparseable_sweep_fails_the_whole_call_via_the_real_failure_path():
+    """Same as above for the OTHER failure path (core.py:490): rows that are non-empty but that
+    parse_tag_map/parse_raw_tags cannot structurally read (no "token"/"tags" keys) -- the shape
+    guard's error branch, not a missing sweep. This is a genuinely new behaviour versus the
+    pre-Task-4 code: previously an unparseable sweep only warned and let the run continue on the
+    per-project clamp fallback, routing untouched. Now, because fetch_project_tags reads
+    project_raw_tags from the very same sweep, a structurally-unparseable sweep also means no
+    routing tags exist for anyone, and fetch_project_tags must fail the whole call rather than
+    silently route nothing -- failing loudly beats routing nothing silently."""
+    bad_shape = json.dumps({"projectTags": [{"unexpected": "shape"}]})
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value=bad_shape):
         assert core.fetch_project_tags(["tok-1"]) is None
 
 

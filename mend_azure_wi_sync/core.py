@@ -454,6 +454,14 @@ def fetch_project_tag_state() -> dict:
     Memoised the way _fetch_entities_rows is. An unreadable sweep returns {} and marks state
     unavailable rather than raising: every window then falls back to the clamp, which is correct
     but repeats work, so the operator needs the warning and the run needs to continue.
+
+    Also sets tag_sweep_ok = False on either of its own two failure paths (unreadable body;
+    rows present but structurally unparseable). fetch_project_tags gates on that flag, so this
+    is a genuinely new behaviour versus the pre-Task-4 code: previously a structurally-bad sweep
+    only warned and let every window fall back to the per-project clamp, with routing untouched
+    (routing read the separate 2.0 /entities call). Now project_raw_tags -- the routing tags --
+    comes from this same sweep, so the same failure also aborts a routed run outright rather
+    than silently routing nothing. Deliberate: failing loudly beats routing nothing silently.
     """
     global project_tag_state, project_tag_values, project_raw_tags, tag_sweep_ok
     if project_tag_state is not None:
@@ -610,9 +618,13 @@ def _fetch_entities_rows():
 def fetch_project_tags(tokens: list) -> dict:
     """Map Mend 1.4 project token -> that project's tags, from the org sweep.
 
-    Returns None (the whole call) if the sweep was unreadable, matching the previous
-    all-or-nothing convention: a partial map would make a real project look untagged and
-    route nothing, silently.
+    Returns None (the whole call) if the sweep was unreadable OR structurally unparseable
+    (fetch_project_tag_state's tag_sweep_ok), matching the previous all-or-nothing convention:
+    a partial map would make a real project look untagged and route nothing, silently. The
+    structurally-unparseable case is new: it used to only cost sync state its watermark and let
+    routing continue via the separate 2.0 /entities call; now routing tags come from the same
+    sweep, so the same bad shape means no routing tags exist for anyone and the whole call fails
+    rather than quietly routing nothing.
 
     This used to join 2.0 /entities rows to 1.4 tokens on (productName, projectName), because
     1.4 tokens and 2.0 uuids are different identifier spaces. The 1.4 sweep carries the same

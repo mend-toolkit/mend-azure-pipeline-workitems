@@ -69,3 +69,28 @@ def test_non_string_entry_before_a_good_entry_does_not_clobber_it():
                          {"key": "azure-project", "value": "Platform"}])
     assert route.azure_project == "Platform"
     assert route.schema == ""
+
+
+def test_dict_shape_whitespace_is_stripped_from_keys_and_values():
+    route = parse_route({"  azure-project  ": ["  Platform  "]})
+    assert route.azure_project == "Platform"
+
+
+def test_dict_shape_non_string_key_is_skipped_not_fatal():
+    route = parse_route({123: ["Platform"]})
+    assert route.azure_project == ""
+
+
+def test_dict_shape_non_string_value_is_skipped_not_fatal():
+    route = parse_route({"azure-project": [123]})
+    assert route.azure_project == ""
+
+
+def test_dict_shape_unknown_key_is_ignored():
+    route = parse_route({"team": ["payments"], "azure-project": ["Platform"]})
+    assert route.azure_project == "Platform"
+    assert route.repo == ""
+
+
+def test_dict_shape_empty_dict_yields_an_empty_route():
+    assert parse_route({}) == Route()

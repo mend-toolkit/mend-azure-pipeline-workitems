@@ -32,12 +32,16 @@ def caplog_at_error():
 def _reset_state():
     core.project_tag_state = None
     core.project_tag_values = {}
+    core.project_raw_tags = {}
     core.tag_state_available = True
+    core.tag_sweep_ok = True
     core.TAG_WARNED = False
     yield
     core.project_tag_state = None
     core.project_tag_values = {}
+    core.project_raw_tags = {}
     core.tag_state_available = True
+    core.tag_sweep_ok = True
     core.TAG_WARNED = False
 
 
