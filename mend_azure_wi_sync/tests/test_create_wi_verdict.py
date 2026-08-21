@@ -146,3 +146,58 @@ def test_create_wi_calls_enrich_project_for_a_project_with_findings():
          mock.patch.object(core, "updated_wi", []):
         core.create_wi("tok-1", "2026-08-01 00:00:00", "2026-08-20 12:00:00", [], "Task")
     enrich.assert_called_once_with("tok-1")
+
+
+def _custom_field_value(default_value: str):
+    """Run one MEND_CUSTOMFIELDS expression through create_wi and return what it resolved to.
+
+    analyze_fields is nested inside create_wi, so it cannot be called directly. This drives
+    the real function the way the tests above do and reads the value back out of the PATCH
+    body handed to call_azure_api, which is where a custom field actually lands.
+    """
+    conf = _conf_with_library()
+    conf.conf_json.return_value = {"wsurl": "https://saas.mend.io",
+                                   "wsuserkey": "SECRET-USER-KEY"}
+    captured = []
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core, "fetch_prj_policy",
+                           return_value=["Prod", "Proj", _prj_el_with_one_cve()]), \
+         mock.patch.object(core, "call_ws_api",
+                           return_value='{"libraries": [], "libraryLocations": []}'), \
+         mock.patch.object(core, "call_azure_api",
+                           side_effect=lambda **kw: (captured.append(kw.get("data")),
+                                                     ({"id": 1}, 0))[1]), \
+         mock.patch.object(core, "exist_wis", []), \
+         mock.patch.object(core, "updated_wi", []):
+        core.create_wi("tok-1", "2026-08-01 00:00:00", "2026-08-20 12:00:00",
+                       [{"referenceName": "Custom.LeakCanary", "name": "LeakCanary",
+                         "defaultValue": default_value}], "Task")
+    for body in captured:
+        for op in (body or []):
+            if op.get("path") == "/fields/Custom.LeakCanary":
+                return op.get("value")
+    return None
+
+
+def test_an_unknown_custom_field_variable_does_not_inherit_the_previous_part():
+    """A '&'-delimited part naming a variable that no longer exists must resolve to "",
+    never to the value of the part before it.
+
+    analyze_fields looks up `var_name` after a `for var_ in varenvs` loop that only assigns
+    on a match. `var_name` was never initialised and is never reset per part, so an unmatched
+    part silently reused the PREVIOUS part's name and duplicated its value. This was masked
+    until 2026-08-21 because `$MEND_EMAIL` matched varenvs.wsemail (absent from conf_json(),
+    so it resolved to ""); deleting wsemail with the 2.0 transport made the leak reachable
+    for the first time. It matters because the leaked value can be a CREDENTIAL --
+    `$MEND_USERKEY&$MEND_EMAIL` rendered the user key TWICE into a work item field.
+    MEND_CUSTOMFIELDS syntax is a documented user-facing contract, so this is visible
+    behaviour, not an internal detail.
+
+    Fails without the one-line `var_name = ""` init: returns the first value doubled.
+    """
+    assert _custom_field_value("$MEND_URL") == "https://saas.mend.io"
+    assert _custom_field_value("$MEND_NOSUCHVAR") == "" or \
+        _custom_field_value("$MEND_NOSUCHVAR") is None
+    assert _custom_field_value("$MEND_URL&$MEND_NOSUCHVAR") == "https://saas.mend.io"
+    # The credential case, stated separately so a regression names itself in the failure.
+    assert _custom_field_value("$MEND_USERKEY&$MEND_NOSUCHVAR") == "SECRET-USER-KEY"

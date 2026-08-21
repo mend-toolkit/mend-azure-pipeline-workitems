@@ -1108,6 +1108,12 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                     if t.startswith("$"):
                         dict_env_val = conf.conf_json()
                         env_val = t[1:].strip()
+                        # Must be reset per '&'-delimited part. Without it, a part naming an
+                        # unknown or RETIRED variable ($MEND_EMAIL, until it was deleted with
+                        # the 2.0 transport) leaks the PREVIOUS part's var_name and duplicates
+                        # its value -- which can be $MEND_USERKEY. "" resolves to "" via
+                        # try_or_error, which is what an unmatched part has always produced.
+                        var_name = ""
                         for var_ in varenvs:
                             if env_val in var_.value:
                                 var_name = var_.name

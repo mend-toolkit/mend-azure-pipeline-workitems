@@ -250,10 +250,7 @@ def test_token_missing_from_the_tag_map_is_loud_not_quiet():
          mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
          mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
-        try:
-            result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
-        finally:
-            mock.patch.stopall()
+        result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
 
     assert "unknown-target: 1" in result
     assert "no-target" not in result
