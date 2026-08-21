@@ -73,6 +73,8 @@ tag_sweep_ok = True           # False only when the getOrganizationProjectTags s
                                # on this, not tag_state_available, so one failed saveProjectTag
                                # mid-run does not abort routing for the rest of the run.
 TAG_WARNED = False            # WARNING_MSG-style guard so 400 projects log one error, not 400
+ALERTS_WARNED = False         # same guard for the enrichment alerts fetch: a user key that
+                               # cannot read alerts fails for all ~107 projects identically
 
 
 def fn():
@@ -645,7 +647,15 @@ def fetch_project_alerts(prj_token: str) -> dict:
     Returns {} on any failure rather than raising: this is display-only data and must never
     cost a Work Item. orgToken is omitted to match get_ingnored_alerts, the alerts call this
     tool has been making successfully since before this change.
+
+    An unreadable response warns ONCE per run. Returning {} silently would be invisible:
+    create_wi only calls safe_decorate when the index is non-empty, and safe_decorate owns the
+    only other enrichment warning ("matched 0 of N candidate finding(s)"), so a WHOLESALE
+    failure -- the exact case where the operator most needs to know -- would skip both and
+    render "-" in every column with nothing in the log. This restores the single run-level
+    warning that the deleted prepare_enrichment used to emit.
     """
+    global ALERTS_WARNED
     body = {"requestType": "getProjectAlertsByType",
             "userKey": conf.ws_user_key,
             "projectToken": prj_token,
@@ -653,6 +663,15 @@ def fetch_project_alerts(prj_token: str) -> dict:
     payload = try_or_error(lambda: json.loads(call_ws_api(data=json.dumps(body))), None)
     alerts = try_or_error(lambda: payload["alerts"], None)
     if not isinstance(alerts, list):
+        if not ALERTS_WARNED:
+            # Once per run, not once per project: one bad credential or entitlement fails
+            # identically for all ~107 projects and would otherwise log 107 times.
+            ALERTS_WARNED = True
+            logger.warning(f"[{fn()}] Could not read Mend alerts for enrichment "
+                           f"(getProjectAlertsByType on {prj_token} returned {payload}). "
+                           f"Reachability, EPSS and Exploit Code Maturity will be blank ('-') "
+                           f"on every work item this run. Enrichment is display-only, so the "
+                           f"run continues and no work item is lost.")
         return {}
     return build_alert_index(alerts)
 

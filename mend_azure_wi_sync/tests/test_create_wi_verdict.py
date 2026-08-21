@@ -194,6 +194,14 @@ def test_an_unknown_custom_field_variable_does_not_inherit_the_previous_part():
     behaviour, not an internal detail.
 
     Fails without the one-line `var_name = ""` init: returns the first value doubled.
+
+    NOTE on the `$MEND_USERKEY` assertion below: it pins PART-INDEPENDENCE -- part two must not
+    inherit part one -- and nothing else. It is NOT an endorsement of `$MEND_USERKEY` as an
+    intended substitution; writing the org's Mend key into a work item field is an open
+    security item on the tracker. Whoever fixes that should change this assertion to whatever
+    the new behaviour is (refusal, redaction), not treat this test as blocking them. Any
+    variable with a non-empty `conf_json()` value would do here; the key is used only because
+    it makes the leak's consequence concrete in the failure message.
     """
     assert _custom_field_value("$MEND_URL") == "https://saas.mend.io"
     assert _custom_field_value("$MEND_NOSUCHVAR") == "" or \

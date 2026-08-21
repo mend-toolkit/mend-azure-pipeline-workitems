@@ -1,4 +1,5 @@
 import json
+import logging
 from unittest import mock
 
 import pytest
@@ -44,6 +45,37 @@ def test_a_failed_or_odd_alerts_response_yields_an_empty_index(payload):
     with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="uk", ws_org_token="ot")), \
          mock.patch.object(core, "call_ws_api", return_value=payload):
         assert core.fetch_project_alerts("tok-1") == {}
+
+
+def test_a_wholesale_alerts_failure_warns_exactly_once(caplog):
+    """A TOTAL enrichment failure must be loud, and loud exactly once.
+
+    This is the gap the deleted prepare_enrichment used to cover. create_wi only calls
+    safe_decorate when the index is non-empty, and safe_decorate owns the only other
+    enrichment warning ("matched 0 of N candidate finding(s)"), so a user key that cannot read
+    alerts would render "-" in all three columns for all ~107 projects while the log said
+    nothing but "Enrichment: on". Once-per-run, not once-per-project: the failure is
+    identical for every project, and 107 identical lines is the same as none.
+    """
+    with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="uk", ws_org_token="ot")), \
+         mock.patch.object(core, "call_ws_api", return_value='{"errorCode": 5001}'):
+        with caplog.at_level(logging.WARNING):
+            assert core.fetch_project_alerts("tok-1") == {}
+            assert core.fetch_project_alerts("tok-2") == {}
+    hits = [r for r in caplog.records if "Could not read Mend alerts" in r.message]
+    assert len(hits) == 1, [r.message for r in caplog.records]
+    # The message must tell the operator what they will SEE, not just that a call failed.
+    assert "blank ('-')" in hits[0].message
+    assert core.ALERTS_WARNED is True
+
+
+def test_a_successful_alerts_fetch_warns_about_nothing(caplog):
+    with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="uk", ws_org_token="ot")), \
+         mock.patch.object(core, "call_ws_api", return_value=json.dumps({"alerts": []})):
+        with caplog.at_level(logging.WARNING):
+            assert core.fetch_project_alerts("tok-1") == {}
+    assert not [r for r in caplog.records if "Could not read Mend alerts" in r.message]
+    assert core.ALERTS_WARNED is False
 
 
 def test_enrich_project_needs_no_resolution_step():

@@ -54,7 +54,7 @@ def reset_core_globals():
     saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf,
              core.run_failed, core.synced_projects, core.project_tag_state,
              core.project_tag_values, core.tag_state_available, core.TAG_WARNED,
-             core.project_raw_tags, core.tag_sweep_ok)
+             core.project_raw_tags, core.tag_sweep_ok, core.ALERTS_WARNED)
     core.exist_wis = []
     core.updated_wi = []
     core.global_errors = 0
@@ -66,8 +66,9 @@ def reset_core_globals():
     core.TAG_WARNED = False
     core.project_raw_tags = {}
     core.tag_sweep_ok = True
+    core.ALERTS_WARNED = False
     yield
     (core.exist_wis, core.updated_wi, core.global_errors, core.conf,
      core.run_failed, core.synced_projects, core.project_tag_state,
      core.project_tag_values, core.tag_state_available, core.TAG_WARNED,
-     core.project_raw_tags, core.tag_sweep_ok) = saved
+     core.project_raw_tags, core.tag_sweep_ok, core.ALERTS_WARNED) = saved
