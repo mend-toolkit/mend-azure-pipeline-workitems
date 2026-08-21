@@ -48,7 +48,11 @@ def test_decorate_never_creates_a_vulnerability_key():
     # A license policy violation has no vulnerability. Inventing one would render
     # vulnerability fields on a Work Item that describes a license.
     libs = [{"library": {"keyUuid": "lib-a"}, "policyViolations": [{}]}]
-    en.decorate_policy_violations(libs, _alert_index("CVE-1", "lib-a"))
+    index = _alert_index("CVE-1", "lib-a")
+    # Prove the fixture actually carries a real entry first: if build_alert_index ever
+    # stopped indexing it, the assertion below would pass while proving nothing.
+    assert index
+    en.decorate_policy_violations(libs, index)
     assert libs[0]["policyViolations"][0] == {}
 
 

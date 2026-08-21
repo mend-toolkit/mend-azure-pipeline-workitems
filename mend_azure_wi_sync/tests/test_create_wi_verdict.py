@@ -127,3 +127,22 @@ def test_an_azure_api_exception_during_write_verdicts_failed():
         verdict, message = core.create_wi("tok-1", "2026-08-01 00:00:00",
                                           "2026-08-20 12:00:00", [], "Task")
     assert verdict == syncstate.VERDICT_FAILED
+
+
+def test_create_wi_calls_enrich_project_for_a_project_with_findings():
+    """Guards the replacement for the prepare_enrichment wiring tests this task deleted:
+    create_wi must actually call enrich_project for a project with findings, or every
+    enabled customer silently gets three columns of '-' with all tests green."""
+    conf = _conf_with_library()
+    conf.enrichment = "true"
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core, "fetch_prj_policy",
+                           return_value=["Prod", "Proj", _prj_el_with_one_cve()]), \
+         mock.patch.object(core, "call_ws_api",
+                           return_value='{"libraries": [], "libraryLocations": []}'), \
+         mock.patch.object(core, "call_azure_api", return_value=({}, 0)), \
+         mock.patch.object(core, "enrich_project", return_value={}) as enrich, \
+         mock.patch.object(core, "exist_wis", []), \
+         mock.patch.object(core, "updated_wi", []):
+        core.create_wi("tok-1", "2026-08-01 00:00:00", "2026-08-20 12:00:00", [], "Task")
+    enrich.assert_called_once_with("tok-1")

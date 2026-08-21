@@ -109,9 +109,10 @@ def test_decoration_failure_after_the_call_also_cannot_cost_work_items():
 
 
 def test_safe_decorate_warns_only_when_candidates_matched_nothing(caplog):
-    # 3.0 returns every finding in the project while 1.4 returns only this window's policy
-    # violations, so warning on "0 of N findings" would fire on most projects every run and
-    # train operators to ignore the one signal that detects a broken join.
+    # The alerts index carries every open alert in the project while candidates is only
+    # this window's policy violations, so warning on "0 of N findings" would fire on most
+    # projects every run and train operators to ignore the one signal that detects a
+    # broken join.
     libs = [{"library": {"keyUuid": "lib-a"},
              "policyViolations": [{"vulnerability": {"name": "CVE-1"}}]}]
     with caplog.at_level("WARNING"):
