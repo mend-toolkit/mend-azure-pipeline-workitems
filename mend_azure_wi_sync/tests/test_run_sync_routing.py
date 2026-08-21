@@ -233,3 +233,27 @@ def test_expand_product_tokens_survives_a_non_json_response():
     with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="k", ws_org_token="o")), \
          mock.patch.object(core, "call_ws_api", return_value=""):
         assert core.expand_product_tokens("prd-1") is None   # None, not [] — see the scope guard
+
+
+def test_token_missing_from_the_tag_map_is_loud_not_quiet():
+    """fetch_project_tags returns a dict for every token it is asked about, so this is a
+    defensive branch, not a reachable one today. It exists because a future caller passing a
+    subset of tokens would otherwise get parse_route({}) -> the QUIET no-target bucket, which
+    is indistinguishable from a genuinely untagged project. A token the map does not answer
+    for must classify unknown-target (in LOUD_OUTCOMES) instead."""
+    conf = _conf()
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core, "get_prj_list_modified",
+                           return_value=["tok-a", "tok-absent"]), \
+         mock.patch.object(core, "fetch_project_tags",
+                           return_value={"tok-a": TAGS["tok-a"]}), \
+         mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
+         mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
+        try:
+            result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    assert "unknown-target: 1" in result
+    assert "no-target" not in result

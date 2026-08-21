@@ -62,10 +62,6 @@ exist_wis = []
 synced_projects = []   # [(prj_token, "Product/Project", azure_project)] appended by create_wi
 updated_wi = []
 run_failed = False
-mend_v2_session = None  # SessionInfo dict from POST /api/v2.0/login; JWT lives 10 minutes
-entities_rows = None    # one /entities sweep per run, used by fetch_project_tags
-resolved_project_names = None  # token -> (productName, projectName), one sweep per run,
-                                # used by fetch_project_tags
 project_tag_state = None      # one getOrganizationProjectTags sweep per run
 project_tag_values = {}       # {token: {field: [every value]}} from that same sweep
 project_raw_tags = {}         # {token: {raw tag key: [values]}} from that same sweep, used by
@@ -152,16 +148,8 @@ def check_patterns():
         # so without this every project is skipped silently.
         res.append("MEND_BRANCHES must list at least one branch pattern when "
                    "MEND_ROUTING is enabled")
-    if conf.routing.lower() == "true" and not conf.email:
-        # Mend API 2.0 login (used by routing's paged sweep) requires an email; there is
-        # no default, so this must be caught here rather than surfacing as a login failure.
-        res.append("MEND_EMAIL must be set when MEND_ROUTING is enabled")
     if conf.enrichment.lower() not in ("true", "false"):
         res.append(f"MEND_ENRICHMENT must be 'true' or 'false', got '{conf.enrichment}'")
-    if conf.enrichment.lower() == "true" and not conf.email:
-        # The 2.0/3.0 login takes an email and has no default. Failing here costs one line;
-        # failing at call time costs a doomed login attempt per project.
-        res.append("MEND_EMAIL must be set when MEND_ENRICHMENT is enabled")
     if try_or_error(lambda: int(conf.maxlookback) <= 0, True):
         res.append(f"MEND_MAXLOOKBACK must be a positive number of hours, got '{conf.maxlookback}'")
     return res
@@ -451,7 +439,7 @@ def project_window(prj_token: str, state: dict, todate: str, max_hours, reset_on
 def fetch_project_tag_state() -> dict:
     """{token: {lastrun, failed, revsync}} for the whole org, read once per run.
 
-    Memoised the way _fetch_entities_rows is. An unreadable sweep returns {} and marks state
+    Memoised for the run -- one sweep answers every caller. An unreadable sweep returns {} and marks state
     unavailable rather than raising: every window then falls back to the clamp, which is correct
     but repeats work, so the operator needs the warning and the run needs to continue.
 
@@ -521,98 +509,6 @@ def get_prj_list_modified(fromdate: str, todate: str):
         except Exception as err:  # Getting list of modified projects
             res = response_["lastModifiedProjects"]
             return [r["apiToken"] for r in res]
-
-
-def _resolve_project_names(tokens: list):
-    """Map Mend 1.4 project token -> (productName, projectName).
-
-    There is no 1.4 call that takes an arbitrary project token directly, and getAllProjects
-    requires a productToken. So this enumerates products org-wide (getAllProducts, one call)
-    and then each product's projects (getAllProjects, one call per product) until every
-    requested token is resolved or the products run out — a handful of calls, not one per
-    project. Returns None on any Mend API failure: a partial map here would silently make a
-    real project look untagged rather than surface as an error.
-
-    Memoized for the run, the same way _fetch_entities_rows is, so a cached successful sweep
-    can answer more than one caller without a second getAllProducts + getAllProjects pass.
-    Only a successful (non-None) result is cached — a failed sweep must keep failing loudly,
-    not get papered over by a stale empty cache.
-    """
-    global resolved_project_names
-    wanted = set(tokens)
-    if not wanted:
-        return {}
-    if resolved_project_names is not None:
-        return {token: resolved_project_names[token] for token in wanted
-                if token in resolved_project_names}
-    resolved = {}
-    try:
-        products = json.loads(call_ws_api(data=json.dumps(
-            {"requestType": "getAllProducts",
-             "userKey": conf.ws_user_key,
-             "orgToken": conf.ws_org_token,
-             })))["products"]
-    except Exception as err:
-        logger.error(f"[{ex()}] Getting product list for tag resolution failed: {err}")
-        return None
-
-    for prd in products:
-        if len(resolved) == len(wanted):
-            break
-        prd_token = try_or_error(lambda: prd["productToken"], "")
-        prd_name = try_or_error(lambda: prd["productName"], "")
-        if not prd_token:
-            continue
-        try:
-            projects = json.loads(call_ws_api(data=json.dumps(
-                {"requestType": "getAllProjects",
-                 "userKey": conf.ws_user_key,
-                 "orgToken": conf.ws_org_token,
-                 "productToken": prd_token,
-                 })))["projects"]
-        except Exception as err:
-            logger.error(f"[{ex()}] Getting projects for product '{prd_name}' failed: {err}")
-            return None
-        for prj in projects:
-            prj_token = try_or_error(lambda: prj["projectToken"], "")
-            if prj_token and prj_token in wanted:
-                resolved[prj_token] = (prd_name, try_or_error(lambda: prj["projectName"], ""))
-    resolved_project_names = resolved
-    return resolved
-
-
-def _fetch_entities_rows():
-    """Page /entities once per run and cache the raw rows.
-
-    Returns None on any failure, matching fetch_project_tags' all-or-nothing convention: a
-    partial sweep would make a real project look untagged or unresolvable, which is worse
-    than a clean abort.
-    """
-    global entities_rows
-    if entities_rows is not None:
-        return entities_rows
-    collected = []
-    page = 0
-    page_size = 1000
-    while True:
-        payload, errorcode = call_ws_api_v2(f"orgs/{conf.ws_org_token}/entities",
-                                            {"pageSize": page_size, "page": page})
-        if errorcode != 0:
-            return None
-        rows = try_or_error(lambda: payload["retVal"], None)
-        if rows is None:
-            logger.error(f"[{fn()}] Unexpected /entities payload: {payload}")
-            return None
-        collected.extend(rows)
-        # isLastPage is documented as a string ("true"/"false") but has been observed live as
-        # a JSON bool. str(...).lower() handles both; the row-count check is belt-and-braces.
-        is_last_page = str(try_or_error(lambda: payload["additionalData"]["isLastPage"], "")
-                           ).lower() == "true"
-        if is_last_page or len(rows) < page_size:
-            break
-        page += 1
-    entities_rows = collected
-    return entities_rows
 
 
 def fetch_project_tags(tokens: list) -> dict:
@@ -737,77 +633,6 @@ def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST"
         res = f"Error was raised. {try_or_error(lambda: err.args[0].reason.args[0], '')}"
         logger.error(f'[{ex()}] {err}')
     return res
-
-
-def _post_v2_login():
-    # Split out so tests can stub the transport without mocking requests itself.
-    # conf.api_url, NOT conf.ws_url: 2.0 lives on api-saas.mend.io while 1.4 lives on the
-    # SCA app host. See the spec's servers block.
-    url = f"{extract_url(conf.api_url)}/api/v2.0/login"
-    body = {"email": conf.email, "userKey": conf.ws_user_key, "orgToken": conf.ws_org_token}
-    try:
-        res_ = requests.post(url, json=body, verify=False, proxies=conf.proxy,
-                             headers={"Content-Type": "application/json"})
-        return (json.loads(res_.text), 0) if res_.status_code == 200 \
-            else (try_or_error(lambda: json.loads(res_.text), {}), 2)
-    except Exception as err:
-        return {f"[{ex()}] Mend 2.0 login failed": f"{err}"}, 2
-
-
-def mend_v2_token() -> str:
-    # Cached for the process. The JWT is valid for 10 minutes and all 2.0 use in this tool
-    # is one burst at the start of a run, so expiry is handled by a single retry in
-    # call_ws_api_v2 rather than by refresh-token plumbing.
-    global mend_v2_session
-    if mend_v2_session:
-        return try_or_error(lambda: mend_v2_session["retVal"]["jwtToken"], "")
-    payload, errorcode = _post_v2_login()
-    if errorcode != 0:
-        logger.error(f"[{fn()}] Mend API 2.0 login failed: {payload}")
-        return ""
-    token = try_or_error(lambda: payload["retVal"]["jwtToken"], "")
-    if token:
-        mend_v2_session = payload
-    return token
-
-
-def _get_v2(url: str, token: str, params: dict):
-    global WARNING_MSG
-    try:
-        with warnings.catch_warnings(record=True) as warning_list:
-            warnings.simplefilter("always", InsecureRequestWarning)
-            res_ = requests.get(url, params=params or {}, verify=False, proxies=conf.proxy,
-                                headers={"Authorization": f"Bearer {token}",
-                                         "Content-Type": "application/json"})
-        if not WARNING_MSG:
-            for warning in warning_list:
-                if issubclass(warning.category, InsecureRequestWarning):
-                    index_of_see = str(warning.message).find("See:")
-                    logger.warning(str(warning.message)[:index_of_see].strip())
-                    WARNING_MSG = True
-        if res_.status_code == 200:
-            return json.loads(res_.text), 0
-        return try_or_error(lambda: json.loads(res_.text), {}), res_.status_code
-    except Exception as err:
-        return {f"[{ex()}] Mend 2.0 call failed": f"{err}"}, 2
-
-
-def call_ws_api_v2(api: str, params: dict = None):
-    # Returns (payload, errorcode) with the same convention as call_azure_api:
-    # 0 = success, non-zero = failure. One re-login covers a JWT that expired mid-run.
-    global mend_v2_session
-    url = f"{extract_url(conf.api_url)}/api/v2.0/{api}"
-    payload, errorcode = _get_v2(url, mend_v2_token(), params)
-    if errorcode in (401, 403):
-        # The JWT lives 10 minutes. The spec documents no 401 anywhere, so an expired token
-        # most plausibly surfaces as 403 — retry both. A real permission denial costs one
-        # wasted re-login and still fails, which is the right trade.
-        mend_v2_session = None
-        payload, errorcode = _get_v2(url, mend_v2_token(), params)
-    if errorcode != 0:
-        logger.error(f"[{fn()}] Mend 2.0 call to '{api}' failed: {payload}")
-        errorcode = 2
-    return payload, errorcode
 
 
 def fetch_project_alerts(prj_token: str) -> dict:
@@ -1920,23 +1745,26 @@ def run_sync_routed(modified_projects: list, end_date: str, custom_flds: list,
     preset.update({t: SKIP_OUT_OF_SCOPE
                    for t in (set(modified_projects) - narrowed) - excluded})
 
-    # A per-token None from fetch_project_tags means the (product, project) name pair
-    # collided in /entities and the join is ambiguous — distinct from a genuinely
-    # untagged project ([]). That must surface loudly (SKIP_UNKNOWN, in LOUD_OUTCOMES),
-    # never fall into the quiet no-target bucket that an empty route would produce.
-    collided = set()
+    # A token the tag map does not answer for is NOT the same thing as an untagged project.
+    # fetch_project_tags returns a dict for every token it is asked about, so this is
+    # defensive rather than reachable today (the old reachable cause -- an ambiguous
+    # (productName, projectName) join against 2.0 /entities -- is gone with that transport).
+    # It stays because a future caller passing a subset of tokens would otherwise get
+    # parse_route({}) and land in the QUIET no-target bucket, indistinguishable from a
+    # genuinely tagless project. Answer-less means loud: SKIP_UNKNOWN, in LOUD_OUTCOMES.
+    unanswered = set()
     routes = {}
     for token in modified_projects:
         per_token_tags = tags.get(token)
         if per_token_tags is None:
-            collided.add(token)
+            unanswered.add(token)
             per_token_tags = []
         route = parse_route(per_token_tags)
         if route.azure_project:
             route.azure_project = known_by_casefold.get(route.azure_project.casefold(),
                                                          route.azure_project)
         routes[token] = route
-    for token in collided:
+    for token in unanswered:
         preset.setdefault(token, SKIP_UNKNOWN)
 
     targets, outcomes = build_table(routes, known, conf.branches, preset=preset)
@@ -2160,8 +1988,6 @@ def startup():
         proxy=varenvs.get_env("proxy").strip(),
         routing=varenvs.get_env("wsrouting").strip(),
         branches=varenvs.get_env("wsbranches").strip(),
-        email=varenvs.get_env("wsemail").strip(),
-        api_url=varenvs.get_env("wsapiurl").strip(),
         enrichment=varenvs.get_env("wsenrichment").strip(),
         maxlookback=varenvs.get_env("wsmaxlookback").strip(),
     )

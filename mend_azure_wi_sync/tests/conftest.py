@@ -51,19 +51,15 @@ import pytest
 def reset_core_globals():
     """core.py holds mutable module globals that leak between tests."""
     from mend_azure_wi_sync import core
-    saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session,
-             core.run_failed, core.synced_projects, core.entities_rows,
-             core.resolved_project_names, core.project_tag_state,
+    saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf,
+             core.run_failed, core.synced_projects, core.project_tag_state,
              core.project_tag_values, core.tag_state_available, core.TAG_WARNED,
              core.project_raw_tags, core.tag_sweep_ok)
     core.exist_wis = []
     core.updated_wi = []
     core.global_errors = 0
-    core.mend_v2_session = None
     core.run_failed = False
     core.synced_projects = []
-    core.entities_rows = None
-    core.resolved_project_names = None
     core.project_tag_state = None
     core.project_tag_values = {}
     core.tag_state_available = True
@@ -71,8 +67,7 @@ def reset_core_globals():
     core.project_raw_tags = {}
     core.tag_sweep_ok = True
     yield
-    (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session,
-     core.run_failed, core.synced_projects, core.entities_rows,
-     core.resolved_project_names, core.project_tag_state,
+    (core.exist_wis, core.updated_wi, core.global_errors, core.conf,
+     core.run_failed, core.synced_projects, core.project_tag_state,
      core.project_tag_values, core.tag_state_available, core.TAG_WARNED,
      core.project_raw_tags, core.tag_sweep_ok) = saved

@@ -50,8 +50,6 @@ class varenvs(Enum):  # Lit of Env.variables
     proxy = ("PROXY", "MEND_PROXY")
     wsrouting = ("WS_ROUTING", "MEND_ROUTING")
     wsbranches = ("WS_BRANCHES", "MEND_BRANCHES")
-    wsemail = ("WS_EMAIL", "MEND_EMAIL")
-    wsapiurl = ("WS_APIURL", "MEND_APIURL")
     wsenrichment = ("WS_ENRICHMENT", "MEND_ENRICHMENT")
     wsmaxlookback = ("WS_MAXLOOKBACK", "MEND_MAXLOOKBACK")
 
@@ -120,8 +118,6 @@ class Config:
     proxy: str
     routing: str
     branches: str
-    email: str
-    api_url: str
     enrichment: str
     maxlookback: str
 
@@ -180,16 +176,6 @@ class Config:
                     value = "720" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "branches":
                     value = "main,master" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
-                elif key == "api_url":
-                    # 2.0 lives on api-saas.mend.io while 1.4 lives on the SCA app host.
-                    # Anchor on the host, not the scheme: MEND_URL is documented as accepting
-                    # a scheme-less value (see extract_url), and a scheme-anchored regex
-                    # silently no-ops on "saas.mend.io" and sends login to the wrong host.
-                    value = properties[key]
-                    if re.match(r"\$\(.+\)$", value or "") or not value:
-                        host = re.sub(r"^https?://", "", self.ws_url or "")
-                        value = f"https://api-{host}" if host and not host.startswith("api-") \
-                            else (f"https://{host}" if host else "")
                 elif key == "proxy":
                     if properties[key]:
                         if type(properties[key]) is dict:

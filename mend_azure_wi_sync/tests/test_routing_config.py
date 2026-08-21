@@ -38,8 +38,7 @@ def _valid_conf(**overrides):
                   wsprojecttoken="", wsexcludetoken="", azure_area="", azure_type="Task",
                   azure_custom="", dependency="true", reponame="", description="ReproSteps",
                   priority="false", wsalert="true", proxy="", routing="false",
-                  branches="main,master", email="", api_url="", enrichment="false",
-                  maxlookback="720")
+                  branches="main,master", enrichment="false", maxlookback="720")
     fields.update(overrides)
     return Config(**fields)
 
@@ -52,15 +51,14 @@ def test_check_patterns_rejects_a_mistyped_routing_value():
 
 def test_check_patterns_accepts_valid_routing_values():
     for value in ("true", "false", "TRUE", "False"):
-        with mock.patch.object(core, "conf", _valid_conf(routing=value, email="a@b.c")):
+        with mock.patch.object(core, "conf", _valid_conf(routing=value)):
             assert not any("ROUTING" in el for el in core.check_patterns())
 
 
 def test_check_patterns_rejects_an_empty_branch_list():
     """MEND_BRANCHES=mian or an unquoted YAML value sends every project to the QUIET
     branch-filtered bucket. Validate the setting rather than relying on the report."""
-    with mock.patch.object(core, "conf", _valid_conf(routing="true", email="a@b.c",
-                                                     branches="")):
+    with mock.patch.object(core, "conf", _valid_conf(routing="true", branches="")):
         assert any("BRANCHES" in el for el in core.check_patterns())
 
 
@@ -74,3 +72,11 @@ def test_check_patterns_rejects_a_slash_in_azure_project():
 def test_check_patterns_accepts_an_azure_project_without_a_slash():
     with mock.patch.object(core, "conf", _valid_conf(azure_project="Platform")):
         assert not any("AZUREPROJECT" in el for el in core.check_patterns())
+
+
+def test_routing_no_longer_requires_mend_email():
+    """MEND_EMAIL existed for the 2.0 login behind routing's /entities sweep. Routing tags
+    come from the 1.4 org tag sweep now, so requiring an email would block a valid config for
+    a login the tool never performs."""
+    with mock.patch.object(core, "conf", _valid_conf(routing="true", branches="main")):
+        assert not [el for el in core.check_patterns() if "MEND_EMAIL" in el]

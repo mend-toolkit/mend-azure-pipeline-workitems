@@ -82,20 +82,17 @@ LIVE_SHAPE = json.dumps({"projectTags": [
               "azure-wi-lastrun": ["2026-08-21 14:36:34"]}}]})
 
 
-def test_fetch_project_tags_reads_the_real_sweep_end_to_end_without_the_2_0_transport():
+def test_fetch_project_tags_reads_the_real_sweep_end_to_end():
     """Every other test in this module patches core.project_raw_tags directly, so none of them
     would notice `project_raw_tags = parse_raw_tags(rows)` being deleted from
     fetch_project_tag_state -- they would stay green while every routed run in production died
     at "nothing routed" because project_raw_tags stayed {}. This drives a real HTTP-shaped body
-    through fetch_project_tags with nothing patched but conf/call_ws_api/call_ws_api_v2, and
-    asserts the 2.0 transport (call_ws_api_v2) is never touched -- the join and its fan-out are
-    gone, not just unused for this token. Confirmed to fail (empty route, no azure_project) if
+    through fetch_project_tags with nothing patched but conf and call_ws_api -- one transport,
+    one call. Confirmed to fail (empty route, no azure_project) if
     `project_raw_tags = parse_raw_tags(rows)` is commented out of fetch_project_tag_state."""
     with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api", return_value=LIVE_SHAPE), \
-         mock.patch.object(core, "call_ws_api_v2") as v2:
+         mock.patch.object(core, "call_ws_api", return_value=LIVE_SHAPE):
         tags = core.fetch_project_tags(["tok-routed"])
-    v2.assert_not_called()
     route = routing.parse_route(tags["tok-routed"])
     assert route.azure_project == "Test Pipeline Workitems"
     assert route.repo == "Test Workitems"
@@ -136,105 +133,3 @@ def test_a_failed_tag_write_does_not_break_routing():
          mock.patch.object(core, "tag_sweep_ok", True, create=True), \
          mock.patch.object(core, "project_raw_tags", {}, create=True):
         assert core.fetch_project_tags(["tok-1"]) == {"tok-1": {}}
-
-
-# ---------------------------------------------------------------------------
-# _resolve_project_names — the 1.4 getAllProducts + getAllProjects join key resolution.
-# No longer called by fetch_project_tags (Task 4), but the function itself is untouched and
-# still owned by Task 5's removal of the rest of the 2.0 transport, so its own tests stay.
-# ---------------------------------------------------------------------------
-
-def test_resolve_project_names_walks_products_until_found():
-    products = {"products": [{"productName": "Product A", "productToken": "prd-a"},
-                             {"productName": "Product B", "productToken": "prd-b"}]}
-    prd_a_projects = {"projects": [{"projectName": "Project A", "projectToken": "tok-a"}]}
-    prd_b_projects = {"projects": [{"projectName": "Project B", "projectToken": "tok-b"}]}
-    import json as _json
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api",
-                           side_effect=[_json.dumps(products), _json.dumps(prd_a_projects),
-                                       _json.dumps(prd_b_projects)]) as api:
-        result = core._resolve_project_names(["tok-a", "tok-b"])
-    assert result == {"tok-a": ("Product A", "Project A"), "tok-b": ("Product B", "Project B")}
-    assert api.call_count == 3
-
-
-def test_resolve_project_names_stops_once_all_tokens_are_found():
-    products = {"products": [{"productName": "Product A", "productToken": "prd-a"},
-                             {"productName": "Product B", "productToken": "prd-b"}]}
-    prd_a_projects = {"projects": [{"projectName": "Project A", "projectToken": "tok-a"}]}
-    import json as _json
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api",
-                           side_effect=[_json.dumps(products), _json.dumps(prd_a_projects)]) as api:
-        result = core._resolve_project_names(["tok-a"])
-    assert result == {"tok-a": ("Product A", "Project A")}
-    assert api.call_count == 2          # products + one product's projects; product B unneeded
-
-
-def test_resolve_project_names_empty_input_makes_no_calls():
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api") as api:
-        assert core._resolve_project_names([]) == {}
-    api.assert_not_called()
-
-
-def test_resolve_project_names_returns_none_when_products_call_fails():
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api", return_value="not json"):
-        assert core._resolve_project_names(["tok-a"]) is None
-
-
-def test_resolve_project_names_returns_none_when_a_projects_call_fails():
-    import json as _json
-    products = {"products": [{"productName": "Product A", "productToken": "prd-a"}]}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api",
-                           side_effect=[_json.dumps(products), "not json"]):
-        assert core._resolve_project_names(["tok-a"]) is None
-
-
-def test_resolve_project_names_is_memoized_for_the_run():
-    """A cached sweep must answer more than one call without a second getAllProducts +
-    getAllProjects pass, the same way _fetch_entities_rows already does for /entities."""
-    import json as _json
-    products = {"products": [{"productName": "Product A", "productToken": "prd-a"}]}
-    prd_a_projects = {"projects": [{"projectName": "Project A", "projectToken": "tok-a"},
-                                   {"projectName": "Project B", "projectToken": "tok-b"}]}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api",
-                           side_effect=[_json.dumps(products), _json.dumps(prd_a_projects)]) as api:
-        first = core._resolve_project_names(["tok-a", "tok-b"])
-        # A narrower second call must be answered from the cache, not trigger a second sweep.
-        second = core._resolve_project_names(["tok-a"])
-    assert first == {"tok-a": ("Product A", "Project A"), "tok-b": ("Product A", "Project B")}
-    assert second == {"tok-a": ("Product A", "Project A")}
-    assert api.call_count == 2          # one sweep: products + one product's projects
-
-
-def test_a_failed_sweep_is_not_cached():
-    """The all-or-nothing convention: a None result must not be cached, or a transient
-    failure would poison every subsequent call for the rest of the run with an empty map."""
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api", return_value="not json"):
-        assert core._resolve_project_names(["tok-a"]) is None
-    import json as _json
-    products = {"products": [{"productName": "Product A", "productToken": "prd-a"}]}
-    prd_a_projects = {"projects": [{"projectName": "Project A", "projectToken": "tok-a"}]}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api",
-                           side_effect=[_json.dumps(products), _json.dumps(prd_a_projects)]):
-        assert core._resolve_project_names(["tok-a"]) == {"tok-a": ("Product A", "Project A")}
-
-
-def test_resolve_project_names_leaves_unfound_tokens_out_of_the_map():
-    """A token that belongs to no product in the org is simply absent from the map, not an
-    error."""
-    import json as _json
-    products = {"products": [{"productName": "Product A", "productToken": "prd-a"}]}
-    prd_a_projects = {"projects": [{"projectName": "Project A", "projectToken": "tok-a"}]}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api",
-                           side_effect=[_json.dumps(products), _json.dumps(prd_a_projects)]):
-        result = core._resolve_project_names(["tok-ghost"])
-    assert result == {}

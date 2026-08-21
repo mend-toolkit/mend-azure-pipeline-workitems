@@ -25,13 +25,10 @@ def test_check_patterns_rejects_a_mistyped_enrichment_value():
         assert any("MEND_ENRICHMENT" in el for el in core.check_patterns())
 
 
-def test_enrichment_requires_email():
-    # The 2.0/3.0 login has no default email. Catching it here turns ~1,600 doomed HTTP
-    # calls per run into one startup error.
-    with mock.patch.object(core, "conf", _valid_conf(enrichment="true", email="")):
-        assert any("EMAIL" in el for el in core.check_patterns())
-    with mock.patch.object(core, "conf",
-                           _valid_conf(enrichment="true", email="svc@example.com")):
-        assert not any("EMAIL" in el for el in core.check_patterns())
-    with mock.patch.object(core, "conf", _valid_conf(enrichment="false", email="")):
-        assert not any("EMAIL" in el for el in core.check_patterns())
+def test_enrichment_no_longer_requires_mend_email():
+    """MEND_EMAIL existed for the 2.0/3.0 login. Enrichment reads the 1.4 alerts API now,
+    which authenticates with MEND_USERKEY alone, so requiring an email would block a valid
+    config for a login the tool never performs. Config no longer carries an `email` field at
+    all, so this asserts on the surviving validation list rather than on a false value."""
+    with mock.patch.object(core, "conf", _valid_conf(enrichment="true")):
+        assert not [el for el in core.check_patterns() if "MEND_EMAIL" in el]
