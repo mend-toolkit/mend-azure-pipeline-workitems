@@ -91,3 +91,79 @@ def test_two_repos_sharing_a_library_each_keep_their_own_item():
     ]
     assert core.check_wi_id(id=TITLE, project_name="ProductX/api") == 4821
     assert core.check_wi_id(id=TITLE, project_name="ProductX/api-client") == 4822
+
+
+LEGACY = "log4j-core: 3 vulnerabilities (highest severity is 9.8)"
+
+
+def test_matching_finds_by_predicate():
+    core.exist_wis = [{LEGACY: {4821: "ProductX/api; security vulnerability"}}]
+    assert core.check_wi_id_matching(
+        lambda t: t.startswith("log4j-core:"), project_name="ProductX/api") == 4821
+
+
+def test_matching_still_requires_the_project_tag():
+    """A predicate match with the wrong project tag must not resolve."""
+    core.exist_wis = [{LEGACY: {4821: "ProductX/api-client; security vulnerability"}}]
+    assert core.check_wi_id_matching(
+        lambda t: t.startswith("log4j-core:"), project_name="ProductX/api") == 0
+
+
+def test_matching_returns_zero_when_the_predicate_never_fires():
+    core.exist_wis = [{LEGACY: {4821: "ProductX/api; security vulnerability"}}]
+    assert core.check_wi_id_matching(
+        lambda t: t == "something else", project_name="ProductX/api") == 0
+
+
+def test_matching_ignores_a_malformed_entry_and_still_finds_a_good_one():
+    core.exist_wis = [
+        {LEGACY: 12345},
+        {LEGACY: {4821: "ProductX/api; security vulnerability"}},
+    ]
+    assert core.check_wi_id_matching(
+        lambda t: t.startswith("log4j-core:"), project_name="ProductX/api") == 4821
+
+
+def test_a_raising_predicate_does_not_abort_the_search():
+    """A bad predicate on one title must not suppress a match on another."""
+    def boom(title):
+        if title == "bad":
+            raise ValueError("boom")
+        return True
+
+    core.exist_wis = [
+        {"bad": {1: "ProductX/api"}},
+        {LEGACY: {4821: "ProductX/api; security vulnerability"}},
+    ]
+    assert core.check_wi_id_matching(boom, project_name="ProductX/api") == 4821
+
+
+def test_resolve_falls_back_to_the_legacy_predicate():
+    core.exist_wis = [{LEGACY: {4821: "ProductX/api; security vulnerability"}}]
+    assert core.resolve_wi_id("log4j-core",
+                              lambda t: t.startswith("log4j-core:"),
+                              project_name="ProductX/api") == 4821
+
+
+def test_resolve_prefers_the_exact_match_and_skips_the_fallback():
+    """An already-migrated item must not be re-matched by the legacy predicate."""
+    core.exist_wis = [
+        {"log4j-core": {4821: "ProductX/api; security vulnerability"}},
+        {LEGACY: {9999: "ProductX/api; security vulnerability"}},
+    ]
+    assert core.resolve_wi_id("log4j-core",
+                              lambda t: t.startswith("log4j-core:"),
+                              project_name="ProductX/api") == 4821
+
+
+def test_resolve_with_no_legacy_predicate_is_exact_only():
+    """Licenses pass None -- their title never changed."""
+    core.exist_wis = [{LEGACY: {4821: "ProductX/api; security vulnerability"}}]
+    assert core.resolve_wi_id("log4j-core", None, project_name="ProductX/api") == 0
+
+
+def test_check_wi_id_still_matches_exactly_after_the_refactor():
+    """Regression: the existing exact-match contract is unchanged."""
+    core.exist_wis = [{LEGACY: {4821: "ProductX/api; security vulnerability"}}]
+    assert core.check_wi_id(id=LEGACY, project_name="ProductX/api") == 4821
+    assert core.check_wi_id(id="log4j-core", project_name="ProductX/api") == 0

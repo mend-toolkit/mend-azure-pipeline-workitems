@@ -889,7 +889,14 @@ def tag_set(raw_tags: str) -> set:
     return {t.strip() for t in (raw_tags or "").replace(",", ";").split(";") if t.strip()}
 
 
-def check_wi_id(id: str, project_name: str):
+def check_wi_id_matching(title_matches, project_name: str):
+    """Find a live work item whose title satisfies `title_matches` and which carries
+    `project_name` as a tag. Returns its id, or 0.
+
+    `title_matches` is a predicate over the title so callers can match either an exact title or
+    a legacy title shape (see identity.py) through one code path -- the tag-ownership rule below
+    is the part that must not be duplicated.
+    """
     def owns(entry):
         # entry is {work_item_id: raw_tags}; a malformed entry must skip, not abort the search.
         # ';' joins multiple values so a tag at the end of one value can't weld onto the start
@@ -898,10 +905,15 @@ def check_wi_id(id: str, project_name: str):
         # (case-preserving on first write, lowercased on read back), so an exact case-sensitive
         # comparison would miss an existing tag forever and create a duplicate every run.
         return try_or_error(lambda: project_name.strip().casefold() in
-                             {t.casefold() for t in tag_set(';'.join(entry.values()))}, False)
+                            {t.casefold() for t in tag_set(';'.join(entry.values()))}, False)
 
     try:
-        values = [d[id] for d in exist_wis if id in d and owns(d[id])]
+        values = []
+        for d in exist_wis:
+            for title, entry in try_or_error(lambda: list(d.items()), []):
+                # A predicate raising on one odd title must not suppress a match elsewhere.
+                if try_or_error(lambda: bool(title_matches(title)), False) and owns(entry):
+                    values.append(entry)
         res = try_or_error(lambda: max(values, key=lambda x: list(x.keys())[0]), 0)
         if type(res) is dict:
             return list(res.keys())[0]
@@ -909,6 +921,23 @@ def check_wi_id(id: str, project_name: str):
             return res
     except:
         return 0
+
+
+def check_wi_id(id: str, project_name: str):
+    return check_wi_id_matching(lambda title: title == id, project_name)
+
+
+def resolve_wi_id(title: str, legacy_matches, project_name: str):
+    """Find the work item for `title`, falling back to the legacy title shape it replaces.
+
+    Both create_wi call sites need the same two-step, and both need the fallback to run only when
+    the exact match misses -- an already-migrated item must never be re-matched by the legacy
+    predicate. `legacy_matches` is None for licenses, whose title never changed.
+    """
+    found = check_wi_id(id=title, project_name=project_name)
+    if found == 0 and legacy_matches is not None:
+        found = check_wi_id_matching(legacy_matches, project_name)
+    return found
 
 
 def clamp_revsync(prj_token, state, todate, max_hours, reset_on):
