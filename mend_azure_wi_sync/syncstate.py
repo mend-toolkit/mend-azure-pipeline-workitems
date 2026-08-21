@@ -30,29 +30,56 @@ _TAG_FIELDS = {
 }
 
 
+def _row_fields(row):
+    """(token, tags) for a structurally readable row, else (None, None)."""
+    if not isinstance(row, dict):
+        return None, None
+    token = row.get("token")
+    tags = row.get("tags")
+    if not isinstance(token, str) or not token.strip() or not isinstance(tags, dict):
+        return None, None
+    return token.strip(), tags
+
+
+def _tag_values(value):
+    """One tag's values as a sorted list of non-blank strings -- the 1.4 sweep returns a LIST.
+
+    Verified live 2026-08-21: the sweep returns {"azure-wi-lastrun": ["2026-08-21 14:36:34",
+    "2026-08-21 14:55:01"]}, a dict of lists, not of strings. The scalar form the docs imply is
+    accepted too. A key carrying several values is tolerated; parse_tag_map picks the latest.
+    """
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    return sorted(v.strip() for v in value if isinstance(v, str) and v.strip())
+
+
 def parse_tag_map(rows) -> dict:
     """Project tag rows -> {token: {lastrun, failed, revsync, project}}, keys present only when tagged.
 
     Deliberately tolerant: a malformed row is skipped, never fatal. This runs over every project
     in the organization, so one bad row must not cost the whole run its state.
+
+    The LATEST value wins where a key carries several: every field here is a watermark or an
+    address, and the newest is the one in force. Timestamps are TS_FORMAT, which sorts
+    lexicographically, so max() is the latest.
     """
     state = {}
     for row in rows or []:
-        if not isinstance(row, dict):
-            continue
-        token = row.get("token")
-        tags = row.get("tags")
-        if not isinstance(token, str) or not token.strip() or not isinstance(tags, dict):
+        token, tags = _row_fields(row)
+        if not token:
             continue
         entry = {}
         for key, value in tags.items():
-            if not isinstance(key, str) or not isinstance(value, str):
+            if not isinstance(key, str):
                 continue
             field = _TAG_FIELDS.get(key.strip().lower())
-            if field and value.strip():
-                entry[field] = value.strip()
+            values = _tag_values(value)
+            if field and values:
+                entry[field] = max(values)
         if entry:
-            state[token.strip()] = entry
+            state[token] = entry
     return state
 
 

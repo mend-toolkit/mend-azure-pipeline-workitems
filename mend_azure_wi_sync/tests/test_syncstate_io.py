@@ -139,3 +139,36 @@ def test_apply_tag_ops_skips_the_clear_when_the_advance_failed():
         core.apply_tag_ops("tok-1", syncstate.tag_ops(syncstate.VERDICT_OK, "2026-08-20 12:00:00",
                                                      "2026-08-19 11:00:00"))
     assert calls == []
+
+
+LIVE_SHAPE = json.dumps({"projectTags": [
+    # Verbatim from the live org (2026-08-21): tags is a dict of LISTS, most projects carry
+    # only CLI scan tags, and the two routed ones carry ours alongside the routing tags.
+    {"name": "AZ_IaC", "token": "tok-scan-only",
+     "tags": {"CTX": ["99ef77b0"], "commitId": ["fe39bbda"],
+              "repoFullName": ["DotNET-Demo/IaC@master"]}},
+    {"name": "Test", "token": "tok-untagged", "tags": {}},
+    {"name": "Test Workitems_master", "token": "tok-routed",
+     "tags": {"azure-wi-project": ["Test Pipeline Workitems|Test Pipeline Workitems/Test Workitems_master"],
+              "azure-branch": ["refs/heads/master"],
+              "azure-project": ["Test Pipeline Workitems"],
+              "azure-repo": ["Test Workitems"],
+              "azure-wi-lastrun": ["2026-08-21 14:36:34"]}}]})
+
+
+def test_the_live_1_4_row_shape_is_read_without_a_shape_warning(caplog):
+    """The sweep returns list-valued tags. Reading them as strings parsed the whole org to {},
+    so every window fell back to MEND_MAXLOOKBACK while the tag WRITES were succeeding -- which
+    is why the warning's advice about MEND_USERKEY permissions pointed the wrong way."""
+    core.project_tag_state = None
+    core.tag_state_available = True
+    core.TAG_WARNED = False
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value=LIVE_SHAPE), \
+         caplog.at_level("ERROR"):
+        state = core.fetch_project_tag_state()
+    assert state == {"tok-routed": {
+        "lastrun": "2026-08-21 14:36:34",
+        "project": "Test Pipeline Workitems|Test Pipeline Workitems/Test Workitems_master"}}
+    assert core.tag_state_available is True
+    assert caplog.records == []
