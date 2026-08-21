@@ -52,14 +52,13 @@ steps:
     MEND_CALCULATEPRIORITY : $(MEND_CALCULATEPRIORITY)
     MEND_ALERT : $(MEND_ALERT)
     MEND_MAXLOOKBACK: $(MEND_MAXLOOKBACK)
-    # Tag-based routing to multiple Azure projects (optional — requires Mend API 2.0)
+    # Tag-based routing to multiple Azure projects (optional)
     # MEND_ROUTING: $(MEND_ROUTING)
     # MEND_BRANCHES: $(MEND_BRANCHES)
-    # Reachability, EPSS and exploitability on every work item (optional — Mend API 3.0)
+    # Reachability, EPSS and exploitability on every work item (optional)
     # MEND_ENRICHMENT: $(MEND_ENRICHMENT)
-    # Required by MEND_ROUTING and MEND_ENRICHMENT alike — both authenticate to Mend
-    # API 2.0/3.0, which has no default email.
-    # MEND_EMAIL: $(MEND_EMAIL)
+    # Both read Mend API 1.4 with the same MEND_USERKEY as every other call — no extra
+    # variable and no extra Mend permission is needed to turn either one on.
     # NOTE: uncomment a line only once the matching pipeline variable exists. Azure leaves
     # an undefined variable as the literal string "$(MEND_ENRICHMENT)", which normalizes to
     # "false" — the feature then stays off with nothing logged as an error.
