@@ -7,6 +7,27 @@ from mend_azure_wi_sync import core
 from mend_azure_wi_sync import syncstate
 
 
+import contextlib
+import logging
+
+
+@contextlib.contextmanager
+def caplog_at_error():
+    """Collect ERROR records without a caplog fixture, for use inside `with` chains."""
+    records = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    sink = _Sink(level=logging.ERROR)
+    core.logger.addHandler(sink)
+    try:
+        yield records
+    finally:
+        core.logger.removeHandler(sink)
+
+
 @pytest.fixture(autouse=True)
 def _reset_state():
     core.project_tag_state = None
@@ -306,3 +327,58 @@ def test_the_reverse_watermark_and_the_address_are_pruned_too():
     assert ("removeProjectTag", syncstate.TAG_REVSYNC, "2026-08-20 09:00:00") in calls
     assert ("saveProjectTag", syncstate.TAG_PROJECT, "New Project|Prod/Proj") in calls
     assert ("removeProjectTag", syncstate.TAG_PROJECT, "Old Project|Prod/Proj") in calls
+
+
+# --- what counts as a successful write ---
+# Verified live 2026-08-21: a saveProjectTag whose value demonstrably landed in Mend
+# (azure-wi-lastrun = the run's todate, confirmed in the org's tags afterwards) was reported as
+# a failure, because _tag_call demanded a "projectTags" key in the response. Requiring a key
+# nothing documents made every successful write look failed. Mend 1.4 signals failure the way
+# get_prj_list_modified already reads it: errorCode / errorMessage in the body.
+
+def test_a_success_response_without_a_projecttags_key_is_not_a_failure():
+    _reset_tag_globals()
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value="{}"):
+        assert core.save_project_tag("tok-1", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01") is True
+    assert core.tag_state_available is True
+
+
+def test_an_error_body_is_a_failure():
+    _reset_tag_globals()
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api",
+                           return_value='{"errorCode": 5001, "errorMessage": "user is not allowed"}'), \
+         caplog_at_error() as records:
+        assert core.save_project_tag("tok-1", syncstate.TAG_LASTRUN, "x") is False
+    assert core.tag_state_available is False
+    assert any("user is not allowed" in r.getMessage() for r in records)
+
+
+def test_a_zero_errorcode_is_success_not_failure():
+    """Some 1.4 responses carry errorCode: 0 on success. Only a truthy code, or any
+    errorMessage, means the write was rejected."""
+    _reset_tag_globals()
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value='{"errorCode": 0}'):
+        assert core.save_project_tag("tok-1", syncstate.TAG_LASTRUN, "x") is True
+    assert core.tag_state_available is True
+
+
+def test_an_empty_body_is_still_a_failure():
+    """call_ws_api returns "" for any non-200 and the status code is gone by the time it gets
+    here, so an empty body cannot be told apart from a rejected write. Report it."""
+    _reset_tag_globals()
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value=""):
+        assert core.save_project_tag("tok-1", syncstate.TAG_LASTRUN, "x") is False
+    assert core.tag_state_available is False
+
+
+def test_a_successful_save_still_prunes_when_the_body_has_no_projecttags_key():
+    """The two fixes have to compose: the prune only runs on a save reported successful."""
+    _reset_tag_globals({"tok-1": {"lastrun": ["2026-08-21 14:36:34"]}})
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value="{}") as api:
+        core.replace_project_tag("tok-1", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01")
+    assert ("removeProjectTag", syncstate.TAG_LASTRUN, "2026-08-21 14:36:34") in _tag_calls(api)

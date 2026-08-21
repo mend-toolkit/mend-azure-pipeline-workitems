@@ -270,7 +270,8 @@ def _warn_tag_state_once(detail: str):
     global_errors += 1
     logger.error(f"[{fn()}] Could not persist sync state as Mend project tags ({detail}). "
                 f"Windows fall back to MEND_MAXLOOKBACK and overlapping work is repeated each "
-                f"run. Check that MEND_USERKEY may save project tags.")
+                f"run. Read the response above before assuming a permissions problem: this "
+                f"warning used to blame MEND_USERKEY for writes that had in fact succeeded.")
 
 
 def _tag_call(request_type: str, prj_token: str, key: str, value: str) -> bool:
@@ -280,9 +281,31 @@ def _tag_call(request_type: str, prj_token: str, key: str, value: str) -> bool:
             "projectToken": prj_token,
             "tagKey": key,
             "tagValue": value}
-    payload = try_or_error(lambda: json.loads(call_ws_api(data=json.dumps(body))), None)
-    if not isinstance(payload, dict) or "projectTags" not in payload:
-        _warn_tag_state_once(f"{request_type} on {prj_token}")
+    # The call stays inside try_or_error: the original one-liner wrapped json.dumps and
+    # call_ws_api as well as the parse, so an exception from either was tolerated. Hoisting
+    # only the parse out would turn a survivable transport failure into a dead run.
+    raw = try_or_error(lambda: call_ws_api(data=json.dumps(body)), "")
+    payload = try_or_error(lambda: json.loads(raw), None)
+    logger.debug(f"[{fn()}] {request_type} {key} on {prj_token} -> {str(raw)[:300]}")
+    # Success is "no error reported", NOT the presence of a "projectTags" key. Requiring that key
+    # (nothing documents it on a write) made every successful save look failed: verified live
+    # 2026-08-21, where a save warned here at 14:55:38 and its value -- the run's todate,
+    # 2026-08-21 14:55:01 -- was in the org's tags immediately afterwards. Mend 1.4 reports
+    # failure in the body, the way get_prj_list_modified already reads it. errorCode 0 is
+    # success, so only a truthy code or any errorMessage counts.
+    error = ""
+    if isinstance(payload, dict):
+        error = str(payload.get("errorMessage") or "")
+        code = payload.get("errorCode")
+        if not error and code not in (None, 0, "0", ""):
+            error = f"errorCode {code}"
+    if payload is None or error:
+        # An empty body cannot be told apart from a rejected write: call_ws_api returns "" for
+        # every non-200 and the status code is gone by the time it reaches here. Report it.
+        detail = (f"returned {error}" if error else
+                  f"returned {str(raw)[:200]}" if str(raw).strip() else
+                  "returned an empty body: non-200 or transport failure")
+        _warn_tag_state_once(f"{request_type} of '{key}' on {prj_token} {detail}")
         return False
     return True
 
