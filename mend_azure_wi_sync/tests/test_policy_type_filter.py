@@ -20,7 +20,7 @@ def _conf():
     # create_area() or exercise MagicMock truthiness. Mirrors test_create_wi_verdict.py's
     # _conf_with_library().
     return mock.MagicMock(azure_type="Task", dependency="false", wsalert="true",
-                          enrichment="false", reponame="", routing="false",
+                          epss="false", reachability="false", reponame="", routing="false",
                           azure_project="Book", description="Description",
                           ws_user_key="uk-123", priority="false", azure_area="")
 

@@ -38,7 +38,7 @@ def _valid_conf(**overrides):
                   wsprojecttoken="", wsexcludetoken="", azure_area="", azure_type="Task",
                   azure_custom="", dependency="true", reponame="", description="ReproSteps",
                   priority="false", wsalert="true", proxy="", routing="false",
-                  branches="main,master", enrichment="false", maxlookback="720")
+                  branches="main,master", epss="false", reachability="false", maxlookback="720")
     fields.update(overrides)
     return Config(**fields)
 

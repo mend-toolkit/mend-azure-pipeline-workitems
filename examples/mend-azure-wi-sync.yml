@@ -55,10 +55,15 @@ steps:
     # Tag-based routing to multiple Azure projects (optional)
     # MEND_ROUTING: $(MEND_ROUTING)
     # MEND_BRANCHES: $(MEND_BRANCHES)
-    # Reachability, EPSS and exploitability on every work item (optional)
-    # MEND_ENRICHMENT: $(MEND_ENRICHMENT)
+    # EPSS score and exploit code maturity on every work item (optional)
+    # MEND_EPSS: $(MEND_EPSS)
+    # Reachability on every work item (optional) — independent of MEND_EPSS, so an org
+    # without reachability analysis enabled can leave this off
+    # MEND_REACHABILITY: $(MEND_REACHABILITY)
     # Both read Mend API 1.4 with the same MEND_USERKEY as every other call — no extra
-    # variable and no extra Mend permission is needed to turn either one on.
+    # variable and no extra Mend permission is needed to turn either one on, and turning on
+    # both still costs exactly one alerts call per project, the same as turning on either
+    # one alone.
     # NOTE: uncomment a line only once the matching pipeline variable exists. Azure leaves
-    # an undefined variable as the literal string "$(MEND_ENRICHMENT)", which normalizes to
-    # "false" — the feature then stays off with nothing logged as an error.
+    # an undefined variable as the literal string "$(MEND_EPSS)" / "$(MEND_REACHABILITY)",
+    # which normalizes to "false" — the feature then stays off with nothing logged as an error.

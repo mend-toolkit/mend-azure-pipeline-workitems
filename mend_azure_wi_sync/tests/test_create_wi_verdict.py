@@ -6,7 +6,7 @@ from mend_azure_wi_sync import syncstate
 
 def _conf():
     return mock.MagicMock(azure_type="Task", dependency="false", wsalert="true",
-                          enrichment="false", reponame="", routing="false",
+                          epss="false", reachability="false", reponame="", routing="false",
                           ws_user_key="uk-123")
 
 
@@ -78,7 +78,7 @@ def _conf_with_library():
     # azure_area are pinned to plain falsy/known values so this test exercises the item_failed
     # mechanism and nothing incidental to it.
     return mock.MagicMock(azure_type="Task", dependency="false", wsalert="true",
-                          enrichment="false", reponame="", routing="false",
+                          epss="false", reachability="false", reponame="", routing="false",
                           ws_user_key="uk-123", description="", priority="false",
                           azure_area="", azure_project="TestProj")
 
@@ -134,7 +134,8 @@ def test_create_wi_calls_enrich_project_for_a_project_with_findings():
     create_wi must actually call enrich_project for a project with findings, or every
     enabled customer silently gets three columns of '-' with all tests green."""
     conf = _conf_with_library()
-    conf.enrichment = "true"
+    conf.epss = "true"
+    conf.reachability = "true"
     with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "fetch_prj_policy",
                            return_value=["Prod", "Proj", _prj_el_with_one_cve()]), \

@@ -50,7 +50,8 @@ class varenvs(Enum):  # Lit of Env.variables
     proxy = ("PROXY", "MEND_PROXY")
     wsrouting = ("WS_ROUTING", "MEND_ROUTING")
     wsbranches = ("WS_BRANCHES", "MEND_BRANCHES")
-    wsenrichment = ("WS_ENRICHMENT", "MEND_ENRICHMENT")
+    wsepss = ("WS_EPSS", "MEND_EPSS")
+    wsreachability = ("WS_REACHABILITY", "MEND_REACHABILITY")
     wsmaxlookback = ("WS_MAXLOOKBACK", "MEND_MAXLOOKBACK")
 
     @classmethod
@@ -118,7 +119,8 @@ class Config:
     proxy: str
     routing: str
     branches: str
-    enrichment: str
+    epss: str
+    reachability: str
     maxlookback: str
 
     def conf_json(self):
@@ -145,7 +147,8 @@ class Config:
             "proxy" : self.proxy,
             "wsrouting": self.routing,
             "wsbranches": self.branches,
-            "wsenrichment": self.enrichment,
+            "wsepss": self.epss,
+            "wsreachability": self.reachability,
             "wsmaxlookback": self.maxlookback,
         }
 
@@ -170,7 +173,9 @@ class Config:
                     value = DescAzure.get_name_by_value(self.azure_type) if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "routing":
                     value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
-                elif key == "enrichment":
+                elif key == "epss":
+                    value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "reachability":
                     value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "maxlookback":
                     value = "720" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]

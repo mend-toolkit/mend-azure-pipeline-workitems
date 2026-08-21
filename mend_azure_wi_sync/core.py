@@ -155,8 +155,10 @@ def check_patterns():
         # so without this every project is skipped silently.
         res.append("MEND_BRANCHES must list at least one branch pattern when "
                    "MEND_ROUTING is enabled")
-    if conf.enrichment.lower() not in ("true", "false"):
-        res.append(f"MEND_ENRICHMENT must be 'true' or 'false', got '{conf.enrichment}'")
+    if conf.epss.lower() not in ("true", "false"):
+        res.append(f"MEND_EPSS must be 'true' or 'false', got '{conf.epss}'")
+    if conf.reachability.lower() not in ("true", "false"):
+        res.append(f"MEND_REACHABILITY must be 'true' or 'false', got '{conf.reachability}'")
     if try_or_error(lambda: int(conf.maxlookback) <= 0, True):
         res.append(f"MEND_MAXLOOKBACK must be a positive number of hours, got '{conf.maxlookback}'")
     return res
@@ -543,17 +545,44 @@ def fetch_project_tags(tokens: list) -> dict:
     return {token: dict(project_raw_tags.get(token) or {}) for token in tokens}
 
 
-def enrichment_enabled() -> bool:
+def epss_enabled() -> bool:
+    return conf.epss.lower() == "true"
+
+
+def reachability_enabled() -> bool:
+    return conf.reachability.lower() == "true"
+
+
+def alerts_enabled() -> bool:
+    # Both signals arrive in the same getProjectAlertsByType response, so turning either
+    # (or both) on costs exactly one alerts call per project -- the same as one.
+    #
     # No enrichment_disabled latch any more: it existed because a persistent 3.0 401/403 meant
     # the org lacked a 3.0 entitlement, which no amount of retrying would fix. Alerts ride the
     # same 1.4 transport and credential as every other call, so a failure there is not an
     # enrichment-specific condition to latch on.
-    return conf.enrichment.lower() == "true"
+    return epss_enabled() or reachability_enabled()
+
+
+def requested_signal_names() -> str:
+    """Human-readable list of the enrichment signals actually requested this run, for the
+    once-per-run alerts-fetch-failed warning. Naming only what was asked for keeps the
+    message honest when an org only has one of the two flags turned on."""
+    signals = []
+    if epss_enabled():
+        signals.extend(["EPSS", "Exploit Code Maturity"])
+    if reachability_enabled():
+        signals.append("Reachability")
+    if len(signals) <= 1:
+        return "".join(signals)
+    if len(signals) == 2:
+        return " and ".join(signals)
+    return f"{', '.join(signals[:-1])}, and {signals[-1]}"
 
 
 def enrich_project(prj_token: str) -> dict:
     """Enrichment index for one Mend project, or {} if unavailable for any reason."""
-    if not enrichment_enabled():
+    if not alerts_enabled():
         return {}
     return try_or_error(lambda: fetch_project_alerts(prj_token), {})
 
@@ -580,6 +609,30 @@ def safe_decorate(sorted_libs: list, index: dict):
 
     try_or_error(_decorate, None)
     return None
+
+
+def epss_exploit_row_fields(policy_el: dict, epss_on: bool) -> dict:
+    """The EPSS/Exploit row keys, gated on MEND_EPSS alone -- independent of reachability,
+    since an org may not have reachability analysis enabled at all."""
+    return {"EPSS": format_epss(policy_el), "Exploit": format_exploit(policy_el)} if epss_on else {}
+
+
+def reachability_row_field(policy_el: dict, reachability_on: bool) -> dict:
+    """The Reachability row key, gated on MEND_REACHABILITY alone."""
+    return {"Reachability": format_reachability(policy_el)} if reachability_on else {}
+
+
+def build_enrich_html(policy_el: dict, epss_on: bool, reachability_on: bool) -> str:
+    """The enrichment lines spliced into a CVE's description, gated per flag so each of the
+    four flag combinations renders only its own lines. Used by both MEND_DEPENDENCY branches
+    -- they are the same feature in two code paths and must behave identically."""
+    html = ""
+    if reachability_on:
+        html += f"<br><b>Reachability:</b> {format_reachability(policy_el)}"
+    if epss_on:
+        html += f"<br><b>EPSS:</b> {format_epss(policy_el)}" \
+                f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}"
+    return html
 
 
 def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST", agent_info_login=False):
@@ -674,9 +727,9 @@ def fetch_project_alerts(prj_token: str) -> dict:
             ALERTS_WARNED = True
             logger.warning(f"[{fn()}] Could not read Mend alerts for enrichment "
                            f"(getProjectAlertsByType on {prj_token} returned {payload}). "
-                           f"Reachability, EPSS and Exploit Code Maturity will be blank ('-') "
-                           f"on every work item this run. Enrichment is display-only, so the "
-                           f"run continues and no work item is lost.")
+                           f"{requested_signal_names()} will be blank ('-') on every work "
+                           f"item this run. Enrichment is display-only, so the run continues "
+                           f"and no work item is lost.")
         return {}
     return build_alert_index(alerts)
 
@@ -1429,7 +1482,8 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         prj_lib_hierarchy = try_or_error(lambda: get_prj_lib_hierarchy()["libraries"], [])
         prj_licenses = try_or_error(lambda: get_prj_licenses(), [])
         prj_lib_locations = try_or_error(lambda: get_lib_locations(), [])
-        enrich_on = bool(enrichment_enabled())
+        epss_on = epss_enabled()
+        reachability_on = reachability_enabled()
         prd_name = ws_prj[0]
         prj_name = ws_prj[1]
         status_op = "created"
@@ -1530,24 +1584,22 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                 vul_fix_type = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["type"], "")
                                 vul_url = lib_home_page if is_license else try_or_error(
                                     lambda: policy_el["vulnerability"]["url"], "")
-                                # MEND_ENRICHMENT defaults to false, and the README/design
-                                # doc promise a byte-identical work item when it's off, so
-                                # these two keys are gated on enrich_on. URL must stay the
-                                # last key written either way: create_html_table drops the
-                                # final cell by position, so anything after URL vanishes.
+                                # MEND_EPSS and MEND_REACHABILITY both default to false, and
+                                # the README/design doc promise a byte-identical work item
+                                # when both are off, so these keys are gated per flag. URL
+                                # must stay the last key written in every combination:
+                                # create_html_table drops the final cell by position, so
+                                # anything after URL vanishes.
                                 row = {
                                     "CVE": vul_name,
                                     "Severity": vul_severity,
                                     "CVSS": vul_score,
                                 }
-                                if enrich_on:
-                                    row["EPSS"] = format_epss(policy_el)
-                                    row["Exploit"] = format_exploit(policy_el)
+                                row.update(epss_exploit_row_fields(policy_el, epss_on))
                                 row["Dependency"] = lib_name
                                 row["Type"] = lib_dep
                                 row["Fixed in"] = vul_fix_resolution
-                                if enrich_on:
-                                    row["Reachability"] = format_reachability(policy_el)
+                                row.update(reachability_row_field(policy_el, reachability_on))
                                 row["URL"] = vul_url
                                 table_data.append(row)
                                 lic_data = "<br>"
@@ -1557,13 +1609,10 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                                f"<b>License Policy Violation - </b>{policy_lic_name}<br>"
                                 lic_data = generate_expandable_section("<b>License Details</b>", lic_data) if is_license else ""
 
-                                # Gated on enrich_on: MEND_ENRICHMENT defaults to false, and
+                                # MEND_EPSS and MEND_REACHABILITY both default to false, and
                                 # the README/design doc promise a byte-identical work item
-                                # when it's off.
-                                enrich_html = (f"<br><b>Reachability:</b> {format_reachability(policy_el)}"
-                                              f"<br><b>EPSS:</b> {format_epss(policy_el)}"
-                                              f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}") \
-                                    if enrich_on else ""
+                                # when both are off.
+                                enrich_html = build_enrich_html(policy_el, epss_on, reachability_on)
                                 vul_data = "<b>Vulnerable Library:</b>" + lib_name + \
                                     "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
                                     "<br><b>Vulnerability Details:</b> " + vul_desc + "<br><b>Publish Date:</b> " + \
@@ -1648,13 +1697,10 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                                f"<br><b>License Reference File: </b><a href='{lic_data_[0]}'>{lic_data_[0]}</a><br>" \
                                                f"<b>License Policy Violation - </b>{policy_lic_name}<br>"
                                 lic_data = generate_expandable_section("<b>License Details</b>", lic_data) if is_license else ""
-                                # Gated on enrich_on: MEND_ENRICHMENT defaults to false, and
+                                # MEND_EPSS and MEND_REACHABILITY both default to false, and
                                 # the README/design doc promise a byte-identical work item
-                                # when it's off.
-                                enrich_html = (f"<br><b>Reachability:</b> {format_reachability(policy_el)}"
-                                              f"<br><b>EPSS:</b> {format_epss(policy_el)}"
-                                              f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}") \
-                                    if enrich_on else ""
+                                # when both are off.
+                                enrich_html = build_enrich_html(policy_el, epss_on, reachability_on)
                                 vul_data = "" if is_license else \
                                     "<br><b>Vulnerability Details:</b> " + vul_desc + \
                                     "<br><b>Publish Date:</b> " + vul_publish_date + \
@@ -1924,8 +1970,9 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     logger.info(f"Selection mode: {'tag-based routing' if conf.routing.lower() == 'true' else 'token list'}")
     # Logged on both branches, before routing returns: without it a pipeline log cannot
     # answer "did enrichment run?", and 'off' is reached silently by an unexpanded
-    # $(MEND_ENRICHMENT) as well as by an explicit false.
-    logger.info(f"Enrichment: {'on' if enrichment_enabled() else 'off'} (MEND_ENRICHMENT)")
+    # $(MEND_EPSS) / $(MEND_REACHABILITY) as well as by an explicit false.
+    logger.info(f"Enrichment: EPSS {'on' if epss_enabled() else 'off'} (MEND_EPSS), "
+                f"Reachability {'on' if reachability_enabled() else 'off'} (MEND_REACHABILITY)")
     sync_state_desc = "Mend project tags" if tag_state_available \
         else "unavailable — windows fall back to MEND_MAXLOOKBACK"
     logger.info(f"Sync state: {sync_state_desc}; window floor {floor} -> {end_date}")
@@ -2049,7 +2096,8 @@ def startup():
         proxy=varenvs.get_env("proxy").strip(),
         routing=varenvs.get_env("wsrouting").strip(),
         branches=varenvs.get_env("wsbranches").strip(),
-        enrichment=varenvs.get_env("wsenrichment").strip(),
+        epss=varenvs.get_env("wsepss").strip(),
+        reachability=varenvs.get_env("wsreachability").strip(),
         maxlookback=varenvs.get_env("wsmaxlookback").strip(),
     )
     try:

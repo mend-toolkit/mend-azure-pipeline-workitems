@@ -16,7 +16,7 @@ def test_fetch_project_alerts_asks_1_4_for_this_project_s_vulnerability_alerts()
              "reachabilityInfo": {"reachable": True, "analyzed": True},
              "library": {"keyUuid": "lib-a"}}
     with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="uk", ws_org_token="ot",
-                                                        enrichment="true")), \
+                                                        epss="true", reachability="true")), \
          mock.patch.object(core, "call_ws_api",
                            return_value=json.dumps({"alerts": [alert]})) as api:
         index = core.fetch_project_alerts("tok-1")
@@ -79,23 +79,32 @@ def test_a_successful_alerts_fetch_warns_about_nothing(caplog):
 
 
 def test_enrich_project_needs_no_resolution_step():
-    """The whole point of #14: no uuid map, no name join, no 2.0 login. If enrichment is on,
-    a project token is all that is needed."""
-    with mock.patch.object(core, "conf", mock.MagicMock(enrichment="true")), \
+    """The whole point of #14: no uuid map, no name join, no 2.0 login. If either signal is
+    on, a project token is all that is needed."""
+    with mock.patch.object(core, "conf", mock.MagicMock(epss="true", reachability="false")), \
          mock.patch.object(core, "fetch_project_alerts", return_value={("CVE-1", "lib-a"): {}}) as f:
         assert core.enrich_project("tok-1") == {("CVE-1", "lib-a"): {}}
     f.assert_called_once_with("tok-1")
 
 
-def test_enrich_project_is_empty_when_enrichment_is_off():
-    with mock.patch.object(core, "conf", mock.MagicMock(enrichment="false")), \
+def test_enrich_project_fetches_when_only_reachability_is_on():
+    """Both signals arrive in the same getProjectAlertsByType response, so turning on either
+    one alone must still make the call -- not just EPSS."""
+    with mock.patch.object(core, "conf", mock.MagicMock(epss="false", reachability="true")), \
+         mock.patch.object(core, "fetch_project_alerts", return_value={("CVE-1", "lib-a"): {}}) as f:
+        assert core.enrich_project("tok-1") == {("CVE-1", "lib-a"): {}}
+    f.assert_called_once_with("tok-1")
+
+
+def test_enrich_project_is_empty_when_both_flags_are_off():
+    with mock.patch.object(core, "conf", mock.MagicMock(epss="false", reachability="false")), \
          mock.patch.object(core, "fetch_project_alerts") as f:
         assert core.enrich_project("tok-1") == {}
     f.assert_not_called()
 
 
 def test_a_raising_fetch_never_reaches_create_wi():
-    with mock.patch.object(core, "conf", mock.MagicMock(enrichment="true")), \
+    with mock.patch.object(core, "conf", mock.MagicMock(epss="true", reachability="true")), \
          mock.patch.object(core, "fetch_project_alerts", side_effect=Exception("boom")):
         assert core.enrich_project("tok-1") == {}
 

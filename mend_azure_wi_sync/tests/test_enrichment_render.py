@@ -8,11 +8,11 @@ from mend_azure_wi_sync import enrichment as en
 def test_url_must_remain_the_last_row_key():
     """create_html_table drops the final cell by position, assuming URL is last.
 
-    The enrichment columns are gated on `enrich_on` (MEND_ENRICHMENT), so the row is built by
-    mutating a `row` dict rather than a single dict literal. This parses the ORDER OF
-    ASSIGNMENTS made to `row`, not a literal's keys. This is a guard test, not a feature
-    test: if someone appends a column after URL, the column vanishes from every work item
-    silently. Failing loudly here is the point.
+    The enrichment columns are gated on MEND_EPSS / MEND_REACHABILITY independently, so the
+    row is built by mutating a `row` dict rather than a single dict literal. This parses the
+    ORDER OF ASSIGNMENTS made to `row`, not a literal's keys. This is a guard test, not a
+    feature test: if someone appends a column after URL, the column vanishes from every work
+    item silently. Failing loudly here is the point.
     """
     src = core.__file__
     with open(src, encoding="utf-8") as fh:
@@ -25,64 +25,75 @@ def test_url_must_remain_the_last_row_key():
         m = re.search(r'"([A-Za-z ]+)":', line) or re.search(r'row\["([A-Za-z ]+)"\]\s*=', line)
         if m:
             keys.append(m.group(1))
+        elif "epss_exploit_row_fields" in line:
+            keys.extend(["EPSS", "Exploit"])
+        elif "reachability_row_field" in line:
+            keys.append("Reachability")
     assert keys[-1] == "URL", f"URL must be the last key assigned to row, got {keys}"
     assert keys[-2] == "Reachability", f"Reachability must be assigned immediately before URL, got {keys}"
     assert "EPSS" in keys and "Exploit" in keys
 
 
-def test_no_enrichment_keys_are_added_when_the_flag_is_off():
-    # MEND_ENRICHMENT defaults to false. Existing users must see a byte-identical work item
-    # -- not three columns of "-". The README promises exactly this, so EPSS/Exploit/
-    # Reachability must never be written to `row` except behind an `if enrich_on:` guard.
-    # There is no create_wi test harness to drive this behaviourally (none exists in this
-    # suite), so this asserts on the source structure instead.
+def test_no_enrichment_keys_are_added_when_both_flags_are_off():
+    # MEND_EPSS and MEND_REACHABILITY both default to false. Existing users must see a
+    # byte-identical work item -- not three columns of "-".
+    assert core.epss_exploit_row_fields({}, epss_on=False) == {}
+    assert core.reachability_row_field({}, reachability_on=False) == {}
+
+
+def test_epss_exploit_row_fields_only_gated_on_the_epss_flag():
+    """EPSS/Exploit must be independent of reachability -- an org may not have reachability
+    analysis enabled at all."""
+    fields = core.epss_exploit_row_fields(
+        {"vulnerability": {"threatAssessment": {"epssPercentage": 5.0,
+                                                "exploitCodeMaturity": "HIGH"}}},
+        epss_on=True)
+    assert set(fields) == {"EPSS", "Exploit"}
+
+
+def test_reachability_row_field_only_gated_on_the_reachability_flag():
+    fields = core.reachability_row_field(
+        {"reachabilityInfo": {"reachable": True, "analyzed": True}}, reachability_on=True)
+    assert set(fields) == {"Reachability"}
+
+
+def test_build_enrich_html_covers_all_four_flag_combinations():
+    """Both MEND_DEPENDENCY branches splice `enrich_html` into vul_data via this one
+    function, so each of the four flag combinations must render only its own lines and
+    nothing else."""
+    policy_el = {"vulnerability": {"threatAssessment": {"epssPercentage": 5.0,
+                                                        "exploitCodeMaturity": "HIGH"}},
+                "reachabilityInfo": {"reachable": True, "analyzed": True}}
+
+    neither = core.build_enrich_html(policy_el, epss_on=False, reachability_on=False)
+    assert neither == ""
+
+    epss_only = core.build_enrich_html(policy_el, epss_on=True, reachability_on=False)
+    assert "<b>EPSS:</b>" in epss_only
+    assert "<b>Exploit Code Maturity:</b>" in epss_only
+    assert "<b>Reachability:</b>" not in epss_only
+
+    reachability_only = core.build_enrich_html(policy_el, epss_on=False, reachability_on=True)
+    assert "<b>Reachability:</b>" in reachability_only
+    assert "<b>EPSS:</b>" not in reachability_only
+    assert "<b>Exploit Code Maturity:</b>" not in reachability_only
+
+    both = core.build_enrich_html(policy_el, epss_on=True, reachability_on=True)
+    assert "<b>Reachability:</b>" in both
+    assert "<b>EPSS:</b>" in both
+    assert "<b>Exploit Code Maturity:</b>" in both
+    # Reachability renders first, matching the row's column order.
+    assert both.index("<b>Reachability:</b>") < both.index("<b>EPSS:</b>")
+
+
+def test_both_mend_dependency_branches_use_the_same_enrich_html_builder():
+    """The two vul_data sites (one per MEND_DEPENDENCY branch) are the same feature in two
+    code paths and must behave identically -- guarded against drift by sharing one function."""
     src = core.__file__
     with open(src, encoding="utf-8") as fh:
         body = fh.read()
-    start = body.index("row = {")
-    end = body.index("table_data.append(row)", start)
-    block = body[start:end]
-
-    literal_dict = block[:block.index("}")]
-    for key in ("EPSS", "Exploit", "Reachability"):
-        assert f'"{key}"' not in literal_dict, (
-            f'"{key}" must not be an unconditional row key, got literal {literal_dict!r}')
-
-    epss_exploit_guarded = re.search(
-        r'if enrich_on:\s*\n\s*row\["EPSS"\]\s*=\s*format_epss\(policy_el\)\s*\n'
-        r'\s*row\["Exploit"\]\s*=\s*format_exploit\(policy_el\)', block)
-    assert epss_exploit_guarded, "EPSS and Exploit must be assigned together inside 'if enrich_on:'"
-
-    reachability_guarded = re.search(
-        r'if enrich_on:\s*\n\s*row\["Reachability"\]\s*=\s*format_reachability\(policy_el\)', block)
-    assert reachability_guarded, "Reachability must be assigned inside its own 'if enrich_on:'"
-
-    # Only these two guards should exist in the row-building block -- confirms Dependency,
-    # Type, Fixed in and URL are unconditional, not gated.
-    assert block.count("if enrich_on:") == 2, \
-        f"expected exactly 2 'if enrich_on:' guards in the row block, got {block.count('if enrich_on:')}"
-
-
-def test_vul_data_enrich_html_is_empty_string_when_flag_is_off():
-    """Both MEND_DEPENDENCY branches splice `enrich_html` into vul_data (the CVE's
-    expandable detail section when MEND_DEPENDENCY=true, the flat per-CVE description when
-    it's false). test_no_enrichment_keys_are_added_when_the_flag_is_off already covers the
-    table-row gating; this is the other half of the same invariant -- with the flag off,
-    the description must be byte-identical to before this feature -- for the two vul_data
-    sites. There is no create_wi test harness to drive this behaviourally, so this asserts
-    on the source structure, same style as test_url_must_remain_the_last_row_key.
-    """
-    src = core.__file__
-    with open(src, encoding="utf-8") as fh:
-        body = fh.read()
-
-    guarded_sites = re.findall(
-        r'enrich_html\s*=\s*\(f"<br><b>Reachability:</b>.*?"\)\s*\\?\s*\n\s*if enrich_on else ""',
-        body, re.DOTALL)
-    assert len(guarded_sites) == 2, (
-        f"expected exactly 2 'enrich_html = (...) if enrich_on else \"\"' sites, one per "
-        f"MEND_DEPENDENCY branch, got {len(guarded_sites)}")
-
+    sites = re.findall(r'enrich_html = build_enrich_html\(policy_el, epss_on, reachability_on\)', body)
+    assert len(sites) == 2, f"expected exactly 2 call sites, got {len(sites)}"
     spliced = body.count("enrich_html + \\")
     assert spliced == 2, (
         f"expected both vul_data sites to splice the guarded enrich_html variable, "
