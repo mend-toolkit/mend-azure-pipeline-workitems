@@ -123,17 +123,34 @@ def test_format_epss_does_not_rescale_the_value():
     def _epss(raw):
         return en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": raw}}})
 
-    assert _epss(0.8) == "0.8%"        # was "80.0%" before the correction
     assert _epss(92.4) == "92.4%"
     assert _epss(100) == "100.0%"
-    assert _epss(0.04) == "0.0%"       # rounds to one decimal, as CVSS does
+    assert _epss(2.5) == "2.5%"
+    assert _epss(1) == "1.0%"          # the boundary is inclusive: 1 is not "below 1%"
+
+
+def test_format_epss_renders_anything_below_one_percent_as_less_than_one():
+    """Matches Mend's own repo integration, which is the point: the same score must not read
+    differently depending on which Mend surface a triager is looking at.
+
+    One decimal on a 0-100 scale would compress most of the real distribution -- the majority
+    of CVEs score well under 1% -- into a wall of "0.0%" and "0.3%". Verified live 2026-08-21:
+    epssPercentage 0.253 is 0.25% in the Mend UI, which one decimal renders "0.3%".
+    """
+    def _epss(raw):
+        return en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": raw}}})
+
+    assert _epss(0.253) == "<1%"       # the live sample; the UI shows 0.25%
+    assert _epss(0.8) == "<1%"
+    assert _epss(0.04) == "<1%"
+    assert _epss(0.924) == "<1%"
+    assert _epss(0.999) == "<1%"
 
 
 def test_format_epss_renders_zero_as_a_real_score():
     # 0.0 is a valid EPSS score and is falsy. A truthiness check here would render a real
-    # answer as "we got nothing".
-    assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": 0.0}}}) == "0.0%"
-    assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": 0.924}}}) == "0.9%"
+    # answer as "we got nothing" -- "<1%" is a real answer, en.NO_DATA is not.
+    assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": 0.0}}}) == "<1%"
     assert en.format_epss({}) == en.NO_DATA
     assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": "x"}}}) == en.NO_DATA
 
