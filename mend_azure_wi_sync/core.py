@@ -13,6 +13,8 @@ from _version import __tool_name__, __version__
 from config import *
 from enrichment import (build_alert_index, decorate_policy_violations, format_epss,
                         format_exploit, format_reachability)
+from identity import (cve_title, is_legacy_cve_title, is_legacy_vulnerability_title,
+                      license_title, vulnerability_title)
 from routing import (parse_route, build_table, classify, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_PROJECT, TAG_REVSYNC, VERDICT_FAILED,
@@ -1578,11 +1580,18 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                            try_or_error(lambda: x["vulnerability"]["score"], 0))))
                         max_severity = try_or_error(lambda: max_severity_el["vulnerability"]["cvss3_score"],
                                                     try_or_error(lambda: max_severity_el["vulnerability"]["score"], ""))
-                vul_title = f"License Policy Violation detected in {lib_name}" if is_license else f"{lib_name}: " \
-                                        f"{len(relevant_vuls)} vulnerabilities (highest severity is {max_severity})"
+                vul_title = license_title(lib_name) if is_license \
+                    else vulnerability_title(lib_name)
                 hierarchy_libs = ""
                 vulnerability_data = ""
-                exist_id = check_wi_id(id=vul_title,project_name=f"{prd_name}/{prj_name}")
+                # Migration: an item created before titles became library-keyed still carries the
+                # count-and-severity form. resolve_wi_id matches it, and create_wi_content's PATCH
+                # body already includes System.Title, so the match renames it in place.
+                # The legacy predicate is deletable one release after every user has synced once.
+                exist_id = resolve_wi_id(
+                    vul_title,
+                    None if is_license else (lambda t: is_legacy_vulnerability_title(t, lib_name)),
+                    project_name=f"{prd_name}/{prj_name}")
                 # Looking for ID by System.Title and Tag (Product/Project Name)
                 if exist_id > 0:
                     wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
