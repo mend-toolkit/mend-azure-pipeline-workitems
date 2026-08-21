@@ -7,11 +7,12 @@ sys.path.append(os.path.dirname(__file__))
 # answer gets a real word instead, so a reader can tell "Mend says no" from "we failed".
 NO_DATA = "-"
 
+# Mend's reachability vocabulary is two values. POTENTIALLY_REACHABLE and
+# REACHABILITY_UNAVAILABLE were 3.0 spellings and are gone (confirmed 2026-08-21); the
+# "not analyzed" case is carried by an ABSENT reachability key, which renders NO_DATA.
 REACHABILITY_LABELS = {
     "REACHABLE": "Reachable",
-    "POTENTIALLY_REACHABLE": "Potentially Reachable",
     "UNREACHABLE": "Unreachable",
-    "REACHABILITY_UNAVAILABLE": "Reachability Unavailable",
 }
 
 MATURITY_LABELS = {
@@ -57,6 +58,74 @@ def extract_values(finding: dict) -> dict:
     return values
 
 
+def _reachability_from_info(info):
+    """`reachabilityInfo` -> "REACHABLE" / "UNREACHABLE" / None.
+
+    None means "Mend did not tell us", which the renderer shows as NO_DATA. analyzed=false
+    occurs only when reachability analysis has not run for the project (confirmed live
+    2026-08-21), so it is exactly that case rather than a third reachability state.
+
+    `reachable` is tested with `is True` / `is False`, never truthiness: a string or null
+    from an unexpected payload must read as "not told", not as a confident answer. In a
+    triage field, confidently wrong is worse than blank.
+    """
+    if not isinstance(info, dict):
+        return None
+    if info.get("analyzed") is not True:
+        return None
+    reachable = info.get("reachable")
+    if reachable is True:
+        return "REACHABLE"
+    if reachable is False:
+        return "UNREACHABLE"
+    return None
+
+
+def extract_alert_values(alert: dict) -> dict:
+    """The three enrichment values off one 1.4 alert.
+
+    Field paths verified live 2026-08-21 against getProjectAlertsByType. Unlike the 3.0
+    finding this replaces, an alert nests threatAssessment only under `vulnerability`, so
+    there is no second location to read, and it carries no `exploitable` field at all --
+    exploitCodeMaturity is the exploitability signal, matching Mend's repo integration.
+
+    Keys whose value is unavailable are omitted rather than stored as None: the renderers
+    treat an absent key as "we got nothing" and a present one as a real Mend answer.
+    """
+    values = {}
+    candidates = {
+        "reachability": _reachability_from_info(_get(alert, "reachabilityInfo")),
+        "epss": _get(alert, "vulnerability", "threatAssessment", "epssPercentage"),
+        "maturity": _get(alert, "vulnerability", "threatAssessment", "exploitCodeMaturity"),
+    }
+    for key, value in candidates.items():
+        if value is not None:
+            values[key] = value
+    return values
+
+
+def build_alert_index(alerts: list) -> dict:
+    """{(cve_name, library_key_uuid): values} for one project's 1.4 alerts.
+
+    Both halves of the key are 1.4 field names in the same identifier space as
+    fetchProjectPolicyIssues, so this join has no cross-generation assumption to get wrong --
+    which is the whole reason enrichment moved off 3.0.
+
+    An alert with no extractable values is omitted, so decorate_policy_violations' `matched`
+    count stays honest: a match that carries nothing is not a match.
+    """
+    index = {}
+    for alert in alerts or []:
+        cve = _get(alert, "vulnerability", "name")
+        lib_uuid = _get(alert, "library", "keyUuid")
+        if not cve or not lib_uuid:
+            continue
+        values = extract_alert_values(alert)
+        if values:
+            index[(cve, lib_uuid)] = values
+    return index
+
+
 def build_index(findings: list) -> dict:
     """{(cve_name, library_uuid): values} for one project's 3.0 findings."""
     index = {}
@@ -95,8 +164,6 @@ def decorate_policy_violations(sorted_libs: list, index: dict):
             matched += 1
             if "reachability" in values:
                 policy_el["reachability"] = values["reachability"]
-            if "exploitable" in values:
-                policy_el["exploitable"] = values["exploitable"]
             threat = {}
             if "epss" in values:
                 threat["epssPercentage"] = values["epss"]
@@ -168,15 +235,10 @@ def format_epss(policy_el: dict) -> str:
 
 def format_exploit(policy_el: dict) -> str:
     maturity = _get(policy_el, "vulnerability", "threatAssessment", "exploitCodeMaturity")
-    if maturity is not None:
-        # See format_reachability: dict.get() raises on an unhashable (dict/list) key, and
-        # this function is called unguarded from inside create_wi.
-        if not isinstance(maturity, str):
-            return NO_DATA
-        return MATURITY_LABELS.get(maturity, str(maturity))
-    exploitable = _get(policy_el, "exploitable")
-    if exploitable is True:
-        return "Yes"
-    if exploitable is False:
-        return "No"
-    return NO_DATA
+    if maturity is None:
+        return NO_DATA
+    # See format_reachability: dict.get() raises on an unhashable (dict/list) key, and this
+    # function is called unguarded from inside create_wi.
+    if not isinstance(maturity, str):
+        return NO_DATA
+    return MATURITY_LABELS.get(maturity, str(maturity))

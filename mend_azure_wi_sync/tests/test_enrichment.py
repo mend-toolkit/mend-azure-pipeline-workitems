@@ -104,9 +104,7 @@ def test_an_empty_but_real_match_still_counts_as_matched():
 
 def test_format_reachability_covers_every_state():
     for raw, shown in [("REACHABLE", "Reachable"),
-                       ("POTENTIALLY_REACHABLE", "Potentially Reachable"),
-                       ("UNREACHABLE", "Unreachable"),
-                       ("REACHABILITY_UNAVAILABLE", "Reachability Unavailable")]:
+                       ("UNREACHABLE", "Unreachable")]:
         assert en.format_reachability({"reachability": raw}) == shown
     assert en.format_reachability({}) == en.NO_DATA
     assert en.format_reachability({"reachability": "FUTURE_VALUE"}) == "FUTURE_VALUE"
@@ -162,9 +160,91 @@ def test_format_epss_survives_an_overflowing_value():
     assert en.format_epss({"vulnerability": {"threatAssessment": {"epssPercentage": huge}}}) == en.NO_DATA
 
 
-def test_format_exploit_distinguishes_no_from_nothing():
+def test_format_exploit_reads_maturity_and_falls_back_to_no_data():
+    # The `exploitable` boolean fallback is gone -- see
+    # test_format_exploit_no_longer_falls_back_to_the_exploitable_boolean below.
     assert en.format_exploit({"vulnerability": {"threatAssessment": {"exploitCodeMaturity": "POC_CODE"}}}) == "PoC Code"
     assert en.format_exploit({"vulnerability": {"threatAssessment": {"exploitCodeMaturity": "NOT_DEFINED"}}}) == "Not Defined"
-    assert en.format_exploit({"exploitable": True}) == "Yes"
-    assert en.format_exploit({"exploitable": False}) == "No"
     assert en.format_exploit({}) == en.NO_DATA
+
+
+def test_reachability_maps_the_analyzed_boolean_pair():
+    """Mend's reachability vocabulary is now two values, so the pair collapses to two strings
+    plus "we were not told". analyzed=false occurs only when reachability analysis has not run
+    (confirmed 2026-08-21), and it deliberately maps to None so the renderer shows NO_DATA."""
+    assert en._reachability_from_info({"reachable": True, "analyzed": True}) == "REACHABLE"
+    assert en._reachability_from_info({"reachable": False, "analyzed": True}) == "UNREACHABLE"
+    assert en._reachability_from_info({"reachable": False, "analyzed": False}) is None
+    assert en._reachability_from_info({"reachable": True, "analyzed": False}) is None
+    assert en._reachability_from_info({}) is None
+    assert en._reachability_from_info(None) is None
+    assert en._reachability_from_info("REACHABLE") is None
+
+
+def test_reachability_needs_a_real_boolean_not_a_truthy_value():
+    """A non-boolean `reachable` must not be guessed at: "confidently wrong is worse than
+    blank" applies to a triage field."""
+    assert en._reachability_from_info({"reachable": "yes", "analyzed": True}) is None
+    assert en._reachability_from_info({"reachable": None, "analyzed": True}) is None
+
+
+def test_extract_alert_values_reads_the_live_payload():
+    """Field paths verified live 2026-08-21 against getProjectAlertsByType."""
+    alert = {
+        "vulnerability": {"name": "CVE-2026-31802",
+                          "threatAssessment": {"exploitCodeMaturity": "NOT_DEFINED",
+                                               "epssPercentage": 0.253}},
+        "reachabilityInfo": {"reachable": False, "analyzed": True},
+        "library": {"keyUuid": "9c2fb703-17e5-4f3c-8297-ad9ec3c625b0"},
+    }
+    assert en.extract_alert_values(alert) == {"reachability": "UNREACHABLE",
+                                             "maturity": "NOT_DEFINED",
+                                             "epss": 0.253}
+
+
+def test_extract_alert_values_omits_what_it_did_not_get():
+    """The renderers treat an absent key as "we got nothing" and a present one as a real Mend
+    answer, so a None must never be stored."""
+    assert en.extract_alert_values({}) == {}
+    assert en.extract_alert_values({"vulnerability": {"threatAssessment": {}}}) == {}
+    assert en.extract_alert_values(
+        {"vulnerability": {"threatAssessment": {"epssPercentage": 0.0}}}) == {"epss": 0.0}
+
+
+def test_build_alert_index_keys_on_cve_and_library_uuid():
+    """The join key is (vulnerability.name, library.keyUuid) -- both 1.4 field names, both in
+    the same identifier space as fetchProjectPolicyIssues. This is what retires the unverified
+    1.4 keyUuid == 3.0 component.uuid assumption: there is no cross-space join left."""
+    alerts = [{"vulnerability": {"name": "CVE-1", "threatAssessment": {"epssPercentage": 2.5}},
+               "library": {"keyUuid": "lib-a"}},
+              {"vulnerability": {"name": "CVE-2", "threatAssessment": {"epssPercentage": 9.0}},
+               "library": {"keyUuid": "lib-b"}}]
+    assert en.build_alert_index(alerts) == {("CVE-1", "lib-a"): {"epss": 2.5},
+                                           ("CVE-2", "lib-b"): {"epss": 9.0}}
+
+
+def test_build_alert_index_skips_unusable_alerts():
+    alerts = ["not-a-dict",
+              {"library": {"keyUuid": "lib-a"}},                      # no CVE name
+              {"vulnerability": {"name": "CVE-1"}},                   # no library uuid
+              {"vulnerability": {"name": "CVE-2"}, "library": {"keyUuid": "lib-b"}},  # no values
+              {"vulnerability": {"name": "CVE-3", "threatAssessment": {"epssPercentage": 1.0}},
+               "library": {"keyUuid": "lib-c"}}]
+    assert en.build_alert_index(alerts) == {("CVE-3", "lib-c"): {"epss": 1.0}}
+    assert en.build_alert_index([]) == {}
+    assert en.build_alert_index(None) == {}
+
+
+def test_format_exploit_no_longer_falls_back_to_the_exploitable_boolean():
+    """Alerts carry exploitCodeMaturity and no `exploitable` field, and maturity is the signal
+    Mend's own repo integration displays. The boolean fallback is dead once enrichment reads
+    alerts, and a dead fallback in a triage renderer is worse than no fallback: it would render
+    a stale 3.0-shaped value if one ever survived in a payload."""
+    assert en.format_exploit({"exploitable": True}) == en.NO_DATA
+    assert en.format_exploit({"exploitable": False}) == en.NO_DATA
+    assert en.format_exploit(
+        {"vulnerability": {"threatAssessment": {"exploitCodeMaturity": "FUNCTIONAL"}}}) == "Functional"
+
+
+def test_reachability_labels_carry_only_the_two_live_values():
+    assert set(en.REACHABILITY_LABELS) == {"REACHABLE", "UNREACHABLE"}
