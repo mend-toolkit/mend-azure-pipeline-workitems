@@ -13,7 +13,7 @@ from _version import __tool_name__, __version__
 from config import *
 from enrichment import (build_alert_index, decorate_policy_violations, format_epss,
                         format_exploit, format_reachability)
-from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
+from routing import (parse_route, build_table, classify, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_PROJECT, TAG_REVSYNC, VERDICT_FAILED,
                        VERDICT_OK, build_selection, clamp, failed_stamp, is_stale,
@@ -1105,6 +1105,29 @@ def update_wi_in_thread():
     excluded = set(t for t in conf.wsexcludetoken.split(",") if t)
     if excluded:
         targets = [t for t in targets if t[0] not in excluded]
+    if conf.routing.lower() == "true":
+        # Under routing the token lists are not the selector -- the routing tags are -- so the
+        # narrowing above filters nothing in a routed run. A stored address says where a
+        # project's work items LIVE; its routing tags say whether the project is still ours to
+        # sync. Without this, enabling routing on an org where one project carries tags still
+        # cost a WIQL query plus a work-item hydration for every project that had ever been
+        # addressed, including ones whose tags were removed runs ago.
+        #
+        # classify() is reused rather than reimplemented so this cannot drift from the forward
+        # side's definition of routable. The stored Azure project is passed as the known-projects
+        # set so its destination check passes trivially: the reverse sync visits the address the
+        # work items were actually written to, which is not necessarily where the routing tags
+        # point today, and re-deriving that here would send state to the wrong project.
+        routable = {token for token, azure_project, _ in targets
+                    if classify(parse_route((project_raw_tags or {}).get(token) or {}),
+                                {azure_project}, conf.branches) == SKIP_OK}
+        addressed = len(targets)
+        targets = [t for t in targets if t[0] in routable]
+        if len(targets) != addressed:
+            # Deliberately a count, not a token list: an org where routing covers a handful of
+            # projects would otherwise print most of its project tokens on every single run.
+            logger.info(f"Reverse sync filtered to match the project filter: "
+                        f"{len(targets)} of {addressed} project(s) with a stored address.")
     if not targets:
         return "No Mend project in scope has a stored reverse-sync address; reverse sync skipped."
 

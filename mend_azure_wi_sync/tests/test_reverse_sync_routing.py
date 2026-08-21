@@ -335,3 +335,62 @@ def test_a_failed_expansion_is_not_memoized():
     assert first is None
     assert second == []
     assert api.call_count == 2
+
+
+# --- routing narrows the reverse sync too (reported live 2026-08-21) ---
+# Under MEND_ROUTING the token lists are not the selector, routing tags are. Scoping the
+# reverse sync by MEND_PRODUCTTOKEN/PROJECTTOKEN therefore narrows nothing in a routed run,
+# so enabling routing on an org where one project carries tags still cost a WIQL query plus
+# a work-item hydration for every project that had ever stored an address.
+
+def _routed_state():
+    return {"tok-tagged": {"project": "Platform|Prod/Tagged"},
+            "tok-untagged": {"project": "Tools|Prod/Untagged"},
+            "tok-otherbranch": {"project": "Extra|Prod/Other"}}
+
+
+def _raw_tags():
+    return {"tok-tagged": {"azure-project": ["Platform"], "azure-repo": ["Tagged"],
+                           "azure-branch": ["refs/heads/main"]},
+            # carries a stored address from an earlier run but no routing tags any more
+            "tok-untagged": {"CTX": ["abc"], "commitId": ["def"]},
+            "tok-otherbranch": {"azure-project": ["Extra"], "azure-repo": ["Other"],
+                                "azure-branch": ["refs/heads/feature/x"]}}
+
+
+def _visited(**conf_kw):
+    seen = []
+    base = dict(routing="true", branches="main", wsproducttoken="", wsprojecttoken="",
+                wsexcludetoken="", azure_project="Bookkeeping", utc_delta=0)
+    base.update(conf_kw)
+    with mock.patch.object(core, "conf", mock.MagicMock(**base)), \
+         mock.patch.object(core, "fetch_project_tag_state", return_value=_routed_state()), \
+         mock.patch.object(core, "project_raw_tags", _raw_tags(), create=True), \
+         mock.patch.object(core, "update_wi_for_project",
+                           side_effect=lambda t, *a, **k: seen.append(t) or "ok"):
+        core.update_wi_in_thread()
+    return sorted(seen)
+
+
+def test_routing_reverse_sync_skips_a_project_whose_routing_tags_are_gone():
+    """The reported symptom: routing on, one project tagged, yet every project that had ever
+    stored an address was still visited. A stored address is where work items LIVE; the
+    routing tags are what says this project is still ours to sync."""
+    assert _visited() == ["tok-tagged"]
+
+
+def test_routing_reverse_sync_respects_mend_branches():
+    """A branch-filtered project is deliberately out of scope on the forward side, so paying
+    a WIQL for it on the reverse side is the same wasted work in the other direction."""
+    assert _visited(branches="feature/*") == ["tok-otherbranch"]
+    assert _visited(branches="main,feature/*") == ["tok-otherbranch", "tok-tagged"]
+
+
+def test_routing_off_still_uses_the_token_lists_not_the_routing_tags():
+    """With routing off, an untagged project is a perfectly normal target -- selection comes
+    from the token lists, and narrowing by routing tags there would silently drop projects."""
+    assert _visited(routing="false") == ["tok-otherbranch", "tok-tagged", "tok-untagged"]
+
+
+def test_routing_on_with_no_routable_project_skips_cleanly():
+    assert _visited(branches="nothing-matches-this") == []
