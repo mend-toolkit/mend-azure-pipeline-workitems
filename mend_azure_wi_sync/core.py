@@ -18,7 +18,8 @@ from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
 from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_PROJECT, TAG_REVSYNC, VERDICT_FAILED,
                        VERDICT_OK, build_selection, clamp, failed_stamp, is_stale,
                        count_parseable_rows, field_for, keep_or_clamp, parse_tag_map,
-                       parse_tag_values, selection_floor, superseded, tag_ops, window_start)
+                       parse_raw_tags, parse_tag_values, selection_floor, superseded, tag_ops,
+                       window_start)
 from syncstate import _parse as _parse_timestamp
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
@@ -67,7 +68,14 @@ resolved_project_names = None  # token -> (productName, projectName), one sweep 
                                 # used by fetch_project_tags
 project_tag_state = None      # one getOrganizationProjectTags sweep per run
 project_tag_values = {}       # {token: {field: [every value]}} from that same sweep
+project_raw_tags = {}         # {token: {raw tag key: [values]}} from that same sweep, used by
+                               # fetch_project_tags for routing (routing tags are not ours)
 tag_state_available = True    # False once any tag call fails; drives the once-per-run warning
+tag_sweep_ok = True           # False only when the getOrganizationProjectTags sweep ITSELF
+                               # failed or was unreadable -- unlike tag_state_available, a later
+                               # tag WRITE failure does not flip this. fetch_project_tags gates
+                               # on this, not tag_state_available, so one failed saveProjectTag
+                               # mid-run does not abort routing for the rest of the run.
 TAG_WARNED = False            # WARNING_MSG-style guard so 400 projects log one error, not 400
 
 
@@ -447,7 +455,7 @@ def fetch_project_tag_state() -> dict:
     unavailable rather than raising: every window then falls back to the clamp, which is correct
     but repeats work, so the operator needs the warning and the run needs to continue.
     """
-    global project_tag_state, project_tag_values
+    global project_tag_state, project_tag_values, project_raw_tags, tag_sweep_ok
     if project_tag_state is not None:
         return project_tag_state
     body = {"requestType": "getOrganizationProjectTags",
@@ -457,11 +465,15 @@ def fetch_project_tag_state() -> dict:
     rows = try_or_error(lambda: payload["projectTags"], None)
     if rows is None:
         _warn_tag_state_once("getOrganizationProjectTags")
+        tag_sweep_ok = False
         project_tag_state = {}
         return project_tag_state
-    # Both views come from the one sweep: the winners the run reads, and every value, which is
-    # what replace_project_tag has to name to delete a superseded one.
+    # All three views come from the one sweep: the winners the run reads, every value (which is
+    # what replace_project_tag has to name to delete a superseded one), and the raw per-token tag
+    # dict routing reads (see fetch_project_tags) -- routing tags are not ours, so they are not
+    # in project_tag_values/parse_tag_map's four-key contract.
     project_tag_values = parse_tag_values(rows)
+    project_raw_tags = parse_raw_tags(rows)
     project_tag_state = parse_tag_map(rows)
     if rows and not count_parseable_rows(rows):
         # Rows the parser cannot structurally read means the row shape is not what parse_tag_map
@@ -475,6 +487,7 @@ def fetch_project_tag_state() -> dict:
         # first run after upgrade every row parses to nothing — normal, and it used to spend
         # this run's one warning on a mismatch that did not exist.
         _warn_tag_state_once("getOrganizationProjectTags returned rows in an unexpected shape")
+        tag_sweep_ok = False
     return project_tag_state
 
 
@@ -595,59 +608,24 @@ def _fetch_entities_rows():
 
 
 def fetch_project_tags(tokens: list) -> dict:
-    """Map Mend project token -> list of tag objects ({key|namespace, value}), per token, one of:
+    """Map Mend 1.4 project token -> that project's tags, from the org sweep.
 
-    - Resolved and scanned with tags -> the tag list.
-    - Resolved but scanned with no tags, or absent from /entities, or unresolvable to a
-      (product, project) name pair -> [] ("no-target": scanned/known but nothing to route on).
-    - Resolved to a (product, project) name pair that collided with another project's in
-      /entities -> None (ambiguous: ownership of the tags cannot be determined, so this must
-      not be confused with a genuinely untagged project — see the duplicate-name-pair guard
-      below). This is a per-token value, distinct from the function returning None outright.
+    Returns None (the whole call) if the sweep was unreadable, matching the previous
+    all-or-nothing convention: a partial map would make a real project look untagged and
+    route nothing, silently.
 
-    Returns None (the whole call, not a per-token value) if the Mend call failed, matching the
-    get_exist_wi failure convention.
-
-    1.4 project tokens and 2.0 /entities uuids are different identifier spaces (verified live:
-    0 of 25 matched), so the join is done on (productName, projectName) instead — the same pair
-    already carried in the Work Item tag. Names are resolved via _resolve_project_names().
+    This used to join 2.0 /entities rows to 1.4 tokens on (productName, projectName), because
+    1.4 tokens and 2.0 uuids are different identifier spaces. The 1.4 sweep carries the same
+    routing tags keyed by the token directly (verified live 2026-08-21), which removes the
+    join, the getAllProducts/getAllProjects fan-out behind it, and the duplicate-name-pair
+    ambiguity that forced SKIP_UNKNOWN for two projects sharing a name pair. Per-token None
+    (the collision signal) is gone with it: tokens cannot collide, so an unresolved token is
+    simply untagged ({}), same as a resolved-but-tagless one.
     """
-    names = _resolve_project_names(tokens)
-    if names is None:
+    fetch_project_tag_state()
+    if not tag_sweep_ok:
         return None
-
-    tags_by_name = {}
-    collided_names = set()
-    rows = _fetch_entities_rows()
-    if rows is None:
-        return None
-    for row in rows:
-        product_name = try_or_error(lambda: row["product"]["name"], "")
-        project = try_or_error(lambda: row["project"], {})
-        project_name = try_or_error(lambda: project["name"], "")
-        key = (product_name, project_name)
-        row_tags = try_or_error(lambda: project["tags"], [])
-        if key in tags_by_name:
-            # A duplicate (product, project) name pair makes the join ambiguous. Report it
-            # loudly and mark it unusable rather than silently picking one of the two — the
-            # per-token result below surfaces this as None, distinct from a plain [].
-            logger.error(f"[{fn()}] Duplicate Mend project name pair "
-                         f"'{product_name}/{project_name}' seen in /entities; refusing to "
-                         f"guess which one owns the routing tags.")
-            collided_names.add(key)
-        else:
-            tags_by_name[key] = row_tags
-
-    result = {}
-    for token in tokens:
-        name = names.get(token)
-        if name is None:
-            result[token] = []
-        elif name in collided_names:
-            result[token] = None
-        else:
-            result[token] = tags_by_name.get(name, [])
-    return result
+    return {token: dict(project_raw_tags.get(token) or {}) for token in tokens}
 
 
 def enrichment_enabled() -> bool:

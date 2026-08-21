@@ -132,34 +132,6 @@ def test_run_is_still_fatal_when_zero_routed_outcomes_are_genuine():
     assert core.sync_had_fatal_error() is True
 
 
-def test_collided_token_reaches_a_loud_outcome_not_the_quiet_no_target_bucket():
-    # fetch_project_tags returns a per-token None (not []) when the (product, project)
-    # name pair collided in /entities and the join is ambiguous. That must classify as
-    # the loud "unknown-target" outcome, never fall into the quiet "no-target" bucket
-    # that an empty/absent route would otherwise produce via parse_route(None or []).
-    conf = _conf()
-    tags = dict(TAGS)
-    tags["tok-collided"] = None
-    created = []
-    with mock.patch.object(core, "conf", conf), \
-         mock.patch.object(core, "get_prj_list_modified", return_value=list(tags)), \
-         mock.patch.object(core, "fetch_project_tags", return_value=tags), \
-         mock.patch.object(core, "list_azure_projects", return_value={"Platform", "Tools"}), \
-         mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi",
-                           side_effect=lambda t, *a, **k: created.append(t) or (syncstate.VERDICT_OK, "done")):
-        try:
-            result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
-        finally:
-            mock.patch.stopall()
-
-    assert "tok-collided" not in created
-    # tok-c is the genuinely-untagged one; tok-collided must be counted separately as
-    # unknown-target, not lumped into the same no-target bucket as tok-c.
-    assert "no-target: 1" in result
-    assert "unknown-target: 1" in result
-
-
 def test_case_insensitive_tag_routes_to_the_canonical_azure_project_casing():
     # classify()'s known_projects membership check is deliberately exact-string, so the
     # case-insensitive normalisation has to happen in core.py before classify() runs. This

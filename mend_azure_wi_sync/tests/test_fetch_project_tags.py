@@ -1,216 +1,86 @@
 from unittest import mock
 
 from mend_azure_wi_sync import core
+from mend_azure_wi_sync import routing
+from mend_azure_wi_sync import syncstate
 
 
 def _conf():
     return mock.MagicMock(ws_user_key="uk", ws_org_token="ot")
 
 
-def _entity(product_name, project_name, tags):
-    return {"product": {"name": product_name},
-           "project": {"name": project_name, "tags": tags}}
-
-
 # ---------------------------------------------------------------------------
-# fetch_project_tags — the 2.0 /entities sweep and the token -> tag-list join.
-# Name resolution is stubbed via _resolve_project_names so these focus purely on the
-# pagination/parsing/join behaviour of fetch_project_tags itself.
+# fetch_project_tags — the 1.4 getOrganizationProjectTags sweep, keyed by token directly.
+# No 2.0 call and no (productName, projectName) join: the sweep run_sync already makes
+# carries the routing tags against the same 1.4 token the rest of the run uses.
 # ---------------------------------------------------------------------------
 
-def test_project_with_tags_is_returned():
-    tags = [{"key": "azure-project", "value": "Platform"}]
-    names = {"tok-a": ("Product A", "Project A")}
-    page = {"retVal": [_entity("Product A", "Project A", tags)],
-           "additionalData": {"isLastPage": True}}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value=names), \
-         mock.patch.object(core, "call_ws_api_v2", return_value=(page, 0)) as api:
-        result = core.fetch_project_tags(["tok-a"])
-    assert result == {"tok-a": tags}
-    api.assert_called_once_with("orgs/ot/entities", {"pageSize": 1000, "page": 0})
+LIVE_ROWS = [{"name": "Test Workitems_master", "token": "tok-1", "tags": {
+                 "azure-project": ["Test Pipeline Workitems"],
+                 "azure-repo": ["Test Workitems"],
+                 "azure-branch": ["refs/heads/master"],
+                 "azure-wi-lastrun": ["2026-08-21 14:55:01"],
+                 "CTX": ["ignored"]}},
+             {"name": "AZ_IaC", "token": "tok-2", "tags": {"CTX": ["abc"]}}]
 
 
-def test_project_with_no_tags_returns_empty_list_not_absent():
-    names = {"tok-b": ("Product A", "Project B")}
-    page = {"retVal": [_entity("Product A", "Project B", [])],
-           "additionalData": {"isLastPage": True}}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value=names), \
-         mock.patch.object(core, "call_ws_api_v2", return_value=(page, 0)):
-        result = core.fetch_project_tags(["tok-b"])
-    assert result == {"tok-b": []}
-    assert "tok-b" in result           # scanned-but-untagged must be present, not omitted
+def test_routing_tags_come_from_the_1_4_sweep_keyed_by_token():
+    """No 2.0 call, no (product, project) name join. The sweep the run already makes carries
+    the routing tags against the same 1.4 token the rest of the run uses."""
+    with mock.patch.object(core, "fetch_project_tag_state") as state, \
+         mock.patch.object(core, "project_raw_tags",
+                           syncstate.parse_raw_tags(LIVE_ROWS), create=True):
+        state.return_value = {}
+        tags = core.fetch_project_tags(["tok-1", "tok-2"])
+    route = routing.parse_route(tags["tok-1"])
+    assert route.azure_project == "Test Pipeline Workitems"
+    assert route.repo == "Test Workitems"
+    assert route.branch == "refs/heads/master"
+    assert routing.parse_route(tags["tok-2"]).is_routable() is False
 
 
-def test_token_absent_from_entities_response_gets_empty_list():
-    """The token resolves to a name pair, but that pair never shows up in /entities."""
-    names = {"tok-c": ("Product A", "Project C")}
-    page = {"retVal": [_entity("Product A", "Project A", [{"key": "k", "value": "v"}])],
-           "additionalData": {"isLastPage": True}}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value=names), \
-         mock.patch.object(core, "call_ws_api_v2", return_value=(page, 0)):
-        result = core.fetch_project_tags(["tok-c"])
-    assert result == {"tok-c": []}
+def test_parse_route_accepts_the_1_4_dict_of_lists():
+    """The 2.0 shape was a list of {key, value}; 1.4 gives {key: [value, ...]}. Both must work
+    while the two readers coexist, and the adapter must not silently drop a single-value list."""
+    assert routing.parse_route({"azure-project": ["Payments"]}).azure_project == "Payments"
+    assert routing.parse_route({"azure-project": "Payments"}).azure_project == "Payments"
+    assert routing.parse_route([{"key": "azure-project", "value": "Payments"}]).azure_project == "Payments"
 
 
-def test_unresolvable_token_gets_empty_list():
-    """A token _resolve_project_names could not find a name for must not raise or vanish."""
-    page = {"retVal": [], "additionalData": {"isLastPage": True}}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value={}), \
-         mock.patch.object(core, "call_ws_api_v2", return_value=(page, 0)):
-        result = core.fetch_project_tags(["tok-ghost"])
-    assert result == {"tok-ghost": []}
+def test_a_project_absent_from_the_sweep_is_untagged_not_ambiguous():
+    """The name-join produced a per-token None for an ambiguous (product, project) pair. Tokens
+    cannot collide, so that signal is gone and an unknown token is simply untagged."""
+    with mock.patch.object(core, "fetch_project_tag_state") as state, \
+         mock.patch.object(core, "project_raw_tags", {}, create=True):
+        state.return_value = {}
+        tags = core.fetch_project_tags(["tok-missing"])
+    assert tags == {"tok-missing": {}}
+    assert None not in tags.values()
 
 
-def test_multipage_pagination_terminates_on_is_last_page():
-    """isLastPage arrives as a real JSON bool in production; str(...).lower() must handle it,
-    not just the string the 2.0 spec's own example shows. Page 1 is padded to a full page so the
-    belt-and-braces short-row check does not itself terminate the sweep early."""
-    page1_rows = [_entity(f"P{i}", f"J{i}", []) for i in range(1000)]
-    page1_rows.append(_entity("Product A", "Project A", [{"key": "azure-project", "value": "X"}]))
-    page1 = {"retVal": page1_rows, "additionalData": {"isLastPage": "false"}}
-    page2 = {"retVal": [_entity("Product B", "Project B", [{"key": "azure-repo", "value": "Y"}])],
-           "additionalData": {"isLastPage": True}}
-    names = {"tok-a": ("Product A", "Project A"), "tok-b": ("Product B", "Project B")}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value=names), \
-         mock.patch.object(core, "call_ws_api_v2",
-                           side_effect=[(page1, 0), (page2, 0)]) as api:
-        result = core.fetch_project_tags(["tok-a", "tok-b"])
-    assert api.call_count == 2
-    assert result["tok-a"] == [{"key": "azure-project", "value": "X"}]
-    assert result["tok-b"] == [{"key": "azure-repo", "value": "Y"}]
+def test_an_unreadable_sweep_fails_the_whole_call():
+    """Same all-or-nothing contract as before: a partial map would make a real project look
+    untagged and route nothing, silently."""
+    with mock.patch.object(core, "fetch_project_tag_state", return_value={}), \
+         mock.patch.object(core, "tag_sweep_ok", False, create=True):
+        assert core.fetch_project_tags(["tok-1"]) is None
 
 
-def test_short_page_stops_even_if_is_last_page_says_false():
-    """Belt-and-braces: a page shorter than pageSize ends the sweep regardless of the flag."""
-    page = {"retVal": [_entity("Product A", "Project A", [])],
-           "additionalData": {"isLastPage": "false"}}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value={}), \
-         mock.patch.object(core, "call_ws_api_v2", return_value=(page, 0)) as api:
-        core.fetch_project_tags([])
-    assert api.call_count == 1
-
-
-def test_failed_entities_call_returns_none():
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value={}), \
-         mock.patch.object(core, "call_ws_api_v2", return_value=({"message": "boom"}, 2)):
-        assert core.fetch_project_tags(["tok-a"]) is None
-
-
-def test_failed_name_resolution_returns_none_and_skips_the_entities_call():
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value=None), \
-         mock.patch.object(core, "call_ws_api_v2") as api:
-        assert core.fetch_project_tags(["tok-a"]) is None
-    api.assert_not_called()
-
-
-def test_duplicate_name_pair_is_reported_loudly_and_returns_none_for_that_token():
-    """Two /entities rows sharing the same (product, project) name must not let the join
-    silently pick one of them for a token that resolves to that pair. The collision must be
-    distinguishable from a genuinely untagged project, so the per-token value is None, not []."""
-    dup_a = [{"key": "azure-project", "value": "A"}]
-    dup_b = [{"key": "azure-project", "value": "B"}]
-    page = {"retVal": [_entity("Product X", "Project X", dup_a),
-                       _entity("Product X", "Project X", dup_b)],
-           "additionalData": {"isLastPage": True}}
-    names = {"tok-a": ("Product X", "Project X")}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value=names), \
-         mock.patch.object(core, "call_ws_api_v2", return_value=(page, 0)), \
-         mock.patch.object(core, "logger") as logger:
-        result = core.fetch_project_tags(["tok-a"])
-    assert result == {"tok-a": None}
-    assert logger.error.called
-
-
-def test_collided_token_is_none_while_an_ordinary_untagged_token_in_the_same_response_is_empty():
-    """The three-state contract in one response: a collision must not contaminate an unrelated,
-    genuinely-untagged project's result, and the two must remain distinguishable."""
-    dup_a = [{"key": "azure-project", "value": "A"}]
-    dup_b = [{"key": "azure-project", "value": "B"}]
-    page = {"retVal": [_entity("Product X", "Project X", dup_a),
-                       _entity("Product X", "Project X", dup_b),
-                       _entity("Product Y", "Project Y", [])],
-           "additionalData": {"isLastPage": True}}
-    names = {"tok-collided": ("Product X", "Project X"), "tok-plain": ("Product Y", "Project Y")}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value=names), \
-         mock.patch.object(core, "call_ws_api_v2", return_value=(page, 0)):
-        result = core.fetch_project_tags(["tok-collided", "tok-plain"])
-    assert result["tok-collided"] is None
-    assert result["tok-plain"] == []
-
-
-# ---------------------------------------------------------------------------
-# isLastPage permutations — pinned individually against a full-size page so the flag's own
-# branch (not the belt-and-braces short-row fallback) is what each test proves.
-# ---------------------------------------------------------------------------
-
-_ABSENT = object()
-
-
-def _full_page(is_last_page_value):
-    rows = [_entity(f"P{i}", f"J{i}", []) for i in range(1000)]
-    additional_data = {} if is_last_page_value is _ABSENT else {"isLastPage": is_last_page_value}
-    return {"retVal": rows, "additionalData": additional_data}
-
-
-def test_is_last_page_bool_true_stops_the_sweep():
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value={}), \
-         mock.patch.object(core, "call_ws_api_v2",
-                           return_value=(_full_page(True), 0)) as api:
-        core.fetch_project_tags([])
-    assert api.call_count == 1
-
-
-def test_is_last_page_bool_false_continues_the_sweep():
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value={}), \
-         mock.patch.object(core, "call_ws_api_v2",
-                           side_effect=[(_full_page(False), 0), (_full_page(True), 0)]) as api:
-        core.fetch_project_tags([])
-    assert api.call_count == 2
-
-
-def test_is_last_page_string_true_stops_the_sweep():
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value={}), \
-         mock.patch.object(core, "call_ws_api_v2",
-                           return_value=(_full_page("true"), 0)) as api:
-        core.fetch_project_tags([])
-    assert api.call_count == 1
-
-
-def test_is_last_page_string_false_continues_the_sweep():
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value={}), \
-         mock.patch.object(core, "call_ws_api_v2",
-                           side_effect=[(_full_page("false"), 0), (_full_page(True), 0)]) as api:
-        core.fetch_project_tags([])
-    assert api.call_count == 2
-
-
-def test_is_last_page_absent_falls_back_to_the_row_count_check():
-    """No additionalData.isLastPage key at all — a full page must be treated as 'more to come',
-    just like the documented-false case, rather than stopping on an absent flag."""
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "_resolve_project_names", return_value={}), \
-         mock.patch.object(core, "call_ws_api_v2",
-                           side_effect=[(_full_page(_ABSENT), 0), (_full_page(True), 0)]) as api:
-        core.fetch_project_tags([])
-    assert api.call_count == 2
+def test_a_failed_tag_write_does_not_break_routing():
+    """tag_state_available is shared with every tag WRITE (save/removeProjectTag), not just the
+    sweep. A single failed saveProjectTag later in a run must not make fetch_project_tags act as
+    though the sweep itself failed and abort routing for the rest of the run."""
+    with mock.patch.object(core, "fetch_project_tag_state", return_value={}), \
+         mock.patch.object(core, "tag_state_available", False, create=True), \
+         mock.patch.object(core, "tag_sweep_ok", True, create=True), \
+         mock.patch.object(core, "project_raw_tags", {}, create=True):
+        assert core.fetch_project_tags(["tok-1"]) == {"tok-1": {}}
 
 
 # ---------------------------------------------------------------------------
 # _resolve_project_names — the 1.4 getAllProducts + getAllProjects join key resolution.
+# No longer called by fetch_project_tags (Task 4), but the function itself is untouched and
+# still owned by Task 5's removal of the rest of the 2.0 transport, so its own tests stay.
 # ---------------------------------------------------------------------------
 
 def test_resolve_project_names_walks_products_until_found():
@@ -298,7 +168,7 @@ def test_a_failed_sweep_is_not_cached():
 
 def test_resolve_project_names_leaves_unfound_tokens_out_of_the_map():
     """A token that belongs to no product in the org is simply absent from the map, not an
-    error — fetch_project_tags treats that as no name, hence no tags, not a failure."""
+    error."""
     import json as _json
     products = {"products": [{"productName": "Product A", "productToken": "prd-a"}]}
     prd_a_projects = {"projects": [{"projectName": "Project A", "projectToken": "tok-a"}]}

@@ -87,6 +87,30 @@ def parse_tag_values(rows) -> dict:
     return state
 
 
+def parse_raw_tags(rows) -> dict:
+    """{token: {raw tag key: [values]}} -- every tag on every project, ours and everyone else's.
+
+    parse_tag_values deliberately keeps only the four keys this module owns, keyed by field
+    name, because parse_tag_map derives its winners from it. Routing needs the raw keys
+    (azure-project, azure-repo, azure-branch) under their own names, so it gets its own reader
+    over the same rows rather than a widened one whose extra keys could reach parse_tag_map.
+    """
+    state = {}
+    for row in rows or []:
+        token, tags = _row_fields(row)
+        if not token:
+            continue
+        entry = {}
+        for key, value in tags.items():
+            if not isinstance(key, str) or not key.strip():
+                continue
+            values = _tag_values(value)
+            if values:
+                entry[key.strip()] = values
+        state[token] = entry
+    return state
+
+
 def field_for(key) -> str:
     """Tag key -> the field name parse_tag_values stores it under, "" for a key we do not own."""
     return _TAG_FIELDS.get((key or "").strip().lower(), "")

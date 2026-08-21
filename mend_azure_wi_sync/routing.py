@@ -27,21 +27,32 @@ class Route:
 
 
 def parse_route(tags) -> Route:
-    # Last value wins for a repeated key. Deliberately simple: a repository moving between
-    # Azure projects is out of scope for this client.
+    """Project tags -> Route. Accepts both shapes Mend returns.
+
+    1.4 getOrganizationProjectTags gives {key: [value, ...]}; 2.0 /entities gave a list of
+    EntityTagDTO {key, value}. Routing reads the 1.4 sweep now, but the list form is kept
+    because it costs three lines and a caller passing it would otherwise silently route
+    nothing.
+
+    Last value wins for a repeated key. Deliberately simple: a repository moving between
+    Azure projects is out of scope for this client.
+    """
     route = Route()
-    for raw in (tags or []):
-        if not isinstance(raw, dict):
-            continue
-        key = raw.get("key")
-        value = raw.get("value")
+    pairs = []
+    if isinstance(tags, dict):
+        for key, value in tags.items():
+            values = value if isinstance(value, (list, tuple)) else [value]
+            pairs.extend((key, v) for v in values)
+    else:
+        for raw in (tags or []):
+            if isinstance(raw, dict):
+                pairs.append((raw.get("key"), raw.get("value")))
+    for key, value in pairs:
         if not isinstance(key, str) or not isinstance(value, str):
             continue
-        key = key.strip().lower()
-        value = value.strip()
-        attr = TAG_KEYS.get(key)
-        if attr and value:
-            setattr(route, attr, value)
+        attr = TAG_KEYS.get(key.strip().lower())
+        if attr and value.strip():
+            setattr(route, attr, value.strip())
     return route
 
 
