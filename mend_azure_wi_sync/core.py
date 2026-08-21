@@ -17,7 +17,8 @@ from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_PROJECT, TAG_REVSYNC, VERDICT_FAILED,
                        VERDICT_OK, build_selection, clamp, failed_stamp, is_stale,
-                       keep_or_clamp, parse_tag_map, selection_floor, tag_ops, window_start)
+                       count_parseable_rows, keep_or_clamp, parse_tag_map, selection_floor,
+                       tag_ops, window_start)
 from syncstate import _parse as _parse_timestamp
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
@@ -394,13 +395,17 @@ def fetch_project_tag_state() -> dict:
         project_tag_state = {}
         return project_tag_state
     project_tag_state = parse_tag_map(rows)
-    if rows and not project_tag_state:
-        # Non-empty rows that yield no state means the row shape is not what parse_tag_map
-        # expects (gate 4.1.2 is unverified). Without this the run logs "Sync state: Mend
-        # project tags", every window silently falls to the clamp, no project is ever retried,
-        # and migration_seed re-reads the frozen legacy property forever. Deliberately no
-        # guessing at alternative key names: this exists to make a mismatch loud, not to
-        # paper over it.
+    if rows and not count_parseable_rows(rows):
+        # Rows the parser cannot structurally read means the row shape is not what parse_tag_map
+        # expects. Without this the run logs "Sync state: Mend project tags", every window
+        # silently falls to the clamp, no project is ever retried, and migration_seed re-reads
+        # the frozen legacy property forever. Deliberately no guessing at alternative key names:
+        # this exists to make a mismatch loud, not to paper over it.
+        #
+        # The test is structural, NOT "did any project yield state". Most projects in an org
+        # carry only CLI scan tags (CTX, commitId, repoFullName) and none of ours, so on the
+        # first run after upgrade every row parses to nothing — normal, and it used to spend
+        # this run's one warning on a mismatch that did not exist.
         _warn_tag_state_once("getOrganizationProjectTags returned rows in an unexpected shape")
     return project_tag_state
 

@@ -172,3 +172,20 @@ def test_the_live_1_4_row_shape_is_read_without_a_shape_warning(caplog):
         "project": "Test Pipeline Workitems|Test Pipeline Workitems/Test Workitems_master"}}
     assert core.tag_state_available is True
     assert caplog.records == []
+
+
+def test_an_org_whose_projects_carry_only_scan_tags_is_not_a_shape_problem(caplog):
+    """The first run after upgrade: rows are non-empty and readable, but no project carries an
+    azure-wi-* tag yet. Empty state here is the truth, not a mismatch."""
+    rows_only_scan_tags = json.dumps({"projectTags": [
+        {"name": "AZ_IaC", "token": "tok-1", "tags": {"CTX": ["abc"], "commitId": ["def"]}},
+        {"name": "Test", "token": "tok-2", "tags": {}}]})
+    core.project_tag_state = None
+    core.tag_state_available = True
+    core.TAG_WARNED = False
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value=rows_only_scan_tags), \
+         caplog.at_level("ERROR"):
+        assert core.fetch_project_tag_state() == {}
+    assert core.tag_state_available is True
+    assert caplog.records == []

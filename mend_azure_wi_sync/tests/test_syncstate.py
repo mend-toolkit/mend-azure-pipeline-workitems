@@ -265,3 +265,29 @@ def test_malformed_list_values_are_skipped_not_fatal():
             {"token": "tok-3", "tags": {"azure-wi-lastrun": ["   "]}},
             {"token": "tok-4", "tags": {"azure-wi-lastrun": [None, "2026-08-20 10:00:00"]}}]
     assert syncstate.parse_tag_map(rows) == {"tok-4": {"lastrun": "2026-08-20 10:00:00"}}
+
+
+# --- the shape guard's discriminator ---
+# "No project carries an azure-wi-* tag yet" is the normal first run, not a shape problem:
+# 25 of the 28 rows in the live org carry only CLI scan tags (CTX, commitId, repoFullName).
+# What proves the shape is a row the parser can structurally read — a string token and a
+# tags container — not the presence of one of our keys in it.
+
+def test_structurally_valid_rows_are_counted_even_when_none_carry_our_tags():
+    rows = [{"name": "p", "token": "tok-1", "tags": {"CTX": ["abc"], "commitId": ["def"]}},
+            {"name": "q", "token": "tok-2", "tags": {}}]
+    assert syncstate.parse_tag_map(rows) == {}
+    assert syncstate.count_parseable_rows(rows) == 2
+
+
+def test_rows_in_the_wrong_shape_count_as_unparseable():
+    rows = [{"projectToken": "tok-1", "tags": [{"key": "azure-wi-lastrun"}]},
+            "not-a-dict",
+            {"token": "", "tags": {}},
+            {"token": "tok-2", "tags": "not-a-container"}]
+    assert syncstate.count_parseable_rows(rows) == 0
+
+
+def test_count_parseable_rows_tolerates_empty_input():
+    assert syncstate.count_parseable_rows([]) == 0
+    assert syncstate.count_parseable_rows(None) == 0

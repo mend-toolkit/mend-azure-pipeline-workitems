@@ -31,7 +31,12 @@ _TAG_FIELDS = {
 
 
 def _row_fields(row):
-    """(token, tags) for a structurally readable row, else (None, None)."""
+    """(token, tags) for a structurally readable row, else (None, None).
+
+    A readable row is a dict with a non-blank string `token` and a dict `tags`. That, not the
+    presence of one of our keys, is what proves the response shape: an org on its first run
+    carries only CLI scan tags (CTX, commitId, repoFullName) and is perfectly readable.
+    """
     if not isinstance(row, dict):
         return None, None
     token = row.get("token")
@@ -53,6 +58,12 @@ def _tag_values(value):
     if not isinstance(value, (list, tuple)):
         return []
     return sorted(v.strip() for v in value if isinstance(v, str) and v.strip())
+
+
+def count_parseable_rows(rows) -> int:
+    """How many rows the parser could structurally read. core's shape guard needs this to tell
+    "the response shape is wrong" apart from "no project has been tagged yet"."""
+    return len([1 for row in (rows or []) if _row_fields(row)[0]])
 
 
 def parse_tag_map(rows) -> dict:
