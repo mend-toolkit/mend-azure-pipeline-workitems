@@ -15,7 +15,8 @@ def _reverse_conf():
     # reset/maxlookback (they're .lower()'d and int()'d respectively), unlike the
     # forward-sync-only _conf() above.
     return mock.MagicMock(azure_project="AzureTestProject", utc_delta=0, reset="false",
-                          maxlookback="720")
+                          maxlookback="720", wsproducttoken="", wsprojecttoken="",
+                          wsexcludetoken="")
 
 
 def test_run_sync_aborts_when_existing_items_cannot_be_read():

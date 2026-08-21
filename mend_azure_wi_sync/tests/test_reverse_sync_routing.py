@@ -19,7 +19,8 @@ from mend_azure_wi_sync import syncstate
 
 
 def _conf(**kw):
-    base = dict(azure_project="Bookkeeping", utc_delta=0)
+    base = dict(azure_project="Bookkeeping", utc_delta=0,
+                wsproducttoken="", wsprojecttoken="", wsexcludetoken="")
     base.update(kw)
     return mock.MagicMock(**base)
 
@@ -235,3 +236,102 @@ def test_reverse_targets_strips_whitespace_from_a_padded_stored_address():
     state = {"tok-1": {"project": "Platform| Prod/Proj "},
              "tok-2": {"project": "Platform|   "}}
     assert core.reverse_targets(state) == [("tok-1", "Platform", "Prod/Proj")]
+
+
+# --- Reverse sync respects MEND_PRODUCTTOKEN / MEND_PROJECTTOKEN / MEND_EXCLUDETOKEN ---
+#
+# An operator scoping a run to one project was still paying a WIQL query plus a work-item
+# hydration for every project the org has ever tagged, because update_wi_in_thread walked
+# the whole tag map with no regard for the same scope the forward sync honours. These tests
+# mirror run_sync_routed's narrowing contract (core.py:1747-1765) for the reverse path.
+
+
+def test_reverse_sync_is_narrowed_by_wsprojecttoken():
+    core.project_tag_state = {"tok-1": {"project": "Platform|Prod/Platform"},
+                              "tok-2": {"project": "Tools|Prod/Tools"}}
+    seen = []
+    with mock.patch.object(core, "conf", _conf(wsprojecttoken="tok-1")), \
+         mock.patch.object(core, "update_wi_for_project",
+                           side_effect=lambda tok, tag, todate: seen.append(tok) or "ok"):
+        core.update_wi_in_thread()
+    assert seen == ["tok-1"]
+
+
+def test_reverse_sync_is_narrowed_by_wsproducttoken():
+    core.project_tag_state = {"tok-1": {"project": "Platform|Prod/Platform"},
+                              "tok-2": {"project": "Tools|Prod/Tools"}}
+    seen = []
+    with mock.patch.object(core, "conf", _conf(wsproducttoken="prd-1")), \
+         mock.patch.object(core, "expand_product_tokens", return_value=["tok-1"]), \
+         mock.patch.object(core, "update_wi_for_project",
+                           side_effect=lambda tok, tag, todate: seen.append(tok) or "ok"):
+        core.update_wi_in_thread()
+    assert seen == ["tok-1"]
+
+
+def test_reverse_sync_always_subtracts_wsexcludetoken():
+    core.project_tag_state = {"tok-1": {"project": "Platform|Prod/Platform"},
+                              "tok-2": {"project": "Tools|Prod/Tools"}}
+    seen = []
+    with mock.patch.object(core, "conf", _conf(wsexcludetoken="tok-2")), \
+         mock.patch.object(core, "update_wi_for_project",
+                           side_effect=lambda tok, tag, todate: seen.append(tok) or "ok"):
+        core.update_wi_in_thread()
+    assert seen == ["tok-1"]
+
+
+def test_reverse_sync_with_empty_config_narrows_nothing():
+    """Spec 5.6.1's dormant-repo guarantee: absent MEND_PRODUCTTOKEN/MEND_PROJECTTOKEN,
+    every tagged project must still be visited, or a quiet/dormant repo whose work items
+    get closed would never be pushed back to Mend."""
+    core.project_tag_state = {"tok-1": {"project": "Platform|Prod/Platform"},
+                              "tok-2": {"project": "Tools|Prod/Tools"}}
+    seen = []
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "update_wi_for_project",
+                           side_effect=lambda tok, tag, todate: seen.append(tok) or "ok"):
+        core.update_wi_in_thread()
+    assert seen == ["tok-1", "tok-2"]
+
+
+def test_reverse_sync_aborts_rather_than_widen_scope_on_a_failed_expansion():
+    """expand_product_tokens returning None must never be treated as 'no scope' -- that
+    would silently visit every tagged project, which is the exact bug this filtering
+    exists to fix."""
+    core.project_tag_state = {"tok-1": {"project": "Platform|Prod/Platform"}}
+    with mock.patch.object(core, "conf", _conf(wsproducttoken="prd-1")), \
+         mock.patch.object(core, "expand_product_tokens", return_value=None), \
+         mock.patch.object(core, "update_wi_for_project") as inner:
+        before = core.global_errors
+        result = core.update_wi_in_thread()
+    inner.assert_not_called()
+    assert core.global_errors == before + 1
+    assert core.sync_had_fatal_error() is True
+    assert "abort" in result.lower()
+
+
+def test_reverse_sync_scope_expansion_is_memoized():
+    """expand_product_tokens costs one Mend call per product token and is already called
+    once per run by whichever forward path ran; the reverse path must reuse that result
+    rather than paying for it again."""
+    core.project_tag_state = {"tok-1": {"project": "Platform|Prod/Platform"}}
+    with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="k", ws_org_token="o")), \
+         mock.patch.object(core, "call_ws_api",
+                           return_value='{"projects": [{"projectToken": "tok-1"}]}') as api:
+        first = core.expand_product_tokens("prd-memo-test")
+        second = core.expand_product_tokens("prd-memo-test")
+    assert first == ["tok-1"]
+    assert second == ["tok-1"]
+    assert api.call_count == 1
+
+
+def test_a_failed_expansion_is_not_memoized():
+    """Only a successful expansion may be cached -- caching a failure would paper over a
+    transient Mend outage as a permanent empty scope."""
+    with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="k", ws_org_token="o")), \
+         mock.patch.object(core, "call_ws_api", side_effect=["", '{"projects": []}']) as api:
+        first = core.expand_product_tokens("prd-memo-fail")
+        second = core.expand_product_tokens("prd-memo-fail")
+    assert first is None
+    assert second == []
+    assert api.call_count == 2

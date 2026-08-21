@@ -22,7 +22,7 @@ def _reset_state():
 
 def _conf(**kw):
     base = dict(routing="false", reset="false", maxlookback="720", azure_project="Book",
-                utc_delta=0)
+                utc_delta=0, wsproducttoken="", wsprojecttoken="", wsexcludetoken="")
     base.update(kw)
     return mock.MagicMock(**base)
 

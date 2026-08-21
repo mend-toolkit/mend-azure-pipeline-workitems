@@ -75,6 +75,11 @@ tag_sweep_ok = True           # False only when the getOrganizationProjectTags s
 TAG_WARNED = False            # WARNING_MSG-style guard so 400 projects log one error, not 400
 ALERTS_WARNED = False         # same guard for the enrichment alerts fetch: a user key that
                                # cannot read alerts fails for all ~107 projects identically
+product_token_expansion_cache = {}   # {producttoken string: [expanded project tokens]},
+                               # memoized so the forward and reverse paths don't each pay
+                               # one Mend call per product token in the same run. Only a
+                               # SUCCESSFUL expansion is cached -- a failure must stay
+                               # failing, never papered over by a stale cache entry.
 
 
 def fn():
@@ -1018,13 +1023,38 @@ def update_wi_in_thread():
     # forward outcome, and not get_prj_list_modified. That is what closes the regression
     # against pre-branch behaviour: a quiet/dormant repo whose work items get closed must
     # still be pushed back to Mend even though nothing about it changed on the forward side.
-    global conf
+    global conf, global_errors, run_failed
     if conf is None:
         conf = startup()
         conf.update_properties()
     targets = reverse_targets(fetch_project_tag_state())
     if not targets:
         return "No Mend project has a stored reverse-sync address; reverse sync skipped."
+
+    # Mirror run_sync_routed's scope narrowing (core.py, expand_product_tokens caller)
+    # exactly, so a run scoped to one product/project does not pay a WIQL query plus a
+    # work-item hydration for every project the org has ever tagged. Absent config narrows
+    # nothing (spec 5.6.1's dormant-repo guarantee).
+    scope = set()
+    if conf.wsproducttoken:
+        expanded = expand_product_tokens(conf.wsproducttoken)
+        if expanded is None:
+            # Failing to expand must never widen scope -- silently visiting every tagged
+            # project would be the exact bug this filtering exists to fix.
+            global_errors += 1
+            run_failed = True
+            return "Aborted: could not expand MEND_PRODUCTTOKEN; refusing to widen reverse sync scope."
+        scope.update(expanded)
+    if conf.wsprojecttoken:
+        scope.update(conf.wsprojecttoken.split(","))
+    if scope:
+        targets = [t for t in targets if t[0] in scope]
+    excluded = set(t for t in conf.wsexcludetoken.split(",") if t)
+    if excluded:
+        targets = [t for t in targets if t[0] not in excluded]
+    if not targets:
+        return "No Mend project in scope has a stored reverse-sync address; reverse sync skipped."
+
     original_azure_project = conf.azure_project
     todate = (datetime.datetime.now() +
               datetime.timedelta(hours=conf.utc_delta)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1700,6 +1730,9 @@ def expand_product_tokens(producttoken: str) -> list:
     #   2. json.loads(call_ws_api(...)) is now inside the try. In the original it sat
     #      outside, so a non-200 from Mend returned "" and raised an uncaught
     #      JSONDecodeError instead of the graceful failure this refactor exists to give.
+    global product_token_expansion_cache
+    if producttoken in product_token_expansion_cache:
+        return product_token_expansion_cache[producttoken]
     res = []
     for prd_ in producttoken.split(","):
         data = json.dumps({"requestType": "getAllProjects",
@@ -1712,7 +1745,10 @@ def expand_product_tokens(producttoken: str) -> list:
                 res.append(prj_['projectToken'])
         except Exception as err:
             logger.error(f"Mend API call failed. Details:{err}")
+            # A failure must never be memoized -- caching it would paper over a transient
+            # Mend outage as a permanent empty scope.
             return None
+    product_token_expansion_cache[producttoken] = res
     return res
 
 
