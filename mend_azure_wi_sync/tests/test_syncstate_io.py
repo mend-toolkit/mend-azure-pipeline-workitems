@@ -10,10 +10,12 @@ from mend_azure_wi_sync import syncstate
 @pytest.fixture(autouse=True)
 def _reset_state():
     core.project_tag_state = None
+    core.project_tag_values = {}
     core.tag_state_available = True
     core.TAG_WARNED = False
     yield
     core.project_tag_state = None
+    core.project_tag_values = {}
     core.tag_state_available = True
     core.TAG_WARNED = False
 
@@ -64,8 +66,8 @@ def test_removing_a_tag_uses_the_remove_request_type():
 
 
 def test_removing_a_tag_sends_the_stored_value_when_it_has_one():
-    """Whether removeProjectTag matches on tagValue is unverified, so the caller passes what
-    the org sweep actually read back rather than betting on "" being ignored."""
+    """removeProjectTag matches on the tagValue and deletes only that value (verified live
+    2026-08-21), so the caller must pass what the org sweep read back -- "" names nothing."""
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "call_ws_api", return_value='{"projectTags": {}}') as api:
         core.remove_project_tag("tok-1", syncstate.TAG_FAILED, "2026-08-19 11:00:00")
@@ -189,3 +191,118 @@ def test_an_org_whose_projects_carry_only_scan_tags_is_not_a_shape_problem(caplo
         assert core.fetch_project_tag_state() == {}
     assert core.tag_state_available is True
     assert caplog.records == []
+
+
+# --- saveProjectTag creates a second tag under the same key, it does not replace ---
+# Verified live 2026-08-21, from Mend's own UI as well as the API: two runs left
+# azure-wi-lastrun carrying both "2026-08-21 14:36:34" and "2026-08-21 14:55:01". The
+# superseded value must be deleted explicitly, or every key grows by one value per run and
+# runs into the (still unverified) tag value limit.
+
+def _tag_calls(api):
+    """[(requestType, tagKey, tagValue)] in call order."""
+    out = []
+    for call in api.call_args_list:
+        body = json.loads(call.kwargs["data"])
+        if body.get("requestType") in ("saveProjectTag", "removeProjectTag"):
+            out.append((body["requestType"], body["tagKey"], body["tagValue"]))
+    return out
+
+
+def _reset_tag_globals(values=None):
+    """Seed the value map the sweep would have produced. The autouse fixture clears it after."""
+    core.project_tag_values = values if values is not None else {}
+
+
+def test_saving_a_watermark_deletes_the_value_it_supersedes():
+    _reset_tag_globals({"tok-1": {"lastrun": ["2026-08-21 14:36:34"]}})
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value='{"projectTags": {}}') as api:
+        assert core.replace_project_tag("tok-1", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01") is True
+    assert _tag_calls(api) == [
+        ("saveProjectTag", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01"),
+        ("removeProjectTag", syncstate.TAG_LASTRUN, "2026-08-21 14:36:34")]
+
+
+def test_the_new_value_is_saved_before_anything_is_deleted():
+    """Order is the safety property. Save-then-prune leaves both values if the prune fails, and
+    latest-wins reads that correctly. Prune-then-save would leave the project with NO watermark
+    if the save then failed, silently widening its next window to MEND_MAXLOOKBACK."""
+    _reset_tag_globals({"tok-1": {"lastrun": ["2026-08-20 10:00:00", "2026-08-21 14:36:34"]}})
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value='{"projectTags": {}}') as api:
+        core.replace_project_tag("tok-1", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01")
+    calls = _tag_calls(api)
+    assert calls[0] == ("saveProjectTag", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01")
+    assert sorted(calls[1:]) == sorted([
+        ("removeProjectTag", syncstate.TAG_LASTRUN, "2026-08-20 10:00:00"),
+        ("removeProjectTag", syncstate.TAG_LASTRUN, "2026-08-21 14:36:34")])
+
+
+def test_nothing_is_deleted_when_the_save_failed():
+    """A failed save must not take the previous watermark with it -- that is the one value still
+    describing what was actually read."""
+    _reset_tag_globals({"tok-1": {"lastrun": ["2026-08-21 14:36:34"]}})
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value='{"errorCode": 5001}') as api:
+        assert core.replace_project_tag("tok-1", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01") is False
+    assert [c for c in _tag_calls(api) if c[0] == "removeProjectTag"] == []
+
+
+def test_the_value_just_written_is_never_deleted():
+    """Re-saving the value already stored must be a no-op prune, not a delete of itself."""
+    _reset_tag_globals({"tok-1": {"lastrun": ["2026-08-21 14:55:01"]}})
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value='{"projectTags": {}}') as api:
+        core.replace_project_tag("tok-1", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01")
+    assert [c for c in _tag_calls(api) if c[0] == "removeProjectTag"] == []
+
+
+def test_a_second_save_in_the_same_run_prunes_only_the_first_runs_value():
+    """The in-memory value map has to track what this run wrote, or the second save re-issues a
+    remove for a value already gone and, worse, misses the one it just superseded."""
+    _reset_tag_globals({"tok-1": {"lastrun": ["2026-08-21 14:36:34"]}})
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value='{"projectTags": {}}') as api:
+        core.replace_project_tag("tok-1", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01")
+        core.replace_project_tag("tok-1", syncstate.TAG_LASTRUN, "2026-08-21 15:10:00")
+    assert _tag_calls(api) == [
+        ("saveProjectTag", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01"),
+        ("removeProjectTag", syncstate.TAG_LASTRUN, "2026-08-21 14:36:34"),
+        ("saveProjectTag", syncstate.TAG_LASTRUN, "2026-08-21 15:10:00"),
+        ("removeProjectTag", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01")]
+
+
+def test_the_verdict_path_prunes_the_previous_watermark_and_every_failed_value():
+    """tag_ops names one TAG_FAILED value (the winner). With append semantics a project that
+    failed several runs carries several, and clearing the retry queue means clearing them all --
+    one left behind keeps the project in the queue forever."""
+    _reset_tag_globals({"tok-1": {"lastrun": ["2026-08-20 10:00:00"],
+                                  "failed": ["2026-08-19 09:00:00", "2026-08-20 09:00:00"]}})
+    state = {"tok-1": {"lastrun": "2026-08-20 10:00:00", "failed": "2026-08-20 09:00:00"}}
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value='{"projectTags": {}}') as api:
+        core.record_verdict("tok-1", syncstate.VERDICT_OK, "2026-08-21 14:55:01", state)
+    calls = _tag_calls(api)
+    assert calls[0] == ("saveProjectTag", syncstate.TAG_LASTRUN, "2026-08-21 14:55:01")
+    assert ("removeProjectTag", syncstate.TAG_LASTRUN, "2026-08-20 10:00:00") in calls
+    assert ("removeProjectTag", syncstate.TAG_FAILED, "2026-08-19 09:00:00") in calls
+    assert ("removeProjectTag", syncstate.TAG_FAILED, "2026-08-20 09:00:00") in calls
+
+
+def test_the_reverse_watermark_and_the_address_are_pruned_too():
+    """Every one of the four keys is written by a different call site. A site left on the raw
+    save keeps accumulating values under its key while the other three stay clean."""
+    _reset_tag_globals({"tok-1": {"revsync": ["2026-08-20 09:00:00"],
+                                  "project": ["Old Project|Prod/Proj"]}})
+    state = {"tok-1": {"project": "Old Project|Prod/Proj"}}
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "call_ws_api", return_value='{"projectTags": {}}') as api:
+        core.replace_project_tag("tok-1", syncstate.TAG_REVSYNC, "2026-08-21 14:56:00")
+        with mock.patch.object(core, "synced_projects", [("tok-1", "Prod/Proj", "")]):
+            core.conf.azure_project = "New Project"
+            core.save_project_addr("tok-1", state)
+    calls = _tag_calls(api)
+    assert ("removeProjectTag", syncstate.TAG_REVSYNC, "2026-08-20 09:00:00") in calls
+    assert ("saveProjectTag", syncstate.TAG_PROJECT, "New Project|Prod/Proj") in calls
+    assert ("removeProjectTag", syncstate.TAG_PROJECT, "Old Project|Prod/Proj") in calls

@@ -251,12 +251,33 @@ def test_list_and_scalar_tag_values_are_both_accepted():
 
 
 def test_a_multi_valued_tag_takes_the_latest_value():
-    """A key can carry several values. Every field here is a watermark or an address, so the
-    newest is the one in force -- taking the earliest would pin the window to the oldest value
-    and re-scan the same history on every run. Blanks are ignored, not treated as a value."""
+    """saveProjectTag APPENDS rather than replaces (verified live 2026-08-21: two runs left two
+    values under azure-wi-lastrun). Multi-value is therefore the steady state, and the newest
+    value is the real watermark -- taking the earliest would pin the window to the first run
+    ever and re-scan all of history forever. Blanks are ignored, not treated as a value."""
     rows = [{"token": "tok-1", "tags": {"azure-wi-lastrun": ["2026-08-21 14:36:34", "",
                                                              "2026-08-21 14:55:01"]}}]
     assert syncstate.parse_tag_map(rows) == {"tok-1": {"lastrun": "2026-08-21 14:55:01"}}
+
+
+def test_every_value_is_retained_for_pruning_even_though_one_wins():
+    rows = [{"token": "tok-1", "tags": {
+        "azure-wi-lastrun": ["2026-08-21 14:36:34", "2026-08-21 14:55:01"],
+        "azure-wi-revsync": ["2026-08-21 14:56:00"]}}]
+    assert syncstate.parse_tag_values(rows) == {"tok-1": {
+        "lastrun": ["2026-08-21 14:36:34", "2026-08-21 14:55:01"],
+        "revsync": ["2026-08-21 14:56:00"]}}
+
+
+def test_superseded_never_includes_the_value_in_use():
+    """A caller that saves the new watermark first and prunes second must not be handed the
+    value it just wrote, or it would delete its own advance."""
+    values = ["2026-08-21 14:36:34", "2026-08-21 14:55:01"]
+    assert syncstate.superseded(values, "2026-08-21 14:55:01") == ["2026-08-21 14:36:34"]
+    assert syncstate.superseded(values, "2026-08-21 14:36:34") == ["2026-08-21 14:55:01"]
+    assert syncstate.superseded(["only"], "only") == []
+    assert syncstate.superseded([], "x") == []
+    assert syncstate.superseded(None, "x") == []
 
 
 def test_malformed_list_values_are_skipped_not_fatal():

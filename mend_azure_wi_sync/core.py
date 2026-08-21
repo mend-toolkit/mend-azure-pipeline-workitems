@@ -17,8 +17,8 @@ from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_PROJECT, TAG_REVSYNC, VERDICT_FAILED,
                        VERDICT_OK, build_selection, clamp, failed_stamp, is_stale,
-                       count_parseable_rows, keep_or_clamp, parse_tag_map, selection_floor,
-                       tag_ops, window_start)
+                       count_parseable_rows, field_for, keep_or_clamp, parse_tag_map,
+                       parse_tag_values, selection_floor, superseded, tag_ops, window_start)
 from syncstate import _parse as _parse_timestamp
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
@@ -68,6 +68,7 @@ project_uuid_map = {}   # Mend 1.4 project token -> 3.0 project uuid, resolved o
 resolved_project_names = None  # token -> (productName, projectName), one sweep per run,
                                 # shared by fetch_project_tags and resolve_project_uuids
 project_tag_state = None      # one getOrganizationProjectTags sweep per run
+project_tag_values = {}       # {token: {field: [every value]}} from that same sweep
 tag_state_available = True    # False once any tag call fails; drives the once-per-run warning
 TAG_WARNED = False            # WARNING_MSG-style guard so 400 projects log one error, not 400
 
@@ -291,10 +292,53 @@ def save_project_tag(prj_token: str, key: str, value: str) -> bool:
 
 
 def remove_project_tag(prj_token: str, key: str, value: str = "") -> bool:
-    # removeProjectTag takes the same tagKey/tagValue pair as save. Whether it matches on the
-    # value is unverified, so callers pass the value the org sweep actually read back rather
-    # than assuming "" is accepted.
+    # removeProjectTag takes the same tagKey/tagValue pair as save and matches on the VALUE,
+    # deleting only that one and leaving any others under the key (verified live 2026-08-21:
+    # pruning the superseded azure-wi-lastrun left exactly the current value behind). So callers
+    # must pass the value the org sweep actually read back -- "" would name nothing.
     return _tag_call("removeProjectTag", prj_token, key, value)
+
+
+def replace_project_tag(prj_token: str, key: str, value: str) -> bool:
+    """Save one tag value and delete the ones it supersedes.
+
+    saveProjectTag does NOT replace: it adds another value under the same key (verified live
+    2026-08-21 in both the API and the Mend UI -- two runs left azure-wi-lastrun carrying two
+    timestamps). Nothing removes the old one on its own, so each key would grow by one value per
+    run per project, against a tag value limit that is still unverified.
+
+    Save first, prune second, and never prune the value just written. If the prune fails, the key
+    keeps both values and parse_tag_map's latest-wins reading is still correct; the reverse order
+    would leave a project with no watermark at all whenever the save failed, silently widening its
+    next window to MEND_MAXLOOKBACK.
+    """
+    if not save_project_tag(prj_token, key, value):
+        return False
+    field = field_for(key)
+    if not field:
+        return True
+    stored = (project_tag_values.get(prj_token) or {}).get(field) or []
+    for stale in superseded(stored, value):
+        remove_project_tag(prj_token, key, stale)
+    # Track what this run wrote, so a second save for the same key prunes the value this run
+    # superseded rather than re-issuing a remove for one already gone.
+    project_tag_values.setdefault(prj_token, {})[field] = [value]
+    return True
+
+
+def clear_project_tag(prj_token: str, key: str, value: str = ""):
+    """Delete every value stored under one key, not just the one the caller named.
+
+    tag_ops names a single TAG_FAILED value (the winner of the read-once map). With append
+    semantics a project that failed several runs carries several, and one value left behind keeps
+    it in the retry queue forever.
+    """
+    field = field_for(key)
+    stored = list((project_tag_values.get(prj_token) or {}).get(field) or []) if field else []
+    for stale in sorted(set(stored + ([value] if value else []))):
+        remove_project_tag(prj_token, key, stale)
+    if field:
+        project_tag_values.setdefault(prj_token, {}).pop(field, None)
 
 
 def apply_tag_ops(prj_token: str, ops: list):
@@ -305,10 +349,10 @@ def apply_tag_ops(prj_token: str, ops: list):
     """
     for op, key, value in ops or []:
         if op == "save":
-            if not save_project_tag(prj_token, key, value):
+            if not replace_project_tag(prj_token, key, value):
                 return
         elif op == "remove":
-            remove_project_tag(prj_token, key, value)
+            clear_project_tag(prj_token, key, value)
 
 
 def record_verdict(prj_token: str, verdict: str, todate: str, state: dict):
@@ -354,7 +398,7 @@ def save_project_addr(prj_token: str, state: dict):
     desired = f"{conf.azure_project}|{project_tag}"
     if (state.get(prj_token) or {}).get("project") == desired:
         return
-    if save_project_tag(prj_token, TAG_PROJECT, desired):
+    if replace_project_tag(prj_token, TAG_PROJECT, desired):
         state.setdefault(prj_token, {})["project"] = desired
 
 
@@ -382,7 +426,7 @@ def fetch_project_tag_state() -> dict:
     unavailable rather than raising: every window then falls back to the clamp, which is correct
     but repeats work, so the operator needs the warning and the run needs to continue.
     """
-    global project_tag_state
+    global project_tag_state, project_tag_values
     if project_tag_state is not None:
         return project_tag_state
     body = {"requestType": "getOrganizationProjectTags",
@@ -394,6 +438,9 @@ def fetch_project_tag_state() -> dict:
         _warn_tag_state_once("getOrganizationProjectTags")
         project_tag_state = {}
         return project_tag_state
+    # Both views come from the one sweep: the winners the run reads, and every value, which is
+    # what replace_project_tag has to name to delete a superseded one.
+    project_tag_values = parse_tag_values(rows)
     project_tag_state = parse_tag_map(rows)
     if rows and not count_parseable_rows(rows):
         # Rows the parser cannot structurally read means the row shape is not what parse_tag_map
@@ -1175,7 +1222,7 @@ def update_wi_for_project(prj_token: str, project_tag: str, todate: str):
                             except Exception as err:
                                 pass
         if not project_failed:
-            save_project_tag(prj_token, TAG_REVSYNC, todate)
+            replace_project_tag(prj_token, TAG_REVSYNC, todate)
             return f"Updated {executed_wi} work item(s) for {project_tag}"
         # Same string on both paths made a project whose WIQL blew up indistinguishable from
         # an empty success in the joined summary line.

@@ -1,3 +1,4 @@
+import json
 from unittest import mock
 
 import pytest
@@ -189,4 +190,9 @@ def test_a_closed_work_item_pushes_once_across_two_runs():
 
     assert "Updated 1 work item(s)" in result1
     assert "Updated 0 work item(s)" in result2
-    assert len(pushed) == 1
+    # call_ws_api is mocked wholesale, so `pushed` also catches the tag traffic that advances the
+    # watermark -- including the removeProjectTag pruning run 1's value, now that saveProjectTag
+    # is known to append rather than replace. Count only the actual pushes.
+    issue_pushes = [d for d in pushed
+                    if json.loads(d)["requestType"] == "updateExternalIntegrationIssues"]
+    assert len(issue_pushes) == 1

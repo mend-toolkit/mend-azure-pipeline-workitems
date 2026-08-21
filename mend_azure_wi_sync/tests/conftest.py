@@ -54,7 +54,7 @@ def reset_core_globals():
     saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session,
              core.run_failed, core.synced_projects, core.entities_rows, core.enrichment_disabled,
              core.project_uuid_map, core.resolved_project_names, core.project_tag_state,
-             core.tag_state_available, core.TAG_WARNED)
+             core.project_tag_values, core.tag_state_available, core.TAG_WARNED)
     core.exist_wis = []
     core.updated_wi = []
     core.global_errors = 0
@@ -66,10 +66,11 @@ def reset_core_globals():
     core.project_uuid_map = {}
     core.resolved_project_names = None
     core.project_tag_state = None
+    core.project_tag_values = {}
     core.tag_state_available = True
     core.TAG_WARNED = False
     yield
     (core.exist_wis, core.updated_wi, core.global_errors, core.conf, core.mend_v2_session,
      core.run_failed, core.synced_projects, core.entities_rows, core.enrichment_disabled,
      core.project_uuid_map, core.resolved_project_names, core.project_tag_state,
-     core.tag_state_available, core.TAG_WARNED) = saved
+     core.project_tag_values, core.tag_state_available, core.TAG_WARNED) = saved

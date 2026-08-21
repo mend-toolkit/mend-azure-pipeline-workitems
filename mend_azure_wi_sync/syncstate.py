@@ -51,13 +51,54 @@ def _tag_values(value):
 
     Verified live 2026-08-21: the sweep returns {"azure-wi-lastrun": ["2026-08-21 14:36:34",
     "2026-08-21 14:55:01"]}, a dict of lists, not of strings. The scalar form the docs imply is
-    accepted too. A key carrying several values is tolerated; parse_tag_map picks the latest.
+    accepted too. Several values under one key is the NORMAL state, not an anomaly: saveProjectTag
+    APPENDS rather than replaces (verified live the same day -- two runs, two values), so every
+    run adds one.
     """
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, (list, tuple)):
         return []
     return sorted(v.strip() for v in value if isinstance(v, str) and v.strip())
+
+
+def parse_tag_values(rows) -> dict:
+    """{token: {field: [value, …]}} -- every value under each of our keys, sorted.
+
+    parse_tag_map picks one winner per field; this keeps the rest, because the superseded values
+    are exactly what a pruning caller has to name in removeProjectTag. Append semantics mean the
+    list grows by one per run per project otherwise, and the tag-value size limit is unverified.
+    """
+    state = {}
+    for row in rows or []:
+        token, tags = _row_fields(row)
+        if not token:
+            continue
+        entry = {}
+        for key, value in tags.items():
+            if not isinstance(key, str):
+                continue
+            field = _TAG_FIELDS.get(key.strip().lower())
+            values = _tag_values(value)
+            if field and values:
+                entry.setdefault(field, []).extend(values)
+        if entry:
+            state[token] = {f: sorted(set(v)) for f, v in entry.items()}
+    return state
+
+
+def field_for(key) -> str:
+    """Tag key -> the field name parse_tag_values stores it under, "" for a key we do not own."""
+    return _TAG_FIELDS.get((key or "").strip().lower(), "")
+
+
+def superseded(values, winner) -> list:
+    """The values under one key that are NOT the one in use — what a prune must remove.
+
+    Never returns the winner, so a caller that saves first and prunes second can never delete
+    the value it just wrote.
+    """
+    return [v for v in (values or []) if v != winner]
 
 
 def count_parseable_rows(rows) -> int:
@@ -72,26 +113,13 @@ def parse_tag_map(rows) -> dict:
     Deliberately tolerant: a malformed row is skipped, never fatal. This runs over every project
     in the organization, so one bad row must not cost the whole run its state.
 
-    The LATEST value wins where a key carries several: every field here is a watermark or an
-    address, and the newest is the one in force. Timestamps are TS_FORMAT, which sorts
-    lexicographically, so max() is the latest.
+    The LATEST value wins where a key carries several. saveProjectTag appends, so a project that
+    has run twice legitimately carries two watermarks and the newer one is the true one — taking
+    the earliest would pin the window to the first run forever and re-scan all of history on
+    every run. Timestamps are TS_FORMAT, which sorts lexicographically, so max() is the latest.
     """
-    state = {}
-    for row in rows or []:
-        token, tags = _row_fields(row)
-        if not token:
-            continue
-        entry = {}
-        for key, value in tags.items():
-            if not isinstance(key, str):
-                continue
-            field = _TAG_FIELDS.get(key.strip().lower())
-            values = _tag_values(value)
-            if field and values:
-                entry[field] = max(values)
-        if entry:
-            state[token] = entry
-    return state
+    return {token: {field: max(values) for field, values in entry.items()}
+            for token, entry in parse_tag_values(rows).items()}
 
 
 def _parse(stamp):
@@ -201,10 +229,11 @@ def tag_ops(verdict, todate, stored_failed="") -> list:
     """Verdict -> ordered (op, key, value) tuples. Empty when the project was never attempted.
 
     The remove is emitted ONLY when the state map actually carried a TAG_FAILED value, and
-    carries that value rather than "". Whether removeProjectTag tolerates an absent key, and
-    whether it matches on tagValue, are both unverified; on the worst reading an unconditional
-    remove errors on every healthy run, which would falsely report the sync state unavailable
-    and burn the once-per-run warning budget that every genuine save failure needs.
+    carries that value rather than "". removeProjectTag matches on the value (verified live
+    2026-08-21), so "" would name nothing; and whether it tolerates an absent key is still
+    unverified, where an unconditional remove would error on every healthy run, falsely report
+    the sync state unavailable and burn the once-per-run warning budget that every genuine save
+    failure needs.
     """
     if verdict == VERDICT_OK:
         ops = [("save", TAG_LASTRUN, todate)]
