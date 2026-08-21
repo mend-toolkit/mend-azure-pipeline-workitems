@@ -33,7 +33,6 @@ def _run(conf, state, modified, verdict=syncstate.VERDICT_OK):
     with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "get_prj_list_modified", return_value=modified) as modified_call, \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "prepare_enrichment"), \
          mock.patch.object(core, "create_wi", return_value=(verdict, "done")) as create, \
          mock.patch.object(core, "apply_tag_ops") as ops:
         core.run_sync(st_date="", end_date=TODATE, custom_flds=[], wi_type="Task")
@@ -161,7 +160,6 @@ def test_the_routed_path_applies_tag_ops_per_mend_project():
                            return_value={"tok-1": ROUTE_TAGS_PAYMENTS}), \
          mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "prepare_enrichment"), \
          mock.patch.object(core, "create_wi",
                            return_value=(syncstate.VERDICT_OK, "done")) as create, \
          mock.patch.object(core, "apply_tag_ops") as ops:
@@ -182,7 +180,6 @@ def test_a_failed_project_is_retried_under_routing():
                            return_value={"tok-stale": ROUTE_TAGS_PAYMENTS}), \
          mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "prepare_enrichment"), \
          mock.patch.object(core, "create_wi",
                            return_value=(syncstate.VERDICT_OK, "done")) as create, \
          mock.patch.object(core, "apply_tag_ops"):
@@ -202,7 +199,6 @@ def test_an_unroutable_project_gets_no_tag_writes_at_all():
          mock.patch.object(core, "fetch_project_tags", return_value={"tok-1": route_tags_missing}), \
          mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "prepare_enrichment"), \
          mock.patch.object(core, "create_wi") as create, \
          mock.patch.object(core, "apply_tag_ops") as ops:
         core.run_sync_routed(["tok-1"], TODATE, [], "Task")
@@ -224,7 +220,6 @@ def test_a_failed_project_that_is_excluded_is_not_synced_under_routing():
                            return_value={"tok-failed": ROUTE_TAGS_PAYMENTS}), \
          mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "prepare_enrichment"), \
          mock.patch.object(core, "create_wi",
                            return_value=(syncstate.VERDICT_OK, "done")) as create, \
          mock.patch.object(core, "apply_tag_ops"):
@@ -245,7 +240,6 @@ def test_a_failed_project_outside_scope_is_not_synced_under_routing():
                            return_value={"tok-failed": ROUTE_TAGS_PAYMENTS}), \
          mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "prepare_enrichment"), \
          mock.patch.object(core, "create_wi",
                            return_value=(syncstate.VERDICT_OK, "done")) as create, \
          mock.patch.object(core, "apply_tag_ops"):
@@ -269,7 +263,6 @@ def test_a_retry_only_window_with_no_routable_target_is_loud_but_not_fatal(caplo
          mock.patch.object(core, "fetch_project_tags", return_value={"tok-stale": route_missing}), \
          mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "prepare_enrichment"), \
          mock.patch.object(core, "create_wi"), \
          mock.patch.object(core, "apply_tag_ops"), \
          caplog.at_level("ERROR"):
@@ -292,7 +285,6 @@ def test_fresh_work_that_routes_nowhere_is_still_fatal():
          mock.patch.object(core, "fetch_project_tags", return_value={"tok-fresh": route_missing}), \
          mock.patch.object(core, "list_azure_projects", return_value=["Payments"]), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "prepare_enrichment"), \
          mock.patch.object(core, "create_wi"), \
          mock.patch.object(core, "apply_tag_ops"):
         core.run_sync(st_date="", end_date=TODATE, custom_flds=[], wi_type="Task")

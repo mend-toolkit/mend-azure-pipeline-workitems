@@ -95,19 +95,6 @@ def test_a_genuinely_empty_reverse_sync_result_is_not_treated_as_a_failure():
     assert "Updated 0" in result
 
 
-def test_run_sync_wires_prepare_enrichment_with_the_resolved_project_list():
-    """IMPORTANT 3: prepare_enrichment must actually be called from the non-routed path,
-    or every enabled customer silently gets three columns of '-' with all tests green."""
-    with mock.patch.object(core, "get_prj_list_modified", return_value=["prj-token-1"]), \
-         mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
-         mock.patch.object(core, "prepare_enrichment") as prepare, \
-         mock.patch.object(core, "conf", _conf()):
-        core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
-
-    prepare.assert_called_once_with(["prj-token-1"])
-
-
 def test_a_failed_reverse_sync_hydration_batch_sets_the_fatal_flag():
     """A failed wit/workitems hydration call must not silently drop that page of updates."""
     core.project_tag_state = {"tok-1": {"project": "AzureTestProject|Prod/Proj"}}

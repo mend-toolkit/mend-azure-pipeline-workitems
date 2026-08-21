@@ -11,7 +11,7 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
-from enrichment import (build_index, decorate_policy_violations, format_epss,
+from enrichment import (build_alert_index, decorate_policy_violations, format_epss,
                         format_exploit, format_reachability)
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
@@ -62,11 +62,9 @@ synced_projects = []   # [(prj_token, "Product/Project", azure_project)] appende
 updated_wi = []
 run_failed = False
 mend_v2_session = None  # SessionInfo dict from POST /api/v2.0/login; JWT lives 10 minutes
-entities_rows = None    # one /entities sweep per run, shared by tags and UUID resolution
-enrichment_disabled = False  # set for the rest of a run once resolution comes back empty
-project_uuid_map = {}   # Mend 1.4 project token -> 3.0 project uuid, resolved once per run
+entities_rows = None    # one /entities sweep per run, used by fetch_project_tags
 resolved_project_names = None  # token -> (productName, projectName), one sweep per run,
-                                # shared by fetch_project_tags and resolve_project_uuids
+                                # used by fetch_project_tags
 project_tag_state = None      # one getOrganizationProjectTags sweep per run
 project_tag_values = {}       # {token: {field: [every value]}} from that same sweep
 tag_state_available = True    # False once any tag call fails; drives the once-per-run warning
@@ -514,12 +512,10 @@ def _resolve_project_names(tokens: list):
     project. Returns None on any Mend API failure: a partial map here would silently make a
     real project look untagged rather than surface as an error.
 
-    Memoized for the run, the same way _fetch_entities_rows is: when routing and enrichment
-    are both on this is called twice (fetch_project_tags, then resolve_project_uuids) with
-    the second call's tokens always a subset of the first's, so a cached successful sweep
-    answers both without a second getAllProducts + getAllProjects pass. Only a successful
-    (non-None) result is cached — a failed sweep must keep failing loudly, not get papered
-    over by a stale empty cache.
+    Memoized for the run, the same way _fetch_entities_rows is, so a cached successful sweep
+    can answer more than one caller without a second getAllProducts + getAllProjects pass.
+    Only a successful (non-None) result is cached — a failed sweep must keep failing loudly,
+    not get papered over by a stale empty cache.
     """
     global resolved_project_names
     wanted = set(tokens)
@@ -654,80 +650,19 @@ def fetch_project_tags(tokens: list) -> dict:
     return result
 
 
-def resolve_project_uuids(tokens: list) -> dict:
-    """Map Mend 1.4 project token -> Mend 3.0 project uuid.
-
-    1.4 tokens and the uuids carried in /entities are different identifier spaces (verified
-    live: 0 of 25 matched), and 3.0 exposes no 1.4 token, so the join goes through the
-    (productName, projectName) pair — the same one fetch_project_tags uses.
-
-    Tokens that cannot be resolved, or whose name pair collided, are simply absent from the
-    result. The caller skips enrichment for them rather than guessing.
-    """
-    names = _resolve_project_names(tokens)
-    if not names:
-        return {}
-    rows = _fetch_entities_rows()
-    if rows is None:
-        return {}
-    uuid_by_name = {}
-    collided = set()
-    seen = set()
-    for row in rows:
-        key = (try_or_error(lambda: row["product"]["name"], ""),
-               try_or_error(lambda: row["project"]["name"], ""))
-        uuid_ = try_or_error(lambda: row["project"]["uuid"], "")
-        if key in seen:
-            # A duplicate (product, project) pair makes the join ambiguous. Refuse it
-            # outright rather than guessing — resolving to the wrong project would
-            # attribute another repo's reachability data to this one.
-            collided.add(key)
-            uuid_by_name.pop(key, None)
-        else:
-            seen.add(key)
-            if uuid_:
-                uuid_by_name[key] = uuid_
-    return {token: uuid_by_name[name] for token, name in names.items()
-            if name in uuid_by_name and name not in collided}
-
-
 def enrichment_enabled() -> bool:
-    return conf.enrichment.lower() == "true" and not enrichment_disabled
-
-
-def prepare_enrichment(tokens: list):
-    """Resolve every project token to a 3.0 uuid once, before the create_wi loop.
-
-    Resolution costs getAllProducts plus one getAllProjects per product, so it happens once
-    per run rather than once per project. A total failure disables enrichment for the rest
-    of the run: the alternative is repeating a doomed login for each of ~400 projects.
-    """
-    global project_uuid_map, enrichment_disabled
-    if not enrichment_enabled():
-        return
-    if not tokens:
-        # A quiet window with nothing modified is not a resolution failure — warning here
-        # trains operators to ignore the line that means something when it fires.
-        return
-    project_uuid_map = try_or_error(lambda: resolve_project_uuids(list(tokens)), {})
-    if not project_uuid_map:
-        enrichment_disabled = True
-        logger.warning(f"[{fn()}] MEND_ENRICHMENT is on but no Mend project resolved to a "
-                       f"3.0 project id. Reachability, EPSS and exploitability will be "
-                       f"blank on every work item this run.")
+    # No enrichment_disabled latch any more: it existed because a persistent 3.0 401/403 meant
+    # the org lacked a 3.0 entitlement, which no amount of retrying would fix. Alerts ride the
+    # same 1.4 transport and credential as every other call, so a failure there is not an
+    # enrichment-specific condition to latch on.
+    return conf.enrichment.lower() == "true"
 
 
 def enrich_project(prj_token: str) -> dict:
-    """Enrichment index for one Mend project, or {} if unavailable for any reason.
-
-    Display-only data must never cost a Work Item, so every failure path returns {}.
-    """
+    """Enrichment index for one Mend project, or {} if unavailable for any reason."""
     if not enrichment_enabled():
         return {}
-    project_uuid = project_uuid_map.get(prj_token, "")
-    if not project_uuid:
-        return {}
-    return try_or_error(lambda: fetch_project_enrichment(project_uuid), {})
+    return try_or_error(lambda: fetch_project_alerts(prj_token), {})
 
 
 def safe_decorate(sorted_libs: list, index: dict):
@@ -742,9 +677,10 @@ def safe_decorate(sorted_libs: list, index: dict):
     def _decorate():
         candidates, matched = decorate_policy_violations(sorted_libs, index)
         if candidates and not matched:
-            # 3.0 returns every finding in the project, 1.4 only this window's policy
-            # violations, so compare against the 1.4 candidates. Comparing against the 3.0
-            # total would fire on most projects and train operators to ignore it.
+            # The alerts index carries every open alert in the project, while candidates is
+            # only this window's policy violations, so compare against the policy candidates.
+            # Comparing against the full alerts total would fire on most projects and train
+            # operators to ignore it.
             logger.warning(f"[{fn()}] Enrichment matched 0 of {candidates} candidate finding(s) "
                            f"for this project. If this repeats, the (CVE, library uuid) join key "
                            f"is wrong and every work item will show blank reachability.")
@@ -884,72 +820,26 @@ def call_ws_api_v2(api: str, params: dict = None):
     return payload, errorcode
 
 
-def call_ws_api_v3(api: str, params: dict = None):
-    # Same (payload, errorcode) convention as call_ws_api_v2. Mend 3.0 accepts the JWT
-    # minted by the 2.0 login, so there is deliberately no separate 3.0 login path — but
-    # 3.0 lives on the same API host as 2.0, not on the 1.4 SCA app host.
-    global mend_v2_session, enrichment_disabled
-    url = f"{extract_url(conf.api_url)}/api/v3.0/{api}"
-    payload, errorcode = _get_v2(url, mend_v2_token(), params)
-    if errorcode in (401, 403):
-        mend_v2_session = None
-        payload, errorcode = _get_v2(url, mend_v2_token(), params)
-    if errorcode in (401, 403):
-        # A persistent 401/403 after the retry means either the org lacks a 3.0
-        # entitlement or the login itself is failing -- neither recovers mid-run. Stop
-        # here rather than repeating a doomed login + retry for every remaining project
-        # (~400 projects * 3 calls * 2 logins, per the design's §7 failure mode), and
-        # stop clobbering the shared 2.0 JWT cache that routing depends on.
-        if not enrichment_disabled:
-            logger.warning(f"[{fn()}] Mend 3.0 returned {errorcode}; disabling enrichment for "
-                           f"the rest of this run. Reachability, EPSS and exploitability will be blank.")
-        enrichment_disabled = True
-    if errorcode != 0:
-        logger.error(f"[{fn()}] Mend 3.0 call to '{api}' failed: {payload}")
-        errorcode = 2
-    return payload, errorcode
+def fetch_project_alerts(prj_token: str) -> dict:
+    """{(cve, library keyUuid): values} for one Mend project, from the 1.4 alerts API.
 
+    Replaces the 3.0 findings endpoint. Three things went away with it: the 2.0 login, the
+    project-uuid resolution (an alert carries its own 1.4 projectToken), and the paging loop --
+    API 1.4 does not paginate.
 
-# 3.0 types `limit` as a string (default "50", max 10000). At the default a 2,000-finding
-# project costs 40 round trips, so ask for the maximum.
-ENRICHMENT_PAGE_LIMIT = "10000"
-ENRICHMENT_MAX_PAGES = 20
-
-
-def fetch_project_enrichment(project_uuid: str) -> dict:
-    """{(cve, library_uuid): values} for one Mend project, from the 3.0 findings endpoint.
-
-    Returns whatever arrived on failure rather than raising: this is display-only data and
-    must never cost a Work Item.
+    Returns {} on any failure rather than raising: this is display-only data and must never
+    cost a Work Item. orgToken is omitted to match get_ingnored_alerts, the alerts call this
+    tool has been making successfully since before this change.
     """
-    res = {}
-    cursor = None
-    seen_cursors = set()
-    for _ in range(ENRICHMENT_MAX_PAGES):
-        params = {"limit": ENRICHMENT_PAGE_LIMIT}
-        if cursor is not None:
-            params["cursor"] = cursor
-        payload, errorcode = call_ws_api_v3(
-            f"projects/{project_uuid}/dependencies/findings/security", params)
-        if errorcode != 0:
-            return res
-        findings = try_or_error(lambda: payload["response"], None)
-        if not isinstance(findings, list) or not findings:
-            return res
-        res.update(build_index(findings))
-        if len(findings) < int(ENRICHMENT_PAGE_LIMIT):
-            return res
-        cursor = try_or_error(lambda: payload["additionalData"]["cursor"], None)
-        # The cursor is documented as pointing at the last item retrieved, so it is present
-        # on the final page too. A missing, repeated, or unhashable cursor is the only
-        # reliable stop -- an unhashable cursor can't be tracked, so continuing would risk
-        # looping on a cursor we have no way to recognize as repeated.
-        if cursor is None or cursor == "" or try_or_error(lambda: cursor in seen_cursors, True):
-            return res
-        try_or_error(lambda: seen_cursors.add(cursor), None)
-    logger.warning(f"[{fn()}] Enrichment for Mend project {project_uuid} hit the "
-                   f"{ENRICHMENT_MAX_PAGES}-page cap; some findings were not read.")
-    return res
+    body = {"requestType": "getProjectAlertsByType",
+            "userKey": conf.ws_user_key,
+            "projectToken": prj_token,
+            "alertType": "SECURITY_VULNERABILITY"}
+    payload = try_or_error(lambda: json.loads(call_ws_api(data=json.dumps(body))), None)
+    alerts = try_or_error(lambda: payload["alerts"], None)
+    if not isinstance(alerts, list):
+        return {}
+    return build_alert_index(alerts)
 
 
 def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", project: str = "", cmd_type: str = "?",
@@ -2105,8 +1995,6 @@ def run_sync_routed(modified_projects: list, end_date: str, custom_flds: list,
         logger.error(f"{unknown} destinations were not found in the organization. If they "
                      f"exist, the PAT may lack visibility into them.")
 
-    prepare_enrichment([token for target in targets.values() for token, _ in target])
-
     synced = 0
     state = fetch_project_tag_state()
     reset_on = conf.reset.lower() == "true"
@@ -2185,7 +2073,6 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
         return (f"Aborted: could not read existing work items in Azure project "
                 f"'{conf.azure_project}'. Skipping to avoid creating duplicates. "
                 f"Per-project sync state will not advance; this window will be retried.")
-    prepare_enrichment(res)
     for prj_el in res:
         project_start = project_window(prj_el, state, end_date, max_hours, reset_on)
         verdict, message = create_wi(prj_el, project_start, end_date, custom_flds, wi_type)

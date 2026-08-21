@@ -33,31 +33,6 @@ def _get(obj, *path):
     return obj
 
 
-def extract_values(finding: dict) -> dict:
-    """The four enrichment values off one 3.0 finding.
-
-    Nothing in SecurityFindingDTOV3 is declared required, and the DTO carries a
-    threatAssessment while also nesting a VulnerabilityProfileDTO that carries its own —
-    so read both. Keys whose value is None are omitted rather than stored: the renderers
-    treat an absent key as "we got nothing" and a present one as a real Mend answer.
-    """
-    values = {}
-    candidates = {
-        "reachability": _get(finding, "reachability"),
-        "epss": _get(finding, "threatAssessment", "epssPercentage"),
-        "maturity": _get(finding, "threatAssessment", "exploitCodeMaturity"),
-        "exploitable": _get(finding, "exploitable"),
-    }
-    if candidates["epss"] is None:
-        candidates["epss"] = _get(finding, "vulnerability", "threatAssessment", "epssPercentage")
-    if candidates["maturity"] is None:
-        candidates["maturity"] = _get(finding, "vulnerability", "threatAssessment", "exploitCodeMaturity")
-    for key, value in candidates.items():
-        if value is not None:
-            values[key] = value
-    return values
-
-
 def _reachability_from_info(info):
     """`reachabilityInfo` -> "REACHABLE" / "UNREACHABLE" / None.
 
@@ -126,20 +101,8 @@ def build_alert_index(alerts: list) -> dict:
     return index
 
 
-def build_index(findings: list) -> dict:
-    """{(cve_name, library_uuid): values} for one project's 3.0 findings."""
-    index = {}
-    for finding in findings or []:
-        cve = _get(finding, "name")
-        lib_uuid = _get(finding, "component", "uuid")
-        if not cve or not lib_uuid:
-            continue
-        index[(cve, lib_uuid)] = extract_values(finding)
-    return index
-
-
 def decorate_policy_violations(sorted_libs: list, index: dict):
-    """Write 3.0 values onto the 1.4 issue objects, in place.
+    """Write enrichment values onto the 1.4 issue objects, in place.
 
     The join is (CVE name, library UUID) and has no looser fallback: one CVE can affect
     several libraries in a project, so a CVE-only match would attribute reachability to the

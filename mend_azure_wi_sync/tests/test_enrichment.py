@@ -1,59 +1,25 @@
 from mend_azure_wi_sync import enrichment as en
 
 
-def _finding(name="CVE-1", uuid="lib-1", reach="REACHABLE", epss=0.92,
-             maturity="FUNCTIONAL", exploitable=True):
-    return {"name": name, "component": {"uuid": uuid}, "reachability": reach,
-            "exploitable": exploitable,
-            "threatAssessment": {"epssPercentage": epss,
-                                 "exploitCodeMaturity": maturity}}
-
-
-def test_extract_values_reads_the_finding_level_threat_assessment():
-    assert en.extract_values(_finding()) == {
-        "reachability": "REACHABLE", "epss": 0.92,
-        "maturity": "FUNCTIONAL", "exploitable": True}
-
-
-def test_extract_values_falls_back_to_the_nested_vulnerability_threat_assessment():
-    f = {"name": "CVE-1", "component": {"uuid": "lib-1"},
-         "vulnerability": {"threatAssessment": {"epssPercentage": 0.5,
-                                               "exploitCodeMaturity": "HIGH"}}}
-    assert en.extract_values(f) == {"epss": 0.5, "maturity": "HIGH"}
-
-
-def test_extract_values_omits_keys_mend_did_not_send():
-    # Absent must stay absent: the formatters distinguish "Mend said nothing" from
-    # "Mend said no", and a None sentinel would erase that distinction.
-    assert en.extract_values({"name": "CVE-1", "component": {"uuid": "l"}}) == {}
-
-
-def test_extract_values_keeps_falsy_but_real_answers():
-    f = _finding(epss=0.0, exploitable=False, maturity="NOT_DEFINED")
-    values = en.extract_values(f)
-    assert values["epss"] == 0.0
-    assert values["exploitable"] is False
-    assert values["maturity"] == "NOT_DEFINED"
-
-
-def test_build_index_keys_on_cve_and_library_uuid():
-    idx = en.build_index([_finding("CVE-1", "lib-a"), _finding("CVE-1", "lib-b")])
-    assert set(idx) == {("CVE-1", "lib-a"), ("CVE-1", "lib-b")}
-
-
-def test_build_index_skips_findings_missing_either_key():
-    assert en.build_index([{"name": "CVE-1"}, {"component": {"uuid": "l"}}]) == {}
-
-
 def _libs():
     return [{"library": {"keyUuid": "lib-a"},
              "policyViolations": [{"vulnerability": {"name": "CVE-1"}},
                                   {"vulnerability": {"name": "CVE-2"}}]}]
 
 
+def _alert_index(cve="CVE-1", uuid="lib-a", reach="REACHABLE", epss=0.92, maturity="FUNCTIONAL"):
+    """One-entry alert index in the same shape build_alert_index produces."""
+    alert = {"vulnerability": {"name": cve,
+                               "threatAssessment": {"epssPercentage": epss,
+                                                    "exploitCodeMaturity": maturity}},
+             "reachabilityInfo": {"reachable": reach == "REACHABLE", "analyzed": True},
+             "library": {"keyUuid": uuid}}
+    return en.build_alert_index([alert])
+
+
 def test_decorate_writes_values_onto_matching_violations_only():
     libs = _libs()
-    idx = en.build_index([_finding("CVE-1", "lib-a")])
+    idx = _alert_index("CVE-1", "lib-a")
     candidates, matched = en.decorate_policy_violations(libs, idx)
     hit, miss = libs[0]["policyViolations"]
     assert hit["reachability"] == "REACHABLE"
@@ -71,7 +37,7 @@ def test_decorate_merges_threat_assessment_rather_than_replacing_it():
             "policyViolations": [{"vulnerability": {
                 "name": "CVE-1",
                 "threatAssessment": {"someExisting1_4Field": "keep-me"}}}]}]
-    en.decorate_policy_violations(libs, en.build_index([_finding("CVE-1", "lib-a")]))
+    en.decorate_policy_violations(libs, _alert_index("CVE-1", "lib-a"))
     threat = libs[0]["policyViolations"][0]["vulnerability"]["threatAssessment"]
     assert threat["someExisting1_4Field"] == "keep-me"
     assert threat["epssPercentage"] == 0.92
@@ -82,7 +48,7 @@ def test_decorate_never_creates_a_vulnerability_key():
     # A license policy violation has no vulnerability. Inventing one would render
     # vulnerability fields on a Work Item that describes a license.
     libs = [{"library": {"keyUuid": "lib-a"}, "policyViolations": [{}]}]
-    en.decorate_policy_violations(libs, en.build_index([_finding("CVE-1", "lib-a")]))
+    en.decorate_policy_violations(libs, _alert_index("CVE-1", "lib-a"))
     assert libs[0]["policyViolations"][0] == {}
 
 

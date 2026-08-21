@@ -1,91 +1,76 @@
-import itertools
+import json
 from unittest import mock
+
+import pytest
 
 from mend_azure_wi_sync import core
 
 
-def _finding(name, uuid="lib-1"):
-    return {"name": name, "component": {"uuid": uuid}, "reachability": "REACHABLE"}
+def test_fetch_project_alerts_asks_1_4_for_this_project_s_vulnerability_alerts():
+    """One call per project on the transport every other 1.4 call already uses. The alert
+    carries projectToken itself, so nothing has to resolve a 3.0 uuid first."""
+    alert = {"vulnerability": {"name": "CVE-1",
+                               "threatAssessment": {"epssPercentage": 2.5,
+                                                    "exploitCodeMaturity": "HIGH"}},
+             "reachabilityInfo": {"reachable": True, "analyzed": True},
+             "library": {"keyUuid": "lib-a"}}
+    with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="uk", ws_org_token="ot",
+                                                        enrichment="true")), \
+         mock.patch.object(core, "call_ws_api",
+                           return_value=json.dumps({"alerts": [alert]})) as api:
+        index = core.fetch_project_alerts("tok-1")
+    body = json.loads(api.call_args.kwargs["data"])
+    assert body["requestType"] == "getProjectAlertsByType"
+    assert body["projectToken"] == "tok-1"
+    assert body["alertType"] == "SECURITY_VULNERABILITY"
+    assert index == {("CVE-1", "lib-a"): {"reachability": "REACHABLE", "epss": 2.5,
+                                          "maturity": "HIGH"}}
 
 
-def _page(findings, cursor=None):
-    return {"response": findings, "additionalData": {"cursor": cursor} if cursor else {}}
+def test_fetch_project_alerts_makes_exactly_one_call():
+    """API 1.4 does not paginate, so the 3.0 cursor loop and its 20-page cap are gone. A
+    reintroduced loop here would be a silent per-project cost multiplier."""
+    with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="uk", ws_org_token="ot")), \
+         mock.patch.object(core, "call_ws_api",
+                           return_value=json.dumps({"alerts": []})) as api:
+        assert core.fetch_project_alerts("tok-1") == {}
+    assert api.call_count == 1
 
 
-def test_findings_are_read_from_the_response_envelope():
-    with mock.patch.object(core, "call_ws_api_v3",
-                           return_value=(_page([_finding("CVE-1")]), 0)):
-        assert core.fetch_project_enrichment("uuid-1") == {
-            ("CVE-1", "lib-1"): {"reachability": "REACHABLE"}}
+@pytest.mark.parametrize("payload", ['{"errorCode": 5001}', "{}", '{"alerts": "nope"}',
+                                     "not json", ""])
+def test_a_failed_or_odd_alerts_response_yields_an_empty_index(payload):
+    """Display-only data must never cost a Work Item, so every failure path is {}."""
+    with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="uk", ws_org_token="ot")), \
+         mock.patch.object(core, "call_ws_api", return_value=payload):
+        assert core.fetch_project_alerts("tok-1") == {}
 
 
-def test_a_full_page_is_followed_by_a_cursored_request():
-    limit = int(core.ENRICHMENT_PAGE_LIMIT)
-    full = [_finding(f"CVE-{i}") for i in range(limit)]
-    pages = [(_page(full, cursor="c1"), 0), (_page([_finding("CVE-last")], "c2"), 0)]
-    with mock.patch.object(core, "call_ws_api_v3", side_effect=pages) as call:
-        result = core.fetch_project_enrichment("uuid-1")
-    assert ("CVE-last", "lib-1") in result
-    assert "cursor" not in call.call_args_list[0][0][1]   # first call carries no cursor
-    assert call.call_args_list[1][0][1]["cursor"] == "c1"
+def test_enrich_project_needs_no_resolution_step():
+    """The whole point of #14: no uuid map, no name join, no 2.0 login. If enrichment is on,
+    a project token is all that is needed."""
+    with mock.patch.object(core, "conf", mock.MagicMock(enrichment="true")), \
+         mock.patch.object(core, "fetch_project_alerts", return_value={("CVE-1", "lib-a"): {}}) as f:
+        assert core.enrich_project("tok-1") == {("CVE-1", "lib-a"): {}}
+    f.assert_called_once_with("tok-1")
 
 
-def test_a_cursor_repeated_on_the_last_page_terminates():
-    # The cursor points at the LAST ITEM RETRIEVED, so it is present on the final page.
-    # Without the repeat check this loops until the page cap, or forever.
-    limit = int(core.ENRICHMENT_PAGE_LIMIT)
-    full = [_finding(f"CVE-{i}") for i in range(limit)]
-    with mock.patch.object(core, "call_ws_api_v3",
-                           return_value=(_page(full, cursor="same"), 0)) as call:
-        core.fetch_project_enrichment("uuid-1")
-    assert call.call_count == 2
+def test_enrich_project_is_empty_when_enrichment_is_off():
+    with mock.patch.object(core, "conf", mock.MagicMock(enrichment="false")), \
+         mock.patch.object(core, "fetch_project_alerts") as f:
+        assert core.enrich_project("tok-1") == {}
+    f.assert_not_called()
 
 
-def test_the_page_cap_bounds_a_runaway_walk():
-    limit = int(core.ENRICHMENT_PAGE_LIMIT)
-    # Unbounded: each simulated page draws `limit` + 1 values, so a finite range would run
-    # out well before the page cap is reached and this must instead prove the cap holds.
-    cursors = itertools.count()
-    def _call(api, params=None):
-        return _page([_finding(f"CVE-{next(cursors)}") for _ in range(limit)],
-                     cursor=f"c{next(cursors)}"), 0
-    with mock.patch.object(core, "call_ws_api_v3", side_effect=_call) as call:
-        core.fetch_project_enrichment("uuid-1")
-    assert call.call_count == core.ENRICHMENT_MAX_PAGES
+def test_a_raising_fetch_never_reaches_create_wi():
+    with mock.patch.object(core, "conf", mock.MagicMock(enrichment="true")), \
+         mock.patch.object(core, "fetch_project_alerts", side_effect=Exception("boom")):
+        assert core.enrich_project("tok-1") == {}
 
 
-def test_failures_and_malformed_payloads_return_what_arrived():
-    with mock.patch.object(core, "call_ws_api_v3", return_value=({}, 2)):
-        assert core.fetch_project_enrichment("uuid-1") == {}
-    with mock.patch.object(core, "call_ws_api_v3", return_value=({"nope": 1}, 0)):
-        assert core.fetch_project_enrichment("uuid-1") == {}
-    with mock.patch.object(core, "call_ws_api_v3", return_value=(_page([]), 0)):
-        assert core.fetch_project_enrichment("uuid-1") == {}
-
-
-def test_the_limit_is_sent_as_a_string():
-    # The 3.0 spec types limit as a string with default "50"; at the default a 2,000-finding
-    # project would cost 40 requests.
-    with mock.patch.object(core, "call_ws_api_v3", return_value=(_page([]), 0)) as call:
-        core.fetch_project_enrichment("uuid-1")
-    assert call.call_args[0][1]["limit"] == core.ENRICHMENT_PAGE_LIMIT
-    assert isinstance(core.ENRICHMENT_PAGE_LIMIT, str)
-
-
-def test_a_non_list_response_degrades_instead_of_raising():
-    # Display-only data must never cost a work item. A scalar under "response" is a
-    # shape a backend bug could emit; iterating it would raise out of create_wi.
-    for bad in (42, True):
-        with mock.patch.object(core, "call_ws_api_v3",
-                               return_value=({"response": bad, "additionalData": {}}, 0)):
-            assert core.fetch_project_enrichment("uuid-1") == {}
-
-
-def test_an_unhashable_cursor_stops_paging_instead_of_raising():
-    limit = int(core.ENRICHMENT_PAGE_LIMIT)
-    full = [{"name": f"CVE-{i}", "component": {"uuid": "lib-1"}} for i in range(limit)]
-    page = {"response": full, "additionalData": {"cursor": {"bad": "type"}}}
-    with mock.patch.object(core, "call_ws_api_v3", return_value=(page, 0)) as call:
-        result = core.fetch_project_enrichment("uuid-1")
-    assert call.call_count == 1        # stopped, did not raise, did not spin
-    assert len(result) == limit        # the page that did arrive is still used
+def test_the_2_0_and_3_0_transports_are_gone():
+    """Guards the deletion. These names existing again means the consolidation regressed."""
+    for gone in ("call_ws_api_v3", "fetch_project_enrichment", "resolve_project_uuids",
+                 "prepare_enrichment", "project_uuid_map", "enrichment_disabled",
+                 "ENRICHMENT_PAGE_LIMIT", "ENRICHMENT_MAX_PAGES"):
+        assert not hasattr(core, gone), f"{gone} should have been deleted"
