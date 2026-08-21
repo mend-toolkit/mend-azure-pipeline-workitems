@@ -37,7 +37,7 @@ def main():
     conf.utc_delta = int((datetime.datetime.utcnow()-datetime.datetime.now()).total_seconds()/3600)  # in hours
     logger.info("Sync process started")
     if conf.reset.lower() != "true":
-        logger.warning("MEND_RESET parameter set to FALSE, only creating work items since last ran scan")
+        logger.info("MEND_RESET parameter set to FALSE, only creating work items since last ran scan")
     if conf.azure_custom:
         custom_flds = conf.azure_custom.split(";")
         for c_fld_ in custom_flds:
