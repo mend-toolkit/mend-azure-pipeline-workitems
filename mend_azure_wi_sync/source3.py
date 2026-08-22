@@ -53,3 +53,51 @@ def meets_threshold(score, floor: float) -> bool:
     except (TypeError, ValueError):
         # A score we cannot read is not a score that lets us exclude anything.
         return True
+
+
+# The ONLY status that holds a work item open. Every other value in
+# SecurityFindingDTOV3.findingInfo.status -- IGNORED (suppressed in Mend), LIBRARY_REMOVED,
+# LIBRARY_IN_HOUSE, LIBRARY_WHITELIST -- means the work item should be closed.
+#
+# This single field is why v3 can close work items and 1.4 never could: 1.4 published no status,
+# so closure there had to be inferred from a finding's ABSENCE, and absence is indistinguishable
+# from a failed read.
+OPEN_STATUS = "ACTIVE"
+
+
+def _walk(obj, *path):
+    for key in path:
+        if not isinstance(obj, dict) or key not in obj:
+            return None
+        obj = obj[key]
+    return obj
+
+
+def normalise_findings(findings, floor: float):
+    """3.0 security findings -> ({library_name: entry}, unscored_count).
+
+    Only ACTIVE findings at or above `floor` survive. findingInfo.findingStatus is deliberately
+    NOT consulted -- see OPEN_STATUS.
+
+    A library whose findings are all excluded produces NO entry, which is what tells
+    reconciliation to close its work item. An entry with an empty findings list would keep the
+    item open forever, so entries are only created when something survives.
+    """
+    entries = {}
+    unscored = 0
+    for finding in findings or []:
+        if not isinstance(finding, dict):
+            continue
+        if _walk(finding, "findingInfo", "status") != OPEN_STATUS:
+            continue
+        lib = _walk(finding, "component", "name")
+        if not lib:
+            continue
+        score = _walk(finding, "vulnerability", "score")
+        if not meets_threshold(score, floor):
+            continue
+        if score is None or score == "":
+            unscored += 1
+        entry = entries.setdefault(lib, {"library": lib, "kind": "vulnerability", "findings": []})
+        entry["findings"].append(finding)
+    return entries, unscored

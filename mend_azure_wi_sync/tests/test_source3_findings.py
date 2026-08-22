@@ -47,3 +47,92 @@ def test_a_nonnumeric_score_is_included_rather_than_dropped():
 def test_zero_is_a_real_score_not_a_missing_one():
     """0.0 is a valid CVSS score and must be COMPARED, not treated as unscored."""
     assert source3.meets_threshold(0.0, 7.0) is False
+
+
+def _finding(cve="CVE-1", lib="log4j-core", status="ACTIVE", score=9.8,
+             finding_status="UNREVIEWED"):
+    return {
+        "uuid": f"u-{cve}",
+        "name": cve,
+        "type": "SECURITY_VULNERABILITY",
+        "findingInfo": {"status": status, "findingStatus": finding_status},
+        "component": {"name": lib, "version": "2.14.1", "uuid": f"c-{lib}"},
+        "vulnerability": {"name": cve, "score": score, "severity": "HIGH"},
+    }
+
+
+def test_an_active_finding_above_the_threshold_is_kept():
+    entries, unscored = source3.normalise_findings([_finding()], 7.0)
+    assert list(entries) == ["log4j-core"]
+    assert entries["log4j-core"]["kind"] == "vulnerability"
+    assert len(entries["log4j-core"]["findings"]) == 1
+    assert unscored == 0
+
+
+def test_findings_for_one_library_are_grouped_into_one_entry():
+    entries, _ = source3.normalise_findings(
+        [_finding(cve="CVE-1"), _finding(cve="CVE-2")], 7.0)
+    assert list(entries) == ["log4j-core"]
+    assert len(entries["log4j-core"]["findings"]) == 2
+
+
+def test_different_libraries_get_separate_entries():
+    entries, _ = source3.normalise_findings(
+        [_finding(lib="log4j-core"), _finding(lib="jackson-databind")], 7.0)
+    assert sorted(entries) == ["jackson-databind", "log4j-core"]
+
+
+@pytest.mark.parametrize("status", ["IGNORED", "LIBRARY_REMOVED",
+                                    "LIBRARY_IN_HOUSE", "LIBRARY_WHITELIST"])
+def test_every_non_active_status_is_excluded(status):
+    """This is what lets Plan 4 close the work item. IGNORED is a Mend suppression;
+    LIBRARY_REMOVED is the library being gone."""
+    entries, _ = source3.normalise_findings([_finding(status=status)], 7.0)
+    assert entries == {}
+
+
+def test_a_suppressed_finding_leaves_no_entry_even_alongside_an_active_one():
+    entries, _ = source3.normalise_findings(
+        [_finding(cve="CVE-1", status="IGNORED"), _finding(cve="CVE-2", status="ACTIVE")], 7.0)
+    assert len(entries["log4j-core"]["findings"]) == 1
+    assert entries["log4j-core"]["findings"][0]["name"] == "CVE-2"
+
+
+def test_the_library_disappears_when_all_its_findings_are_suppressed():
+    """The closure case: an entry that would be empty must not exist at all, or Plan 4 will
+    keep the work item open forever."""
+    entries, _ = source3.normalise_findings(
+        [_finding(cve="CVE-1", status="IGNORED"), _finding(cve="CVE-2", status="IGNORED")], 7.0)
+    assert entries == {}
+
+
+@pytest.mark.parametrize("finding_status", ["SUPPRESSED", "REMEDIATED", "IN_REVIEW",
+                                            "ISSUE_CREATED"])
+def test_finding_status_is_deliberately_ignored(finding_status):
+    """An analyst workflow field must not drive work item state, or items oscillate."""
+    entries, _ = source3.normalise_findings(
+        [_finding(status="ACTIVE", finding_status=finding_status)], 7.0)
+    assert list(entries) == ["log4j-core"]
+
+
+def test_a_finding_below_the_threshold_is_excluded():
+    entries, _ = source3.normalise_findings([_finding(score=4.0)], 7.0)
+    assert entries == {}
+
+
+def test_an_unscored_finding_is_kept_and_counted():
+    entries, unscored = source3.normalise_findings([_finding(score=None)], 7.0)
+    assert list(entries) == ["log4j-core"]
+    assert unscored == 1
+
+
+def test_a_finding_with_no_library_name_is_skipped_not_crashed():
+    broken = _finding()
+    del broken["component"]
+    entries, _ = source3.normalise_findings([broken, _finding()], 7.0)
+    assert list(entries) == ["log4j-core"]
+
+
+def test_garbage_input_returns_empty_rather_than_raising():
+    assert source3.normalise_findings(None, 7.0) == ({}, 0)
+    assert source3.normalise_findings(["not a dict"], 7.0) == ({}, 0)
