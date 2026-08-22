@@ -5,12 +5,25 @@
 [![GitHub release](https://img.shields.io/github/v/release/mend-toolkit/mend-azure-pipeline-workitems)](https://github.com/mend-toolkit/mend-azure-pipeline-workitems/releases/latest)
 
 # Integrate Mend SCA with Azure Work Items
-A self-hosted tool that creates and updates Azure Work Items based on Mend SCA Issue Tracking policies.  
+A self-hosted tool that creates, updates and closes Azure Work Items from Mend SCA findings.  
 
 The tool is deployed within an Azure Pipeline triggered on fixed intervals by a cron schedule.  
-It utilizes Mend's [Issue Tracking API](https://docs.mend.io/bundle/integrations/page/creating_your_own_issue_tracker_plugin.html) to identify the Mend SCA projects that were [modified](https://docs.mend.io/bundle/integrations/page/creating_your_own_issue_tracker_plugin.html#getOrganizationLastModifiedProjects) since the last execution, obtain the list of [policy matched issues](https://docs.mend.io/bundle/integrations/page/creating_your_own_issue_tracker_plugin.html#fetchProjectPolicyIssues) for each of them and create or update the corresponding Work Item.  
+It runs entirely on **Mend API 3.0**. Every run reads each in-scope Mend project's **complete current state** — its security findings, its license policy violations and its library licenses — and then reconciles Azure DevOps against it: it creates a Work Item for a finding that has none, updates one whose finding has changed, **closes** one whose finding is gone, and **reopens** one whose finding has come back.  
 
-> **_BEHAVIOR CHANGE_**: `MEND_RESET` and `MEND_MAXLOOKBACK` have been **removed**, along with the per-project sync-state tags (`azure-wi-lastrun`, `azure-wi-failed`). The integration now reads each Mend project's **complete current state** from Mend API 3.0 on every run, so there is no window to reset, no watermark to advance and no retry queue: a project that fails this run is simply read again in full on the next one. `MEND_ALERT` and `MEND_EPSS` are removed too: Mend 3.0 reports a finding's suppression state on the finding itself, so there is nothing left for `MEND_ALERT` to filter, and EPSS and Exploit Code Maturity now always render. Leaving any of these variables set in your pipeline is harmless — they are ignored. A run that did not fully complete still exits with a **non-zero exit code**.
+There is no watermark, no "modified since" window and no stored sync state. A run that fails is simply repeated in full on the next schedule.  
+
+> ## ⚠️ BREAKING CHANGES — read before upgrading
+>
+> This release moves the integration off Mend API 1.4 entirely and onto **Mend API 3.0**. The upgrade is **one-way**: once a pipeline is on this version there is no supported way back to the 1.4 behaviour, so upgrade one pipeline first and confirm the Work Items it produces before rolling it out.
+>
+> 1. **`MEND_EMAIL` is now required.** It is the email address of the Mend user whose `MEND_USERKEY` you are using. It logs in against Mend API 2.0 to obtain the JWT that authenticates every 3.0 call. Without it the run cannot authenticate to Mend and does no work.
+> 2. **`MEND_PRODUCTTOKEN`, `MEND_PROJECTTOKEN` and `MEND_EXCLUDETOKEN` now take Mend 3.0 UUIDs**, not the 1.4 tokens you have today. A stale 1.4 token aborts the run with a message naming the offending variable — it never silently syncs the wrong scope.
+> 3. **`MEND_ALERT`, `MEND_EPSS`, `MEND_RESET` and `MEND_MAXLOOKBACK` are removed**, along with the per-project sync-state tags (`azure-wi-lastrun`, `azure-wi-failed`). There is no window to reset, no watermark to advance and no retry queue. Mend 3.0 reports a finding's suppression state on the finding itself, so nothing is left for `MEND_ALERT` to filter, and EPSS and Exploit Code Maturity now always render. Leaving any of these set in your pipeline is harmless — they are ignored.
+> 4. **`MEND_CUSTOMFIELDS` paths must be rewritten.** A `MEND:` dot-path is now walked into a **Mend 3.0 finding**, not a 1.4 policy issue. Every existing path — `MEND:policyViolations.*`, `MEND:vulnerability.*`, `MEND:library.*`, `MEND:policy.*` — resolves to an empty value or to the literal string `No content`. See [Custom Field Mapping](#custom-field-mapping) for the new paths and a migration table.
+> 5. **The reverse sync is gone.** Work Item status is no longer pushed back to Mend. Closing a Work Item in Azure DevOps has no effect in Mend; the flow is now one-way, Mend → Azure DevOps. To stop a Work Item being recreated, resolve or suppress the finding in Mend — which now also **closes** the Work Item (see [Closing and Reopening Work Items](#closing-and-reopening-work-items)).
+> 6. **`MEND_SEVERITY` is now live.** It was inert in previous releases. It defaults to `high`, which means findings below CVSS **7.0** no longer produce Work Items — and any existing Work Item below that floor is **closed** on the first run. If you want the previous "everything" behaviour, set `MEND_SEVERITY: low`.
+>
+> A run that did not fully complete still exits with a **non-zero exit code**.
 
 ## Table of Contents
 - [Supported Operating Systems](#supported-operating-systems)
@@ -19,11 +32,14 @@ It utilizes Mend's [Issue Tracking API](https://docs.mend.io/bundle/integrations
 - [Azure DevOps Setup](#azure-devops-setup)
 - [Mend SCA Setup](#mend-sca-setup)
 - [Azure Pipeline Variables](#azure-pipeline-variables)
-- [Setting Scan Tags for Tag-Based Routing](#setting-scan-tags-for-tag-based-routing)
 - [Enrichment: Reachability, EPSS and Exploit Code Maturity](#enrichment-reachability-epss-and-exploit-code-maturity)
+- [Setting Scan Tags for Tag-Based Routing](#setting-scan-tags-for-tag-based-routing)
+- [Closing and Reopening Work Items](#closing-and-reopening-work-items)
+- [Execution](#execution)
 - [Custom Field Mapping](#custom-field-mapping)
+  - [Available `MEND:` Paths](#available-mend-paths)
+  - [Migrating from Mend API 1.4 Paths](#migrating-from-mend-api-14-paths)
   - [Examples](#examples)
-  - [Execution](#execution)
 
 ## Supported Operating Systems
 - **Linux:**	CentOS, Debian, Ubuntu
@@ -36,8 +52,9 @@ It utilizes Mend's [Issue Tracking API](https://docs.mend.io/bundle/integrations
 * Azure DevOps service user Personal Access Token (PAT) with **Read & write** permissions for both "Work Items" and the "Project and Team" scopes on any organization where you want to run the integration.
 * Azure DevOps service user added to a group with the following permissions in the project: **Create tag definition** and **View permissions for this node** 
 	* The user needs to be added to the team for each area path you wish to create work items for.
-* Mend SCA [Issue Tracking policies](#mend-sca)
+* Mend SCA license policies, if you want license Work Items — see [Mend SCA Setup](#mend-sca-setup). Vulnerability Work Items need no policy.
 * Mend SCA service user with associated with a [role assignment](https://docs.mend.io/bundle/sca_user_guide/page/managing_groups.html#Assigning-a-Role-to-a-Group) of either **Organization Administrator** or **Organization Auditor**  
+* The **email address** of that Mend service user, supplied as `MEND_EMAIL`. It is required: the integration logs in against Mend API 2.0 with `MEND_EMAIL` + `MEND_USERKEY` + `MEND_APIKEY` to obtain the JWT that authenticates every Mend API 3.0 call.  
 
 The PAT needs **Work Items (Read, write & manage)** and **Project and Team (Read)**.
 
@@ -62,15 +79,17 @@ See [Azure Pipeline Variables](#azure-pipeline-variables) for details.
 1. Create a [Personal Access Token (PAT)](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate) with **Read & write** permissions for the **Work Items** scope and **Project and Team** scope
 2. Create a new Azure pipeline from the example file [examples/mend-azure-wi-sync.yml](./examples/mend-azure-wi-sync.yml)
 3. Make sure the user you created the PAT for has the following permissions in each repository where workitems are needed: **Create tag definition** and **View permissions for this node** 
-4. Set up the appropriate environment variables/secrets for the pipeline. The minimum requirements for these variables are: `MEND_URL`, `MEND_USERKEY`, `MEND_APIKEY`, and `MEND_AZUREPAT`. We recommend also setting `MEND_PRODUCTTOKEN`, `MEND_PROJECTTOKEN`, and/or `MEND_EXCLUDETOKEN` as detailed above
+4. Set up the appropriate environment variables/secrets for the pipeline. The minimum requirements for these variables are: `MEND_URL`, `MEND_USERKEY`, `MEND_APIKEY`, `MEND_EMAIL`, and `MEND_AZUREPAT`. We recommend also setting `MEND_PRODUCTTOKEN`, `MEND_PROJECTTOKEN`, and/or `MEND_EXCLUDETOKEN` as detailed above
 <br />
 
 ## Mend SCA Setup
-Set up a policy with [**Issue**](https://docs.mend.io/bundle/sca_user_guide/page/managing_automated_policies.html#Applying-Actions-to-a-Library) action for each use case you wish a Work Item to be created for.  
+Two different things drive Work Item creation, and only one of them involves a policy:
 
-> **_IMPORTANT_**: The **Issue** action is mandatory. The integration only ever requests policy matches of the `CREATE_ISSUE` action type, so a policy configured with any other action (Reject, Approve, Reassign, etc.) is never returned by Mend and will **not** produce a Work Item, regardless of what it matches. The policy must also be **enabled** — matches from disabled policies are ignored.  
+**Vulnerability Work Items need no policy at all.** They come from the project's Mend API 3.0 security findings, selected by CVSS score against `MEND_SEVERITY` (default `high` = 7.0). There is nothing to configure in Mend — every active finding at or above the floor gets a Work Item.
 
-The naming convention should include, other than a self explanatory description of what the policy does, a square-bracketed prefix, either `[License]` or `[Security]`.  
+> **_BEHAVIOR CHANGE_**: Earlier releases created vulnerability Work Items only for libraries matched by a Mend **Issue** policy. They are now driven by `MEND_SEVERITY` instead, so your Issue policies no longer decide which vulnerabilities become Work Items. If your policies were narrower than "CVSS ≥ 7.0" you will see **more** Work Items on the first run; if they were broader, tune `MEND_SEVERITY` down.
+
+**License Work Items come from the project's license policy violations.** Set up a policy for each license case you wish a Work Item to be created for. The naming convention should include, other than a self explanatory description of what the policy does, a square-bracketed prefix, either `[License]` or `[Security]` — the integration strips that prefix and renders the rest as the violation's policy name on the Work Item.
 
 > **_NOTE_**: Refer to the Mend SCA documentation for detailed instructions on how to [create new policies](https://docs.mend.io/bundle/sca_user_guide/page/managing_automated_policies.html#Creating-a-New-Policy).  
 >For best practices concerning desigining your policy scheme, refer to [Best Practices for Mend SCA Policies](https://docs.mend.io/bundle/wsk/page/best_practices_for_mend_sca_policies.html)  
@@ -87,9 +106,9 @@ The following variables can be placed into the pipeline where the integration is
 | `MEND_AZUREPAT`          | secret  |   Yes    | N/A | Azure DevOps [Personal Access Token](https://docs.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate?view=azure-devops&tabs=Windows)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `MEND_AZUREURI`          | string  |   Yes    | N/A | Azure DevOps organization URI (e.g. `https://dev.azure.com/MyOrganization`). <br/> Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services)  `$(System.CollectionUri)`                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `MEND_AZUREPROJECT`      | string  |   Yes    | N/A | Azure Team Project name. <br/> Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services) `$(System.TeamProject)`. Under `MEND_ROUTING` this is no longer the destination — targets come from tags. It remains required, and is the project whose Work Item type definition is read at startup.                                                                                                                                                                                                                                                                                                                                                  |
-| `MEND_PRODUCTTOKEN`      | string  |    No    | Empty String <br />(Include all products) | Comma-separated list of Mend Product Tokens that should be monitored for changes. Under `MEND_ROUTING` these narrow the set of Mend projects considered rather than choosing Azure targets.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `MEND_PROJECTTOKEN`      | string  |    No    | Empty String <br />(Include all projects) | Comma-separated list of Mend Project Tokens that should be monitored for changes. Under `MEND_ROUTING` these narrow the set of Mend projects considered rather than choosing Azure targets.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `MEND_EXCLUDETOKEN`      | string  |    No    | Empty String <br /> (No exclusions) | Comma-separated list of Mend Project Tokens that should not be monitored. Under `MEND_ROUTING` these narrow the set of Mend projects considered rather than choosing Azure targets.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `MEND_PRODUCTTOKEN`      | string  |    No    | Empty String <br />(Include all products) | Comma-separated list of Mend **product UUIDs** to monitor. **Mend API 3.0 UUIDs** — not the 1.4 product tokens used by earlier releases. A value that is neither a UUID nor a token aborts the run with a message naming this variable. Under `MEND_ROUTING` these narrow the set of Mend projects considered rather than choosing Azure targets.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `MEND_PROJECTTOKEN`      | string  |    No    | Empty String <br />(Include all projects) | Comma-separated list of Mend **project UUIDs** to monitor. **Mend API 3.0 UUIDs** — not the 1.4 project tokens used by earlier releases. A value that is neither a UUID nor a token aborts the run with a message naming this variable. Under `MEND_ROUTING` these narrow the set of Mend projects considered rather than choosing Azure targets.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `MEND_EXCLUDETOKEN`      | string  |    No    | Empty String <br /> (No exclusions) | Comma-separated list of Mend **project UUIDs** that should not be monitored. **Mend API 3.0 UUIDs** — not the 1.4 project tokens used by earlier releases. A value that is neither a UUID nor a token aborts the run with a message naming this variable. Under `MEND_ROUTING` these narrow the set of Mend projects considered rather than choosing Azure targets.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `MEND_AZUREAREA`         | string  |    No    | `$MEND_AZUREPROJECT` | [Area Path](https://learn.microsoft.com/en-us/azure/devops/organizations/settings/set-area-paths?view=azure-devops) to group created Work Items under. <br/> For example: `TeamProject\Area1\SubArea2` or `Area1\SubArea2`. Use double-backslashes when specifying sub-areas.                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `MEND_AZURETYPE`         | string  |    No    | Task | Work Item type for creating new Work Items. <br/> Must be one of the [built-in](https://learn.microsoft.com/en-us/azure/devops/boards/work-items/about-work-items?view=azure-devops&tabs=agile-process#track-work-with-different-work-item-types) or [custom](https://learn.microsoft.com/en-us/azure/devops/boards/work-items/about-work-items?view=azure-devops&tabs=agile-process#customize-a-work-item-type) types that are available for the project's [process](https://learn.microsoft.com/en-us/azure/devops/boards/work-items/guidance/choose-process?view=azure-devops&tabs=agile-process). (Basic, Agile, Scrum, etc.) associated with the specified Team Project in the `MEND_AZUREPROJECT` variable. |
 | `MEND_CUSTOMFIELDS`      | string  |   No*    | Empty String <br /> (No custom fields) | Used for mapping additional information from Mend's Issue Policy objects into custom fields of the specified Work Item type (`$MEND_AZURETYPE`). <br/> See [Custom Work Item Types](#custom-field-mapping) below for syntax guidelines. <br/>  This variable is required when using custom Work Item types.                                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -101,10 +120,11 @@ The following variables can be placed into the pipeline where the integration is
 | `MEND_CALCULATEPRIORITY` | boolean |   No*    | False | Priority will be calculated according to Mend’s severity (CSS3) value if the value is equal to True. If not, it will be set to 2 (default priority).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `MEND_PROXY`             | string  |    No    | Empty String <br /> | The Proxy URL. The right format is <proxy_ip>:<proxy_port>. In case of a proxy requires Basic Authentication the format should be like this <proxy_username>:<proxy_password>@<proxy_ip>:<proxy_port>.If http:// or https:// prefix is not provided, the prefix http:// will be used by default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `MEND_REACHABILITY`      | boolean |    No    | `false` | When `true`, adds Reachability to each work item, read from the same Mend API 3.0 finding that produced it. An org without reachability analysis enabled can leave this off and avoid a column of `-`. EPSS and Exploit Code Maturity always render and have no switch. See [Enrichment: Reachability, EPSS and Exploit Code Maturity](#enrichment-reachability-epss-and-exploit-code-maturity) below. |
-| `MEND_EMAIL`             | string  |    No    | Empty String | The email of the Mend user whose `MEND_USERKEY` this is. Required only for features that use Mend API 3.0. |
+| `MEND_EMAIL`             | string  |   Yes    | N/A | The email address of the Mend user whose `MEND_USERKEY` this is. **Required.** It is sent with `MEND_USERKEY` and `MEND_APIKEY` to the Mend API 2.0 login, which returns the JWT that authenticates every Mend API 3.0 call. Without it the run cannot authenticate to Mend and does no work. |
 | `MEND_ORGUUID`           | string  |    No    | `MEND_APIKEY` | The organization UUID used by Mend API 3.0 paths. Defaults to `MEND_APIKEY`, which is the same value for most orgs — set it only if your Organization UUID differs from your API key. |
-| `MEND_CLOSEDSTATE`       | string  |    No    | `Closed` | The `System.State` value written when a work item is closed because its finding is no longer present in Mend. State names are **process-dependent**: Agile uses `Closed`, Scrum `Done`, Basic `Done`. Used only by the reconciliation path — it has no effect on work item creation. |
-| `MEND_REOPENSTATE`       | string  |    No    | `New` | The `System.State` value written when a closed work item's finding comes back in Mend. State names are **process-dependent**: Agile uses `Active`, Scrum `New`, Basic `To Do`. Used only by the reconciliation path — it has no effect on work item creation. |
+| `MEND_SEVERITY`          | string  |    No    | `high` | The minimum CVSS severity a finding must reach to earn a Work Item. Accepts a band — `low` (0.1), `medium` (4.0), `high` (7.0), `critical` (9.0) — or a number from `0` to `10`. **The same floor governs creation and closure**: a finding below it produces no Work Item, and an existing Work Item whose findings have all dropped below it is closed. An unscored finding is always included, because it cannot be compared and losing a real vulnerability is worse than one extra Work Item. An unparseable value falls back to `high` rather than to `0`, so a typo cannot silently open the floodgates. |
+| `MEND_CLOSEDSTATE`       | string  |    No    | `Closed` | The `System.State` value written when a work item is closed because its finding is no longer present in Mend. State names are **process-dependent**: Agile uses `Closed`, Scrum `Done`, Basic `Done`. See [Closing and Reopening Work Items](#closing-and-reopening-work-items). It has no effect on Work Item creation. |
+| `MEND_REOPENSTATE`       | string  |    No    | `New` | The `System.State` value written when a closed work item's finding comes back in Mend. State names are **process-dependent**: Agile uses `Active`, Scrum `New`, Basic `To Do`. See [Closing and Reopening Work Items](#closing-and-reopening-work-items). It has no effect on Work Item creation. |
 
 >**_NOTE_**: `azure-wi-sync` would accept all environment variables with either `MEND_` or `WS_` prefix. For the Azure DevOps settings (`*AZUREURI`, `*AZUREPAT`, `*AZUREPROJECT`, `*AZUREAREA`, `*AZURETYPE`), if both prefixes are set for the same setting, the `WS_` variable wins.
 
@@ -156,6 +176,27 @@ These same values can also be mapped into custom fields — see [Custom Field Ma
 >```
 <br />
 
+## Closing and Reopening Work Items
+Every run reads each in-scope Mend project's **complete current state** and reconciles the Work Items in Azure DevOps against it. A Work Item whose Mend finding is no longer there is **closed**; if the finding comes back, the *same* Work Item is **reopened**.
+
+**A Work Item is closed when its finding is gone from Mend.** That covers every way a finding can leave:
+- the finding is **suppressed** or **ignored** in Mend
+- the vulnerable **library is removed** from the project (upgraded, replaced, or the dependency dropped)
+- the library is marked **in-house** or **whitelisted**
+- for a license Work Item, the **license policy violation** no longer matches
+- the finding's CVSS score drops below `MEND_SEVERITY` (see the [variable table](#azure-pipeline-variables))
+
+Closing sets the Work Item's `System.State` to `MEND_CLOSEDSTATE` (default `Closed`). Reopening sets it to `MEND_REOPENSTATE` (default `New`). Both are process-dependent names — set them to whatever your Azure DevOps process actually uses.
+
+>**_IMPORTANT_**: **Closure never deletes a Work Item.** It only changes the state field. The Work Item keeps its **id**, its history, its comments, its links and any fields your team edited. A finding that comes back reopens *that* Work Item — you do not get a fresh id and you do not lose the discussion that happened on the original.
+
+>**_IMPORTANT_**: **Closure is skipped for any project whose Mend read did not complete.** If a page of findings fails to load, an incomplete result is indistinguishable from a project whose findings were all remediated — and acting on that would be a mass-closure event. When a project's read is incomplete the run logs it, skips every closure for that project, and reports a failed run with a non-zero exit code. **Reopening still runs**, because reopening cannot destroy anything. A failed read can therefore never be mistaken for a resolved backlog.
+
+>**_NOTE_**: Reconciliation identifies Work Items by their **title** and by the `{product}/{project}` tag the integration writes. A Work Item whose title was hand-edited is no longer recognised, and will neither be updated nor closed — a second Work Item is created for the finding instead. Do not rename the titles the integration generates.
+
+>**_NOTE_**: In `MEND_DEPENDENCY: true` (the default) one Work Item covers one library, so it is closed only once **every** vulnerability in that library is gone. In `MEND_DEPENDENCY: false` one Work Item is one CVE and is closed as soon as that CVE is gone.
+<br />
+
 ## Execution
 The recommended way to implement this integration, is by having the pipeline run on a cron schedule. We recommend that the cron schedule run on a daily basis, or by your desired frequency. This is demonstrated in the [example pipeline file](./examples/azure-pipelines.yml).
 ```yaml
@@ -167,17 +208,19 @@ schedules:
         - main
     always: true
 ```
-When the configured pipeline is executed, the integration fetches all the Issue policy matches that were created since the last execution.  
+Each run reads each in-scope Mend project's complete current state from Mend API 3.0 and reconciles Azure DevOps against it. There is no "since the last execution" window: a scheduled run is always a full comparison, so a missed or failed run costs nothing but the delay.  
 <br />
 
 ## Custom Field Mapping
-When specifying a [custom Work Item type](https://learn.microsoft.com/en-us/azure/devops/boards/work-items/about-work-items?view=azure-devops&tabs=agile-process#customize-a-work-item-type) with `$MEND_AZURETYPE`, the integration will utilize the [Azure API](https://learn.microsoft.com/en-us/rest/api/azure/devops/wit/work-item-types/get) to automatically obtain its definition.  
+When specifying a [custom Work Item type](https://learn.microsoft.com/en-us/azure/devops/boards/work-items/about-work-items?view=azure-devops&tabs=agile-process#customize-a-work-item-type) with `$MEND_AZURETYPE`, the integration will utilize the [Azure API](https://learn.microsoft.com/en-us/rest/api/azure/devops/wit/work-item-types/get) to automatically obtain its definition.
 
-The `"issues": []` objects returned by the [fetchProjectPolicyIssues](https://docs.mend.io/bundle/integrations/page/creating_your_own_issue_tracker_plugin.html#fetchProjectPolicyIssues) API response will be used to populate the corresponding Work Item fields. However, you can choose to use the `MEND_CUSTOMFIELDS` variable to populate additional information into any custom fields of that Work Item, if its type has any of those. 
+The `MEND_CUSTOMFIELDS` variable then populates any of that type's custom fields from the **Mend API 3.0 entry** that produced the Work Item.
+
+> **_BREAKING_**: In releases before the move to Mend API 3.0, a `MEND:` path was walked into a Mend API 1.4 policy issue. It is now walked into a **3.0 entry**, and **every 1.4 path must be rewritten**. See [Migrating from Mend API 1.4 Paths](#migrating-from-mend-api-14-paths).
 <br />
 
 ### Setting the Custom Fields Variable
-The `MEND_CUSTOMFIELDS` variable accepts a string that is a semi-colon separated list of key-value pairs in the format of `FieldName::StaticValue` or `FieldName::MEND:MappedValue`. More than one mapped value can be placed into a custom field by concatenating them with "&" like: `CustomField:MEND:MappedValue&MEND:MappedValue` The field name directly corresponds to the "name" property data returned in the API "[WorkItemTypeFieldInstance](https://learn.microsoft.com/en-us/rest/api/azure/devops/wit/work-item-types/get?view=azure-devops-rest-7.0&tabs=HTTP#workitemtypefieldinstance)", whereas the mapped value directly corresponds to the API Response for Mend's "[fetchProjectPolicyIssues](https://docs.mend.io/bundle/integrations/page/creating_your_own_issue_tracker_plugin.html#fetchProjectPolicyIssues)". Please refer to the response example in the API documentation for an example of what you can parse, or you can run the API itself to get real data. 
+The `MEND_CUSTOMFIELDS` variable accepts a string that is a semi-colon separated list of key-value pairs in the format of `FieldName::StaticValue` or `FieldName::MEND:MappedValue`. More than one mapped value can be placed into a custom field by concatenating them with `&`, like `CustomField::MEND:MappedValue&MEND:MappedValue`. The field name directly corresponds to the `name` property returned in the Azure API's "[WorkItemTypeFieldInstance](https://learn.microsoft.com/en-us/rest/api/azure/devops/wit/work-item-types/get?view=azure-devops-rest-7.0&tabs=HTTP#workitemtypefieldinstance)".
 
 >**_NOTE_**: If the definition of the specified Work Item type (`$MEND_AZURETYPE`) includes any fields that are set up as mandatory (`"alwaysRequired": true`), you must also use `MEND_CUSTOMFIELDS` to map values to those fields.
 <br />
@@ -186,13 +229,12 @@ The `MEND_CUSTOMFIELDS` variable accepts a string that is a semi-colon separated
 - The value of `MEND_CUSTOMFIELDS` should be a quoted string (single or double quotes)
 - The string should contain all the desired `Key::Value` mapping pairs, separated by semicolons (`;`)
 - The `Key` of each pair should be the name of the Work Item field (the `name` property, AKA "friendly name". See [WorkItemTypeFieldInstance](https://learn.microsoft.com/en-us/rest/api/azure/devops/wit/work-item-types/get?view=azure-devops-rest-7.0&tabs=HTTP#workitemtypefieldinstance) for details)
-- The value can contain a dot-separated JSON path of the desired property from the `fetchProjectPolicyIssues` response, prefixed by the namespace `MEND:` (case sensitive)
-- The process iterates through the objects under the `"issues": []` array of the `fetchProjectPolicyIssues` response, so any `MEND:` values must be from under that object. Values cannot include JSON paths for other properties from outside `"issues": []`
+- The value can contain a dot-separated path into the **Mend 3.0 entry** the Work Item was built from, prefixed by the namespace `MEND:` (case sensitive). The available paths are listed in [Available `MEND:` Paths](#available-mend-paths) below
 - The value can also contain custom text, either dynamic (using pipeline variables) or static
-- The value can combine multiple parts, both `MEND:` proeprties and/or free text. Parts should be delimited by an ampersand (`&`)
-- If you plan to use the `MEND_REPONAME` or `MEND_DESCRIPTION` variables then you can add this to a custom field with `$MEND_REPONAME` or `$MEND_DESCRIPTION`
+- The value can combine multiple parts, both `MEND:` properties and/or free text. Parts should be delimited by an ampersand (`&`)
+- If you plan to use the `MEND_REPONAME` or `MEND_DESCRIPTION` variables then you can add these to a custom field with `$MEND_REPONAME` or `$MEND_DESCRIPTION`
 
-**Syntax**  
+**Syntax**
 ```yaml
   env:
     ...
@@ -201,33 +243,137 @@ The `MEND_CUSTOMFIELDS` variable accepts a string that is a semi-colon separated
 ```
 <br />
 
+### Available `MEND:` Paths
+A `MEND:` path is walked into the **entry** the Work Item was built from. An entry is one vulnerable library (in the default `MEND_DEPENDENCY: true` mode) or one CVE (in `MEND_DEPENDENCY: false`), and it has this shape:
+
+```
+{
+  "library":  "log4j-core",           <- MEND:library
+  "kind":     "vulnerability",        <- MEND:kind
+  "findings": [ <Mend 3.0 finding>, ... ],   <- MEND:findings.<...>
+  "licenses": [ {"name", "url", "reference_file"}, ... ]   <- MEND:licenses.<...>
+}
+```
+
+Every path below has been verified to resolve. The right-hand column shows what each one returns for a `log4j-core` entry carrying `CVE-2021-44228`:
+
+| Path                                             | Resolves to                                                | Notes |
+|--------------------------------------------------|------------------------------------------------------------|-------|
+| `MEND:library`                                     | `log4j-core`                                               | The vulnerable library name. Present on every entry, in both `MEND_DEPENDENCY` modes. |
+| `MEND:kind`                                        | `vulnerability`                                            | Either `vulnerability` or `license`. |
+| `MEND:findings.vulnerability.name`                 | `CVE-2021-44228`                                           | The CVE (or Mend `WS-`) identifier. |
+| `MEND:findings.vulnerability.score`                | `10.0`                                                     | CVSS base score, as a number. |
+| `MEND:findings.vulnerability.severity`             | `HIGH`                                                     | Raw Mend wording, upper-case — not the `High` used in the description. |
+| `MEND:findings.vulnerability.description`          | `JNDI lookup RCE`                                          | The vulnerability description text. |
+| `MEND:findings.component.name`                     | `log4j-core`                                               | Same value as `MEND:library`. |
+| `MEND:findings.component.version`                  | `2.14.1`                                                   | The resolved library version. |
+| `MEND:findings.component.groupId`                  | `org.apache.logging.log4j`                                 | Maven coordinate; empty for ecosystems that have none. |
+| `MEND:findings.component.artifactId`               | `log4j-core`                                               | Maven coordinate; empty for ecosystems that have none. |
+| `MEND:findings.component.dependencyType`           | `TRANSITIVE`                                               | `DIRECT` or `TRANSITIVE`. |
+| `MEND:findings.component.references.homePage`      | `https://logging.apache.org/log4j/2.x/`                    | The library's home page. |
+| `MEND:findings.findingInfo.status`                 | `ACTIVE`                                                   | A Work Item only exists while this is `ACTIVE`; anything else closes it. |
+| `MEND:findings.findingInfo.detectedAt`             | `2026-08-01T10:00:00Z`                                     | When Mend first detected the finding. |
+| `MEND:findings.threatAssessment.epssPercentage`    | `97.5`                                                     | EPSS on a 0-100 scale. **Raw** — no `%` suffix, and no `<1%` collapsing. |
+| `MEND:findings.threatAssessment.exploitCodeMaturity` | `HIGH`                                                   | Raw wording, upper-case — not the `High` used in the description. |
+| `MEND:findings.reachability`                       | `REACHABLE`                                                | Raw wording — `REACHABLE` rather than `Reachable`. Blank for an org without reachability analysis. |
+| `MEND:findings.topFix.fixResolution`               | `2.17.1`                                                   | The recommended fix version, when Mend has one. |
+| `MEND:licenses.name`                               | `Apache-2.0`                                               | License name, from the project's due-diligence report. |
+| `MEND:licenses.url`                                | URL to the license text                                    | |
+| `MEND:licenses.reference_file`                     | `pom.xml`                                                  | The artifact that evidenced the license. |
+
+<br />
+
+#### Two behaviours that will surprise you
+
+Both of these are long-standing `MEND:` resolution behaviours, not new — but they matter much more now that the paths have changed.
+
+**1. `findings.X` resolves against the LAST finding, not the first and not the most severe.**
+
+In the default `MEND_DEPENDENCY: true` mode, one Work Item covers a whole library, and `findings` is a *list*. A path through it resolves against **whichever finding Mend returned last** — which is arbitrary. It is *not* the first finding, and it is *not* the highest-severity one:
+
+```
+entry.findings = [ CVE-2020-8203 (7.4, HIGH),
+                   CVE-2021-23337 (9.8, CRITICAL),
+                   CVE-2019-10744 (3.1, LOW) ]
+
+MEND:findings.vulnerability.name      ->  CVE-2019-10744
+MEND:findings.vulnerability.score     ->  3.1
+MEND:findings.vulnerability.severity  ->  LOW
+```
+
+A field mapped to `MEND:findings.vulnerability.score` on a library with several CVEs will therefore **disagree with the "highest severity is …" figure in the Work Item's own title**, and will not be the CVE a reader would expect. The same applies to `MEND:licenses.*` when a library carries more than one license.
+
+If you need one value per CVE, use `MEND_DEPENDENCY: false` — each Work Item is then a single CVE and its entry holds exactly one finding, so there is no ambiguity.
+
+**2. An unresolvable path writes the literal string `No content` into the field.**
+
+A typo does **not** leave the Azure field blank — it fills it with the two words `No content`:
+
+```
+MEND:findings.vulnerability.nmae   ->  "No content"     (typo in the last segment)
+MEND:library.filename              ->  "No content"     (1.4 path; `library` is a string, `.filename` is not on it)
+```
+
+The one case that yields an empty value instead is a path whose **first** segment does not exist on the entry at all — the run logs `Custom field parsing failed` and leaves the field empty (for a `Custom.` field, the field is explicitly cleared):
+
+```
+MEND:vulnerability.name            ->  ""    (1.4 path; no top-level `vulnerability` key)
+MEND:policyViolations.name         ->  ""    (1.4 path; no top-level `policyViolations` key)
+```
+
+Either way, check your pipeline log for `Custom field parsing failed` and for `The field '…' is empty. Check the MEND_CUSTOMFIELDS syntax.` after changing `MEND_CUSTOMFIELDS`, and check one produced Work Item before rolling the change out.
+<br />
+
+### Migrating from Mend API 1.4 Paths
+Every `MEND:` path written against Mend API 1.4 is now dead. Rewrite them:
+
+| Old (Mend API 1.4)                                                  | New (Mend API 3.0)                                    |
+|----------------------------------------------------------------------|--------------------------------------------------------|
+| `MEND:library.filename` / `MEND:library.name`                          | `MEND:library`                                         |
+| `MEND:library.version`                                                 | `MEND:findings.component.version`                      |
+| `MEND:library.groupId`                                                 | `MEND:findings.component.groupId`                      |
+| `MEND:library.artifactId`                                              | `MEND:findings.component.artifactId`                   |
+| `MEND:vulnerability.name`                                              | `MEND:findings.vulnerability.name`                     |
+| `MEND:vulnerability.score`                                             | `MEND:findings.vulnerability.score`                    |
+| `MEND:vulnerability.severity`                                          | `MEND:findings.vulnerability.severity`                 |
+| `MEND:vulnerability.description`                                       | `MEND:findings.vulnerability.description`              |
+| `MEND:policyViolations.vulnerability.name`                             | `MEND:findings.vulnerability.name`                     |
+| `MEND:policyViolations.vulnerability.type`                             | `MEND:kind`                                            |
+| `MEND:policyViolations.vulnerability.threatAssessment.epssPercentage`  | `MEND:findings.threatAssessment.epssPercentage`        |
+| `MEND:policyViolations.vulnerability.threatAssessment.exploitCodeMaturity` | `MEND:findings.threatAssessment.exploitCodeMaturity` |
+| `MEND:policyViolations.reachability`                                   | `MEND:findings.reachability`                           |
+| `MEND:policy.name` / `MEND:policy.policyContext`                       | *No equivalent.* Mend API 3.0 does not carry the matched policy on a security finding. Use static text, or `MEND:kind`. |
+
+>**_NOTE_**: `MEND:findings.threatAssessment.*` and `MEND:findings.reachability` sit directly on the **finding**, not under `vulnerability` as they did in 1.4. This is the single easiest path to get wrong: `MEND:findings.vulnerability.threatAssessment.epssPercentage` resolves to `No content`, silently.
+<br />
+
 ### Examples
 All the following examples assume a custom Work Item type named **SCA Issue**, which was configured to inherit fields from the **Bug** Work Item of the **Agile** process flow.
 
-**Example 1**  
-Populating the Work Item's custom fields **Issue Type** and **Issue Reference** with the vulnerability's type and identifier (name):  
+**Example 1**
+Populating the Work Item's custom fields **Library** and **Issue Reference** with the vulnerable library and the CVE identifier:
 
 ```yaml
   env:
     ...
     MEND_AZURETYPE: 'SCA Issue'
-    MEND_CUSTOMFIELDS: 'Issue Type::MEND:policyViolations.vulnerability.type;Issue Reference::MEND:policyViolations.vulnerability.name'
+    MEND_CUSTOMFIELDS: 'Library::MEND:library;Issue Reference::MEND:findings.vulnerability.name'
 ```
 <br />
 
-**Example 2**  
-Populating the Work Item's custom field **Team Comments** with the initial text:  
-**Mend policy name: *POLICY_NAME* (scope: *POLICY_SCOPE*)**  
+**Example 2**
+Populating the Work Item's custom field **Team Comments** with the text
+**Library: *LIBRARY* version *VERSION* (repo: *REPONAME*)**, combining `MEND:` paths, free text and a pipeline variable with `&`:
 
 ```yaml
   env:
     ...
     MEND_AZURETYPE: 'SCA Issue'
-    MEND_CUSTOMFIELDS: 'Team Comments::Mend policy name: &MEND:policy.name& (scope: &MEND:policy.policyContext&)'
+    MEND_CUSTOMFIELDS: 'Team Comments::Library: &MEND:library& version &MEND:findings.component.version& (repo: &$MEND_REPONAME&)'
 ```
 <br />
 
-**Example 3**  
+**Example 3**
 Populating custom fields **Reachability**, **EPSS** and **Exploit Maturity** with the risk signals on each finding (see [Enrichment: Reachability, EPSS and Exploit Code Maturity](#enrichment-reachability-epss-and-exploit-code-maturity)):
 
 ```yaml
@@ -235,10 +381,33 @@ Populating custom fields **Reachability**, **EPSS** and **Exploit Maturity** wit
     ...
     MEND_REACHABILITY: true
     MEND_AZURETYPE: 'SCA Issue'
-    MEND_CUSTOMFIELDS: 'Reachability::MEND:policyViolations.reachability;EPSS::MEND:policyViolations.vulnerability.threatAssessment.epssPercentage;Exploit Maturity::MEND:policyViolations.vulnerability.threatAssessment.exploitCodeMaturity'
+    MEND_CUSTOMFIELDS: 'Reachability::MEND:findings.reachability;EPSS::MEND:findings.threatAssessment.epssPercentage;Exploit Maturity::MEND:findings.threatAssessment.exploitCodeMaturity'
 ```
 
->**_NOTE_**: These three paths are real, but inherit pre-existing `MEND:` resolution behavior that will surprise you if you expect them to match the description table's CVE columns:
->- A path into `policyViolations` resolves against the **last** violation in the list, not the first — if a library matched more than one CVE, the custom field only ever reflects the last one.
->- When the value is missing, the custom field receives the literal string `No content`, not an empty string.
->- Values arrive **raw**, not the human-readable wording used in the description table: `REACHABLE` rather than `Reachable`, and `0.8` rather than `0.8%` (the number is the same — the custom field just has no `%` suffix). Expect the custom field and the description table to disagree in wording for the same finding.
+>**_NOTE_**: These values arrive **raw**, not in the human-readable wording used in the description table: `REACHABLE` rather than `Reachable`, and `97.5` rather than `97.5%` (the number is the same — the custom field just has no `%` suffix, and no `<1%` collapsing). Expect the custom field and the description table to disagree in wording for the same finding. In `MEND_DEPENDENCY: true` mode they will also disagree about *which* CVE, for the reason described [above](#two-behaviours-that-will-surprise-you).
+<br />
+
+**Example 4**
+A worked, complete pipeline fragment — a full custom Work Item type populated from a single Mend 3.0 entry:
+
+```yaml
+- script: python mend_azure_wi_sync/azure_wi_sync.py
+  displayName: 'Mend SCA Work Item Sync'
+  env:
+    MEND_URL: $(MEND_URL)
+    MEND_USERKEY: $(MEND_USERKEY)
+    MEND_APIKEY: $(MEND_APIKEY)
+    MEND_EMAIL: $(MEND_EMAIL)
+    MEND_AZUREPAT: $(MEND_AZUREPAT)
+    MEND_AZUREURI: $(System.CollectionUri)
+    MEND_AZUREPROJECT: $(System.TeamProject)
+    MEND_AZURETYPE: 'SCA Issue'
+    MEND_DEPENDENCY: false          # one Work Item per CVE, so every MEND: path is unambiguous
+    MEND_SEVERITY: high
+    MEND_REACHABILITY: true
+    MEND_CUSTOMFIELDS: 'Library::MEND:library;Version::MEND:findings.component.version;Issue Reference::MEND:findings.vulnerability.name;CVSS::MEND:findings.vulnerability.score;EPSS::MEND:findings.threatAssessment.epssPercentage;Exploit Maturity::MEND:findings.threatAssessment.exploitCodeMaturity;Reachability::MEND:findings.reachability;Fixed In::MEND:findings.topFix.fixResolution;Source Repo::$MEND_REPONAME'
+```
+
+>**_NOTE_**: `MEND_CUSTOMFIELDS` must be a **single-line** string. Field names are matched exactly, with no trimming, so a YAML folded block (`>-`) breaks it — the fold inserts a space and ` Version` no longer matches the field `Version`.
+
+>**_NOTE_**: `MEND_DEPENDENCY: false` is used here deliberately. In the default `true` mode the same mapping still works, but each of the `MEND:findings.*` fields would reflect an arbitrary one of the library's CVEs — see [Two behaviours that will surprise you](#two-behaviours-that-will-surprise-you).

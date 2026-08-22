@@ -35,10 +35,16 @@ steps:
     MEND_URL: $(MEND_URL)
     MEND_USERKEY: $(MEND_USERKEY)
     MEND_APIKEY: $(MEND_APIKEY)
+    # MEND_EMAIL is REQUIRED: the email of the Mend user whose MEND_USERKEY this is. It logs in
+    # against Mend API 2.0 to obtain the JWT that authenticates every Mend API 3.0 call, which
+    # is how this integration now reads everything. Without it the run cannot authenticate.
+    MEND_EMAIL: $(MEND_EMAIL)
     MEND_AZUREPAT: $(MEND_AZUREPAT)
     MEND_AZUREURI: $(System.CollectionUri)
     MEND_AZUREPROJECT: $(System.TeamProject)
     # Optional parameters
+    # NOTE: the three token variables now take Mend API 3.0 UUIDs, not 1.4 tokens. A stale 1.4
+    # token aborts the run with a message naming the variable.
     MEND_PRODUCTTOKEN: $(MEND_PRODUCTTOKEN)
     MEND_PROJECTTOKEN: $(MEND_PROJECTTOKEN)
     MEND_EXCLUDETOKEN: $(MEND_EXCLUDETOKEN)
@@ -49,19 +55,27 @@ steps:
     MEND_REPONAME : $(MEND_REPONAME)
     MEND_DESCRIPTION : $(MEND_DESCRIPTION)
     MEND_CALCULATEPRIORITY : $(MEND_CALCULATEPRIORITY)
+    # Minimum CVSS severity that earns a work item: low | medium | high | critical, or a number
+    # from 0 to 10. Defaults to "high" (7.0). The SAME floor governs closure -- a work item whose
+    # findings all drop below it is closed -- so lowering it creates work items and raising it
+    # closes them.
+    MEND_SEVERITY: $(MEND_SEVERITY)
+    # State names written when a finding disappears from Mend and when it comes back. These are
+    # process-dependent: Agile Closed/Active, Scrum Done/New, Basic Done/To Do. Closure never
+    # deletes a work item -- it keeps its id and history.
+    # MEND_CLOSEDSTATE: $(MEND_CLOSEDSTATE)
+    # MEND_REOPENSTATE: $(MEND_REOPENSTATE)
     # Tag-based routing to multiple Azure projects (optional)
     # MEND_ROUTING: $(MEND_ROUTING)
     # MEND_BRANCHES: $(MEND_BRANCHES)
     # EPSS score and exploit code maturity always render and have no variable.
-    # Reachability on every work item (optional) — an org without reachability analysis
+    # Reachability on every work item (optional) -- an org without reachability analysis
     # enabled can leave this off and avoid a column of "-"
     # MEND_REACHABILITY: $(MEND_REACHABILITY)
-    # Read from the same Mend 3.0 finding as the rest of the work item — no extra call, no
+    # Read from the same Mend 3.0 finding as the rest of the work item -- no extra call, no
     # extra variable and no extra Mend permission.
     # NOTE: uncomment the line only once the matching pipeline variable exists. Azure leaves
     # an undefined variable as the literal string "$(MEND_REACHABILITY)", which normalizes to
-    # "false" — the feature then stays off with nothing logged as an error.
-    # Mend API 3.0 credentials — inert until a feature that uses 3.0 is enabled.
-    # MEND_EMAIL: $(MEND_EMAIL)
+    # "false" -- the feature then stays off with nothing logged as an error.
     # MEND_ORGUUID defaults to MEND_APIKEY; set it only if they differ for your org.
     # MEND_ORGUUID: $(MEND_ORGUUID)
