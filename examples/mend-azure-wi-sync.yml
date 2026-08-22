@@ -67,3 +67,10 @@ steps:
     # NOTE: uncomment a line only once the matching pipeline variable exists. Azure leaves
     # an undefined variable as the literal string "$(MEND_EPSS)" / "$(MEND_REACHABILITY)",
     # which normalizes to "false" — the feature then stays off with nothing logged as an error.
+    # Mend API 3.0 credentials — inert until a feature that uses 3.0 is enabled.
+    # MEND_EMAIL and MEND_APIURL must be set together; setting one without the other
+    # aborts the run with a message naming the missing one.
+    # MEND_EMAIL: $(MEND_EMAIL)
+    # MEND_APIURL: $(MEND_APIURL)
+    # MEND_ORGUUID defaults to MEND_APIKEY; set it only if they differ for your org.
+    # MEND_ORGUUID: $(MEND_ORGUUID)
