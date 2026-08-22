@@ -1,5 +1,3 @@
-from unittest import mock
-
 from mend_azure_wi_sync import core
 from mend_azure_wi_sync import enrichment as en
 
@@ -54,56 +52,6 @@ def test_build_enrich_html_covers_all_four_flag_combinations():
     assert "<b>Exploit Code Maturity:</b>" in both
     # Reachability renders first, matching the row's column order.
     assert both.index("<b>Reachability:</b>") < both.index("<b>EPSS:</b>")
-
-
-def test_decoration_failure_cannot_cost_work_items():
-    libs = [{"library": {"keyUuid": "lib-a"},
-             "policyViolations": [{"vulnerability": {"name": "CVE-1"}}]}]
-    # Patch on `core`, not on `enrichment`: core binds the name at import time, so patching
-    # the source module would leave core's reference untouched and this test would pass
-    # while testing nothing.
-    with mock.patch.object(core, "decorate_policy_violations", side_effect=TypeError("boom")):
-        assert core.safe_decorate(libs, {}) is None
-
-
-def test_decoration_failure_after_the_call_also_cannot_cost_work_items():
-    # safe_decorate's whole body must be guarded, not just the decorate_policy_violations
-    # call: an arity change in its return value must not raise into create_wi either.
-    libs = [{"library": {"keyUuid": "lib-a"},
-             "policyViolations": [{"vulnerability": {"name": "CVE-1"}}]}]
-    with mock.patch.object(core, "decorate_policy_violations", return_value=(1,)):  # wrong arity
-        assert core.safe_decorate(libs, {}) is None
-
-
-def test_safe_decorate_warns_only_when_candidates_matched_nothing(caplog):
-    # The alerts index carries every open alert in the project while candidates is only
-    # this window's policy violations, so warning on "0 of N findings" would fire on most
-    # projects every run and train operators to ignore the one signal that detects a
-    # broken join.
-    libs = [{"library": {"keyUuid": "lib-a"},
-             "policyViolations": [{"vulnerability": {"name": "CVE-1"}}]}]
-    with caplog.at_level("WARNING"):
-        core.safe_decorate(libs, {})
-    assert any("matched" in r.message for r in caplog.records)
-    caplog.clear()
-    with caplog.at_level("WARNING"):
-        core.safe_decorate([], {("CVE-1", "lib-a"): {}})
-    assert not caplog.records
-
-
-def test_a_normal_epss_score_does_not_warn(caplog):
-    """The EPSS unit question is settled: epssPercentage is 0-100, confirmed against live
-    Mend data 2026-08-19.
-
-    The old `> 1` warning existed only to detect the unit being a percentage. Now that it
-    IS a percentage, values above 1 are ordinary — every genuinely exploited CVE has one —
-    so a warning there would fire constantly and say something false.
-    """
-    libs = [{"library": {"keyUuid": "lib-a"},
-             "policyViolations": [{"vulnerability": {"name": "CVE-1"}}]}]
-    with caplog.at_level("WARNING"):
-        core.safe_decorate(libs, {("CVE-1", "lib-a"): {"epss": 92.4}})
-    assert not [r for r in caplog.records if "100x" in r.message]
 
 
 def test_format_reachability_ignores_a_non_string_leaf():

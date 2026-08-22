@@ -9,8 +9,7 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
-from enrichment import (build_alert_index, decorate_policy_violations, format_epss,
-                        format_exploit, format_reachability)
+from enrichment import format_epss, format_exploit, format_reachability
 from identity import license_title, matches_library
 from reconcile import CLOSE, CREATE, REOPEN, SKIP, UPDATE, plan_actions
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
@@ -44,7 +43,6 @@ max_wi = 100
 max_wiql_page = 5000  # WIQL rows per page; Azure DevOps hard-caps a single result set at 20000
 WARNING_MSG = False
 mend_v2_session = None
-API_VERSION = "1.4"
 AGENT_INFO = {"agent": f"{__tool_name__.replace('_', '-')}", "agentVersion": __version__}
 DEFAULT_PRIORITY = 2
 uuid_pattern = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -60,8 +58,6 @@ updated_wi = []
 # instead of silently dropped by the `exist_id not in updated_wi` guard below.
 wi_claim_keyid = {}
 run_failed = False
-ALERTS_WARNED = False         # same guard for the enrichment alerts fetch: a user key that
-                               # cannot read alerts fails for all ~107 projects identically
 
 
 def fn():
@@ -195,64 +191,6 @@ def reachability_enabled() -> bool:
     return conf.reachability.lower() == "true"
 
 
-def alerts_enabled() -> bool:
-    # Both signals arrive in the same getProjectAlertsByType response, so turning either
-    # (or both) on costs exactly one alerts call per project -- the same as one.
-    #
-    # No enrichment_disabled latch any more: it existed because a persistent 3.0 401/403 meant
-    # the org lacked a 3.0 entitlement, which no amount of retrying would fix. Alerts ride the
-    # same 1.4 transport and credential as every other call, so a failure there is not an
-    # enrichment-specific condition to latch on.
-    return epss_enabled() or reachability_enabled()
-
-
-def requested_signal_names() -> str:
-    """Human-readable list of the enrichment signals actually requested this run, for the
-    once-per-run alerts-fetch-failed warning. Naming only what was asked for keeps the
-    message honest when an org only has one of the two flags turned on."""
-    signals = []
-    if epss_enabled():
-        signals.extend(["EPSS", "Exploit Code Maturity"])
-    if reachability_enabled():
-        signals.append("Reachability")
-    if len(signals) <= 1:
-        return "".join(signals)
-    if len(signals) == 2:
-        return " and ".join(signals)
-    return f"{', '.join(signals[:-1])}, and {signals[-1]}"
-
-
-def enrich_project(prj_token: str) -> dict:
-    """Enrichment index for one Mend project, or {} if unavailable for any reason."""
-    if not alerts_enabled():
-        return {}
-    return try_or_error(lambda: fetch_project_alerts(prj_token), {})
-
-
-def safe_decorate(sorted_libs: list, index: dict):
-    """Decorate this project's issue objects, absorbing anything that goes wrong.
-
-    The caller has one outer try whose error string is logged at INFO, so an
-    exception raised here would silently drop every Work Item for the project while the run
-    still reported success. Display-only data must never cost a Work Item. The whole body
-    runs inside one try_or_error, not just the decorate_policy_violations call: an arity
-    change in its return value must not raise into create_wi either.
-    """
-    def _decorate():
-        candidates, matched = decorate_policy_violations(sorted_libs, index)
-        if candidates and not matched:
-            # The alerts index carries every open alert in the project, while candidates is
-            # only this window's policy violations, so compare against the policy candidates.
-            # Comparing against the full alerts total would fire on most projects and train
-            # operators to ignore it.
-            logger.warning(f"[{fn()}] Enrichment matched 0 of {candidates} candidate finding(s) "
-                           f"for this project. If this repeats, the (CVE, library uuid) join key "
-                           f"is wrong and every work item will show blank reachability.")
-
-    try_or_error(_decorate, None)
-    return None
-
-
 def epss_exploit_row_fields(policy_el: dict, epss_on: bool) -> dict:
     """The EPSS/Exploit row keys, gated on MEND_EPSS alone -- independent of reachability,
     since an org may not have reachability analysis enabled at all."""
@@ -275,105 +213,6 @@ def build_enrich_html(policy_el: dict, epss_on: bool, reachability_on: bool) -> 
         html += f"<br><b>EPSS:</b> {format_epss(policy_el)}" \
                 f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}"
     return html
-
-
-def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST", agent_info_login=False):
-    global WARNING_MSG
-    data_json = json.loads(data)
-    data_json["agentInfo"] = AGENT_INFO
-    if agent_info_login:
-        data_json["agentInfo"]["agent"] = AGENT_INFO["agent"].replace("ps-", "ps-login-")
-    try:
-        with warnings.catch_warnings(record=True) as warning_list:
-            warnings.simplefilter("always", InsecureRequestWarning)
-            res_ = requests.request(
-                method=method,
-                url=f"{extract_url(conf.ws_url)}/api/v{API_VERSION}",
-                data=json.dumps(data_json),
-                headers=header,
-                proxies=conf.proxy,
-                verify=False
-            )
-        if not WARNING_MSG:
-            for warning in warning_list:
-                if issubclass(warning.category, InsecureRequestWarning):
-                    index_of_see = str(warning.message).find("See:")
-                    logger.warning(str(warning.message)[:index_of_see].strip())
-                    WARNING_MSG = True
-
-        res = res_.text if res_.status_code == 200 else ""
-        if res:
-            try:
-                res_check = json.loads(res_.text)
-            except:
-                temp_http_proxy = try_or_error(lambda: conf.proxy["http"], "")
-                if temp_http_proxy:
-                    with warnings.catch_warnings(record=True) as warning_list:
-                        warnings.simplefilter("always", InsecureRequestWarning)
-                        res_ = requests.request(
-                            method=method,
-                            url=f"{extract_url(conf.ws_url)}/api/v{API_VERSION}",
-                            data=json.dumps(data_json),
-                            headers=header,
-                            proxies={"http": temp_http_proxy},
-                            verify=False
-                        )
-                    if not WARNING_MSG:
-                        for warning in warning_list:
-                            if issubclass(warning.category, InsecureRequestWarning):
-                                index_of_see = str(warning.message).find("See:")
-                                logger.warning(str(warning.message)[:index_of_see].strip())
-                                WARNING_MSG = True
-
-                    res = res_.text if res_.status_code == 200 else ""
-                else:
-                    logger.error("Shutting down SSL/TLS connection. "
-                                 "Check that your proxy is appropriately configured and run again.")
-                    exit(-1)
-
-    except Exception as err:
-        res = f"Error was raised. {try_or_error(lambda: err.args[0].reason.args[0], '')}"
-        logger.error(f'[{ex()}] {err}')
-    return res
-
-
-def fetch_project_alerts(prj_token: str) -> dict:
-    """{(cve, library keyUuid): values} for one Mend project, from the 1.4 alerts API.
-
-    Replaces the 3.0 findings endpoint. Three things went away with it: the 2.0 login, the
-    project-uuid resolution (an alert carries its own 1.4 projectToken), and the paging loop --
-    API 1.4 does not paginate.
-
-    Returns {} on any failure rather than raising: this is display-only data and must never
-    cost a Work Item. orgToken is omitted to match the ignored-alerts call this
-    tool has been making successfully since before this change.
-
-    An unreadable response warns ONCE per run. Returning {} silently would be invisible:
-    Callers only invoke safe_decorate when the index is non-empty, and safe_decorate owns the
-    only other enrichment warning ("matched 0 of N candidate finding(s)"), so a WHOLESALE
-    failure -- the exact case where the operator most needs to know -- would skip both and
-    render "-" in every column with nothing in the log. This restores the single run-level
-    warning that the deleted prepare_enrichment used to emit.
-    """
-    global ALERTS_WARNED
-    body = {"requestType": "getProjectAlertsByType",
-            "userKey": conf.ws_user_key,
-            "projectToken": prj_token,
-            "alertType": "SECURITY_VULNERABILITY"}
-    payload = try_or_error(lambda: json.loads(call_ws_api(data=json.dumps(body))), None)
-    alerts = try_or_error(lambda: payload["alerts"], None)
-    if not isinstance(alerts, list):
-        if not ALERTS_WARNED:
-            # Once per run, not once per project: one bad credential or entitlement fails
-            # identically for all ~107 projects and would otherwise log 107 times.
-            ALERTS_WARNED = True
-            logger.warning(f"[{fn()}] Could not read Mend alerts for enrichment "
-                           f"(getProjectAlertsByType on {prj_token} returned {payload}). "
-                           f"{requested_signal_names()} will be blank ('-') on every work "
-                           f"item this run. Enrichment is display-only, so the run continues "
-                           f"and no work item is lost.")
-        return {}
-    return build_alert_index(alerts)
 
 
 def _post_v2_login():
