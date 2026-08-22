@@ -2396,6 +2396,18 @@ def extract_url(url: str) -> str:
     return url_[0:pos] if pos > -1 else url_
 
 
+def normalise_state(raw, default: str) -> str:
+    """A work item state name, falling back to `default` for an unset or placeholder value.
+
+    Never returns "": Azure rejects an empty System.State, which would fail every close in the
+    run and look like a permissions problem.
+    """
+    text = str(raw or "").strip()
+    if not text or re.match(r"\$\(.+\)$", text):
+        return default
+    return text
+
+
 def startup():
     global conf
     conf = Config(
@@ -2428,6 +2440,8 @@ def startup():
         api_url=varenvs.get_env("wsapiurl").strip(),
         org_uuid=varenvs.get_env("wsorguuid").strip(),
         severity=varenvs.get_env("wsseverity").strip(),
+        closed_state=varenvs.get_env("wsclosedstate").strip(),
+        reopen_state=varenvs.get_env("wsreopenstate").strip(),
     )
     try:
         return conf

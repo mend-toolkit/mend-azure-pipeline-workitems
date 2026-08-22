@@ -57,6 +57,8 @@ class varenvs(Enum):  # Lit of Env.variables
     wsapiurl = ("WS_APIURL", "MEND_APIURL")
     wsorguuid = ("WS_ORGUUID", "MEND_ORGUUID")
     wsseverity = ("WS_SEVERITY", "MEND_SEVERITY")
+    wsclosedstate = ("WS_CLOSEDSTATE", "MEND_CLOSEDSTATE")
+    wsreopenstate = ("WS_REOPENSTATE", "MEND_REOPENSTATE")
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -130,6 +132,8 @@ class Config:
     api_url: str
     org_uuid: str
     severity: str
+    closed_state: str
+    reopen_state: str
 
     def conf_json(self):
         return {
@@ -162,6 +166,8 @@ class Config:
             "wsapiurl": self.api_url,
             "wsorguuid": self.org_uuid,
             "wsseverity": self.severity,
+            "wsclosedstate": self.closed_state,
+            "wsreopenstate": self.reopen_state,
         }
 
     def get_values(self):
@@ -195,6 +201,10 @@ class Config:
                     value = "main,master" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "severity":
                     value = "high" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "closed_state":
+                    value = "Closed" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "reopen_state":
+                    value = "New" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "proxy":
                     if properties[key]:
                         if type(properties[key]) is dict:
