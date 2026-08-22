@@ -1356,6 +1356,144 @@ def reconcile_after_sync():
         conf.azure_project = original_azure_project
 
 
+# The work item rendering helpers below were nested inside create_wi. They are lifted to
+# module level UNCHANGED so the 3.0 creation path (create_wi_v3) can reuse the exact same
+# renderers rather than reimplementing them -- two implementations of a shipped work item
+# description would drift. Anything that genuinely reads create_wi's closure (the 1.4
+# fetchers, create_wi_content, field_name_in_data, find_parent_chain) stays where it is.
+
+
+def set_priority(value: float):
+    score = [70, 55, 40]  # Mend gradation of SCC scores
+    z = value * 10
+    i = 0
+    for i, sc_ in enumerate(score):
+        if z // sc_ == 1:
+            break
+    return i + 1
+
+
+def mend_val(alert_val: str, prj_el: list):
+    temp = None
+    for lst_ in alert_val.split("."):
+        try:
+            temp = try_or_error(lambda: temp[lst_], "No content") if temp is not None else prj_el[lst_]
+            if type(temp) is list:
+                rs = ""
+                for el_ in temp:
+                    if type(el_) is str:
+                        rs += el_ + ","
+                    elif type(el_) is dict:
+                        temp = el_
+                    elif type(el_) is list:
+                        temp = temp[0]  # Take just first element
+                        break
+                if rs:
+                    return rs[:-1]
+        except Exception as err:
+            logger.error(f"[{ex()}] Custom field parsing failed: {err}")
+            return ""
+    return temp
+
+
+def analyze_fields(fld: dict, prj: list):
+    val = ""
+    if fld["defaultValue"]:
+        step1 = fld["defaultValue"].split("&")
+        for st_ in step1:
+            t = f"{mend_val(st_[5:], prj)}" if "MEND:" in st_ else st_
+            if t:
+                if t.startswith("$"):
+                    dict_env_val = conf.conf_json()
+                    env_val = t[1:].strip()
+                    # Must be reset per '&'-delimited part. Without it, a part naming an
+                    # unknown or RETIRED variable ($MEND_EMAIL, until it was deleted with
+                    # the 2.0 transport) leaks the PREVIOUS part's var_name and duplicates
+                    # its value -- which can be $MEND_USERKEY. "" resolves to "" via
+                    # try_or_error, which is what an unmatched part has always produced.
+                    var_name = ""
+                    for var_ in varenvs:
+                        if env_val in var_.value:
+                            var_name = var_.name
+                            break
+                    t = try_or_error(lambda: dict_env_val[var_name], "")
+                val += t
+            elif "MEND:" in st_:
+                logger.warning(f"The field '{fld['referenceName']}' is empty. "
+                               f"Check the MEND_CUSTOMFIELDS syntax.")
+    return fld["referenceName"], val.strip()
+
+
+def create_area(area):
+    areas = area.split("\\")
+    if areas[0] != conf.azure_project:
+        areas.insert(0, conf.azure_project)
+        conf.azure_area = f"{conf.azure_project}\\{conf.azure_area}"
+    res = {}
+    for i, area_ in enumerate(areas):
+        data = {
+            'name': area_,
+        }
+        if i == 1:
+            res, errcode = call_azure_api(api_type="POST", api=f"wit/classificationnodes/areas", data=data,
+                                 project=conf.azure_project, header="application/json")
+        elif 1 < i < len(areas):
+            res, errcode = call_azure_api(api_type="POST", api=f"wit/classificationnodes/areas/{under}", data=data,
+                                 project=conf.azure_project, header="application/json")
+        under = f"{under}/{area_}" if i > 1 else area_
+    return res
+
+
+def create_html_table(data):
+    table_html = "<table style='border-collapse: collapse; table-layout: auto'>\n"  # Start of the table HTML with styles
+
+    # Create the table header row
+    table_html += "<tr>"
+    for header in data[0].keys():
+        if header != "URL":
+            table_html += f"<th style='border: 1px solid black; padding: 5px;'><b>{header}</b></th>"
+    table_html += "</tr>\n"
+
+    # Create the table data rows
+    for row in data:
+        table_html += "<tr>"
+        for j, value in enumerate(row.values()):
+            if j == 0:
+                url_ = row["URL"]
+                table_html += f"<td style='border: 1px solid black; padding: 5px;'><a href='{url_}'>{value}</a></td>"
+            elif j < len(row.values()) - 1:
+                table_html += f"<td style='border: 1px solid black; padding: 5px;'>{value}</td>"
+
+        table_html += "</tr>\n"
+
+    table_html += "</table>"  # End of the table HTML
+
+    return table_html
+
+
+def generate_expandable_section(summary, detail):
+    html = f"<details>\n"
+    html += f"  <summary>{summary}</summary>\n"
+    html += f"  <p>{detail}</p>\n"
+    html += f"</details>"
+    return html
+
+
+def generate_html_bulleted_list(items):
+    html = "<ul>\n"
+    for item in items:
+        html += f"  <li>{item}</li>\n"
+    html += "</ul>"
+    return html
+
+
+def get_field_ref(fld_name, cstm_flds):
+    for c_fld_ in cstm_flds:
+        if fld_name == c_fld_["name"]:
+            return f"/fields/{c_fld_['referenceName']}"
+    return f"/fields/Custom.{fld_name}"
+
+
 def build_wi_tags(project_tag: str, policy_tag: str, routing: str, reponame: str) -> list:
     # Repo identity is a work item tag because the client declined Area Path. Taking the
     # values as arguments keeps this testable without constructing a whole Config.
@@ -1428,64 +1566,6 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                        try_or_error(lambda: location_['locations'][0]['path'], "")
         return "", ""
 
-    def set_priority(value: float):
-        score = [70, 55, 40]  # Mend gradation of SCC scores
-        z = value * 10
-        i = 0
-        for i, sc_ in enumerate(score):
-            if z // sc_ == 1:
-                break
-        return i + 1
-
-    def analyze_fields(fld: dict, prj: list):
-        val = ""
-        if fld["defaultValue"]:
-            step1 = fld["defaultValue"].split("&")
-            for st_ in step1:
-                t = f"{mend_val(st_[5:], prj)}" if "MEND:" in st_ else st_
-                if t:
-                    if t.startswith("$"):
-                        dict_env_val = conf.conf_json()
-                        env_val = t[1:].strip()
-                        # Must be reset per '&'-delimited part. Without it, a part naming an
-                        # unknown or RETIRED variable ($MEND_EMAIL, until it was deleted with
-                        # the 2.0 transport) leaks the PREVIOUS part's var_name and duplicates
-                        # its value -- which can be $MEND_USERKEY. "" resolves to "" via
-                        # try_or_error, which is what an unmatched part has always produced.
-                        var_name = ""
-                        for var_ in varenvs:
-                            if env_val in var_.value:
-                                var_name = var_.name
-                                break
-                        t = try_or_error(lambda: dict_env_val[var_name], "")
-                    val += t
-                elif "MEND:" in st_:
-                    logger.warning(f"The field '{fld['referenceName']}' is empty. "
-                                   f"Check the MEND_CUSTOMFIELDS syntax.")
-        return fld["referenceName"], val.strip()
-
-    def mend_val(alert_val: str, prj_el: list):
-        temp = None
-        for lst_ in alert_val.split("."):
-            try:
-                temp = try_or_error(lambda: temp[lst_], "No content") if temp is not None else prj_el[lst_]
-                if type(temp) is list:
-                    rs = ""
-                    for el_ in temp:
-                        if type(el_) is str:
-                            rs += el_ + ","
-                        elif type(el_) is dict:
-                            temp = el_
-                        elif type(el_) is list:
-                            temp = temp[0]  # Take just first element
-                            break
-                    if rs:
-                        return rs[:-1]
-            except Exception as err:
-                logger.error(f"[{ex()}] Custom field parsing failed: {err}")
-                return ""
-        return temp
-
     def field_name_in_data(fld_name: str):  # Don't need to add existing element to data
         res = False
         for el_ in data:
@@ -1493,51 +1573,6 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 res = True
                 break
         return res
-
-    def create_area(area):
-        areas = area.split("\\")
-        if areas[0] != conf.azure_project:
-            areas.insert(0, conf.azure_project)
-            conf.azure_area = f"{conf.azure_project}\\{conf.azure_area}"
-        res = {}
-        for i, area_ in enumerate(areas):
-            data = {
-                'name': area_,
-            }
-            if i == 1:
-                res, errcode = call_azure_api(api_type="POST", api=f"wit/classificationnodes/areas", data=data,
-                                     project=conf.azure_project, header="application/json")
-            elif 1 < i < len(areas):
-                res, errcode = call_azure_api(api_type="POST", api=f"wit/classificationnodes/areas/{under}", data=data,
-                                     project=conf.azure_project, header="application/json")
-            under = f"{under}/{area_}" if i > 1 else area_
-        return res
-
-    def create_html_table(data):
-        table_html = "<table style='border-collapse: collapse; table-layout: auto'>\n"  # Start of the table HTML with styles
-
-        # Create the table header row
-        table_html += "<tr>"
-        for header in data[0].keys():
-            if header != "URL":
-                table_html += f"<th style='border: 1px solid black; padding: 5px;'><b>{header}</b></th>"
-        table_html += "</tr>\n"
-
-        # Create the table data rows
-        for row in data:
-            table_html += "<tr>"
-            for j, value in enumerate(row.values()):
-                if j == 0:
-                    url_ = row["URL"]
-                    table_html += f"<td style='border: 1px solid black; padding: 5px;'><a href='{url_}'>{value}</a></td>"
-                elif j < len(row.values()) - 1:
-                    table_html += f"<td style='border: 1px solid black; padding: 5px;'>{value}</td>"
-
-            table_html += "</tr>\n"
-
-        table_html += "</table>"  # End of the table HTML
-
-        return table_html
 
     def find_parent_chain(key_uuid, libraries):
         # Helper function to recursively find the parent chain
@@ -1561,19 +1596,6 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             "projectToken": prj_token
         })
         return json.loads(call_ws_api(data=data))
-
-    def generate_expandable_section(summary, detail):
-        html = f"<details>\n"
-        html += f"  <summary>{summary}</summary>\n"
-        html += f"  <p>{detail}</p>\n"
-        html += f"</details>"
-        return html
-
-    def get_field_ref(fld_name):
-        for c_fld_ in cstm_flds:
-            if fld_name == c_fld_["name"]:
-                return f"/fields/{c_fld_['referenceName']}"
-        return f"/fields/Custom.{fld_name}"
 
     def create_wi_content():
         nonlocal item_failed
@@ -1600,7 +1622,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         elif conf.description == "ReproSteps":
             desc_field = "/fields/Microsoft.VSTS.TCM.ReproSteps"
         elif conf.description:
-            desc_field = get_field_ref(conf.description)
+            desc_field = get_field_ref(conf.description, cstm_flds)
         else:
             desc_field = ""
         if desc_field:
@@ -1706,13 +1728,6 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             item_failed = True
             logger.error(f"[{ex()}] Work item creation/update failed: {err}")
             global_errors += 1
-
-    def generate_html_bulleted_list(items):
-        html = "<ul>\n"
-        for item in items:
-            html += f"  <li>{item}</li>\n"
-        html += "</ul>"
-        return html
 
     def get_ingnored_alerts(project):
         ign_alerts = json.dumps({
