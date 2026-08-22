@@ -14,6 +14,7 @@ from config import *
 from enrichment import (build_alert_index, decorate_policy_violations, format_epss,
                         format_exploit, format_reachability)
 from identity import license_title, matches_library
+from reconcile import CLOSE, CREATE, REOPEN, SKIP, UPDATE, plan_actions
 from routing import (parse_route, build_table, classify, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 from source3 import (normalise_findings, normalise_projects, normalise_violations,
@@ -1191,8 +1192,26 @@ def actual_work_items(project_name: str):
                                 {t.casefold() for t in tag_set(meta.get("tags", ""))}, False):
                 continue
             key = classify_title(title)
-            if key:
-                found[key] = {"id": wid, "state": meta.get("state", "")}
+            if not key:
+                continue
+            candidate = {"id": wid, "state": meta.get("state", "")}
+            previous = found.get(key)
+            if previous is None:
+                found[key] = candidate
+                continue
+            # Two live work items for one (kind, library). The winner is the LOWEST id, so the
+            # choice is deterministic across runs rather than "whichever the cache listed last".
+            # The loser is left alone -- we cannot tell which is canonical, and closing the wrong
+            # one destroys a record an operator may be using. Leaving it open is today's
+            # behaviour, so this is not a regression.
+            keep, drop = sorted([previous, candidate],
+                                key=lambda item: try_or_error(lambda: int(item["id"]),
+                                                              float("inf")))
+            logger.warning(f"[{fn()}] Two work items share the key {key} in project "
+                           f"{project_name}: {previous.get('id')} and {candidate.get('id')}. "
+                           f"Reconciling against {keep.get('id')} (the lowest id); "
+                           f"{drop.get('id')} is left untouched -- resolve the duplicate by hand.")
+            found[key] = keep
     return found
 
 
@@ -1225,6 +1244,63 @@ def apply_close(work_item_id, state: str) -> bool:
 
 def apply_reopen(work_item_id, state: str) -> bool:
     return _patch_state(work_item_id, state, "reopen")
+
+
+def reconcile_project(project, floor):
+    """Reconcile ONE Mend project against Azure. Returns (created, updated, closed, reopened,
+    skipped).
+
+    CREATE and UPDATE are counted and reported but deliberately NOT executed here. create_wi /
+    create_wi_content are built end to end around Mend 1.4 policy-issue objects -- the HTML
+    tables, the CVE sections, the custom-field resolution, the tags and the Hyperlink relation
+    that carries "{projectToken},{issueUuid}". Feeding 3.0 entries through them is a rendering
+    rewrite, not a wiring change. Creation keeps working on the existing 1.4 forward-sync path;
+    this function adds only the closure half.
+
+    The closure interlock (spec 6.1): on ok=False from fetch_v3_desired NOTHING is closed. An
+    incomplete read is indistinguishable from a project whose findings were all remediated, and
+    acting on that at this customer's scale is a mass-closure event. REOPEN still runs -- it
+    cannot destroy anything.
+
+    SKIP makes no API call at all: see reconcile.plan_actions.
+    """
+    project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
+    closed_state = normalise_state(getattr(conf, "closed_state", ""), "Closed")
+    reopen_state = normalise_state(getattr(conf, "reopen_state", ""), "New")
+
+    # Read Azure FIRST, before anything in this run has written to it: entries added to exist_wis
+    # after a POST/PATCH carry state "" and must never be mistaken for a real state.
+    actual = actual_work_items(project_name)
+    desired, ok = fetch_v3_desired(project.get("uuid", ""), floor)
+
+    if not ok:
+        logger.warning(f"[{fn()}] The Mend read for project {project_name} was incomplete. "
+                       f"Closures are SKIPPED for this project -- a partial read looks exactly "
+                       f"like a project whose findings were all remediated, and closing on it "
+                       f"would be a mass-closure. Reopens and the rest of the run continue.")
+
+    created = updated = closed = reopened = skipped = 0
+    for action in plan_actions(desired, actual, closed_state):
+        verb = action.get("action")
+        if verb == CREATE:
+            created += 1
+        elif verb == UPDATE:
+            updated += 1
+        elif verb == REOPEN:
+            if apply_reopen(action.get("id"), reopen_state):
+                reopened += 1
+        elif verb == CLOSE:
+            if not ok:
+                continue
+            if apply_close(action.get("id"), closed_state):
+                closed += 1
+        elif verb == SKIP:
+            skipped += 1
+
+    logger.info(f"[{fn()}] Reconciled {project_name}: {created} to create, {updated} to update "
+                f"(neither is executed on this path), {closed} closed, {reopened} reopened, "
+                f"{skipped} already closed and skipped.")
+    return created, updated, closed, reopened, skipped
 
 
 def clamp_revsync(prj_token, state, todate, max_hours, reset_on):

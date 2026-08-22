@@ -133,3 +133,121 @@ def test_a_transport_failure_also_returns_false_without_raising():
     with mock.patch.object(core, "conf", mock.MagicMock(azure_project="P")), \
          mock.patch.object(core, "call_azure_api", side_effect=Exception("boom")):
         assert core.apply_close(42, "Closed") is False
+
+
+def test_a_duplicate_key_keeps_the_lowest_id_and_warns(caplog):
+    """Two live work items for one (kind, library). The winner must be deterministic across
+    runs, and the loser must never be closed -- we cannot tell which is canonical."""
+    title = "log4j-core: 3 vulnerabilities (highest severity is 9.8)"
+    core.exist_wis = [_wi(title, 77, TAGS), {title + " ": {42: {"tags": TAGS, "state": "New"}}}]
+    with caplog.at_level("WARNING"):
+        actual = core.actual_work_items("ProductX/api")
+    assert actual[("vulnerability", "log4j-core")]["id"] == 42
+    assert "77" in caplog.text and "42" in caplog.text
+
+
+PROJECT = {"uuid": "p-1", "name": "api", "application_name": "ProductX"}
+
+
+def _conf():
+    return mock.patch.object(core, "conf", mock.MagicMock(azure_project="P",
+                                                          closed_state="Closed",
+                                                          reopen_state="New"))
+
+
+def test_an_incomplete_read_skips_closures():
+    """Closure safety. A truncated read looks exactly like a project whose findings were all
+    remediated -- so on ok=False nothing may be closed."""
+    closes = []
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired", return_value=({}, False)), \
+         mock.patch.object(core, "actual_work_items",
+                           return_value={("vulnerability", "log4j-core"): {"id": 42,
+                                                                           "state": "Active"}}), \
+         mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
+        stats = core.reconcile_project(PROJECT, 7.0)
+    assert closes == [], "an incomplete read must never close a work item"
+    assert stats[2] == 0
+
+
+def test_an_incomplete_read_still_reopens():
+    """A reopen cannot destroy anything, so the interlock does not gate it."""
+    reopens = []
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired",
+                           return_value=({("vulnerability", "log4j-core"): {}}, False)), \
+         mock.patch.object(core, "actual_work_items",
+                           return_value={("vulnerability", "log4j-core"): {"id": 42,
+                                                                           "state": "Closed"}}), \
+         mock.patch.object(core, "apply_reopen", lambda *a: reopens.append(a) or True):
+        stats = core.reconcile_project(PROJECT, 7.0)
+    assert reopens == [(42, "New")]
+    assert stats[3] == 1
+
+
+def test_a_complete_read_does_close():
+    closes = []
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired", return_value=({}, True)), \
+         mock.patch.object(core, "actual_work_items",
+                           return_value={("vulnerability", "log4j-core"): {"id": 42,
+                                                                           "state": "Active"}}), \
+         mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
+        stats = core.reconcile_project(PROJECT, 7.0)
+    assert closes == [(42, "Closed")]
+    assert stats[2] == 1
+
+
+def test_an_already_closed_item_produces_no_api_call_at_all():
+    """The anti-oscillation rule: not a redundant close, NO call."""
+    calls = []
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired", return_value=({}, True)), \
+         mock.patch.object(core, "actual_work_items",
+                           return_value={("vulnerability", "log4j-core"): {"id": 42,
+                                                                           "state": "Closed"}}), \
+         mock.patch.object(core, "apply_close", lambda *a: calls.append(a) or True), \
+         mock.patch.object(core, "apply_reopen", lambda *a: calls.append(a) or True):
+        stats = core.reconcile_project(PROJECT, 7.0)
+    assert calls == []
+    assert stats[4] == 1
+
+
+def test_creates_and_updates_are_counted_but_never_executed():
+    """CREATE/UPDATE stay on the 1.4 create_wi path; this function must not call Azure for
+    them."""
+    calls = []
+    desired = {("vulnerability", "log4j-core"): {}, ("license", "jackson"): {}}
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired", return_value=(desired, True)), \
+         mock.patch.object(core, "actual_work_items",
+                           return_value={("vulnerability", "log4j-core"): {"id": 42,
+                                                                           "state": "Active"}}), \
+         mock.patch.object(core, "call_azure_api", lambda *a, **k: calls.append(a) or ({}, 0)), \
+         mock.patch.object(core, "create_wi", lambda *a, **k: calls.append(a)):
+        created, updated, closed, reopened, skipped = core.reconcile_project(PROJECT, 7.0)
+    assert calls == []
+    assert (created, updated, closed, reopened, skipped) == (1, 1, 0, 0, 0)
+
+
+def test_azure_is_read_before_mend():
+    """exist_wis entries written after a POST/PATCH carry state "" -- the cache must be read
+    while it still reflects Azure's pre-run state."""
+    order = []
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired",
+                           side_effect=lambda *a: order.append("mend") or ({}, True)), \
+         mock.patch.object(core, "actual_work_items",
+                           side_effect=lambda *a: order.append("azure") or {}):
+        core.reconcile_project(PROJECT, 7.0)
+    assert order == ["azure", "mend"]
+
+
+def test_a_failed_close_is_not_counted_as_closed():
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired", return_value=({}, True)), \
+         mock.patch.object(core, "actual_work_items",
+                           return_value={("vulnerability", "log4j-core"): {"id": 42,
+                                                                           "state": "Active"}}), \
+         mock.patch.object(core, "apply_close", lambda *a: False):
+        assert core.reconcile_project(PROJECT, 7.0)[2] == 0
