@@ -117,6 +117,9 @@ def check_patterns():
         res.append("MEND_AZUREPAT")
     if not conf.ws_url:
         res.append("MEND_URL")
+    if not conf.email.strip():
+        res.append("MEND_EMAIL (the email of the Mend user whose MEND_USERKEY is configured) "
+                   "is required for Mend API 3.0 authentication")
     if not conf.azure_uri:
         res.append("MEND_AZUREURI")
     if conf.azure_custom and "::" not in conf.azure_custom:

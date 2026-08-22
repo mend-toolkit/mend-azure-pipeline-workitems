@@ -39,7 +39,7 @@ def _valid_conf(**overrides):
                   azure_custom="", dependency="true", reponame="", description="ReproSteps",
                   priority="false", proxy="", routing="false",
                   branches="main,master", reachability="false",
-                  email="", org_uuid="", severity="high",
+                  email="qa@example.com", org_uuid="", severity="high",
                   closed_state="Closed", reopen_state="New")
     fields.update(overrides)
     return Config(**fields)
@@ -74,6 +74,24 @@ def test_check_patterns_rejects_a_slash_in_azure_project():
 def test_check_patterns_accepts_an_azure_project_without_a_slash():
     with mock.patch.object(core, "conf", _valid_conf(azure_project="Platform")):
         assert not any("AZUREPROJECT" in el for el in core.check_patterns())
+
+
+def test_check_patterns_rejects_a_missing_mend_email():
+    """MEND_EMAIL is required for the Mend 2.0 login that authenticates 3.0 calls. It did not
+    exist in the previous release, so forgetting it on upgrade is the likely mistake -- and
+    without this check the failure surfaces deep in the 2.0 login with no helpful message."""
+    with mock.patch.object(core, "conf", _valid_conf(email="")):
+        assert any("MEND_EMAIL" in el for el in core.check_patterns())
+
+
+def test_check_patterns_rejects_a_whitespace_only_mend_email():
+    with mock.patch.object(core, "conf", _valid_conf(email="   ")):
+        assert any("MEND_EMAIL" in el for el in core.check_patterns())
+
+
+def test_check_patterns_accepts_a_present_mend_email():
+    with mock.patch.object(core, "conf", _valid_conf(email="user@example.com")):
+        assert not any("MEND_EMAIL" in el for el in core.check_patterns())
 
 
 def test_routing_no_longer_requires_mend_email():
