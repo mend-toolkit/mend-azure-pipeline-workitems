@@ -281,6 +281,25 @@ def _parents(findings: list) -> list:
     return parents
 
 
+def _reference_url(vuln: dict) -> str:
+    """The CVE link shown in the work item.
+
+    VulnerabilityReferenceDTO carries {value, source, url, signature, advisory, patch}, and the
+    list is MIXED -- references[0] is as likely to be a patch commit or a signature as it is the
+    advisory. Taking it positionally put patch links in the "URL" column where an operator
+    expects the advisory. So: the first reference flagged advisory=true wins, and only if none
+    is flagged does the first non-empty url stand in.
+    """
+    refs = vuln.get("references")
+    if not isinstance(refs, list):
+        return ""
+    candidates = [r for r in refs if isinstance(r, dict) and r.get("url")]
+    for ref in candidates:
+        if ref.get("advisory") is True:
+            return ref["url"]
+    return candidates[0]["url"] if candidates else ""
+
+
 def _vulnerability_row(finding: dict) -> dict:
     """One finding -> the flat vulnerability row the CVE table renders.
 
@@ -295,8 +314,6 @@ def _vulnerability_row(finding: dict) -> dict:
     vuln = vuln if isinstance(vuln, dict) else {}
     top_fix = finding.get("topFix")
     top_fix = top_fix if isinstance(top_fix, dict) else {}
-    refs = vuln.get("references")
-    first_ref = refs[0] if isinstance(refs, list) and refs and isinstance(refs[0], dict) else {}
 
     shim = {
         "reachability": finding.get("reachability"),
@@ -309,12 +326,13 @@ def _vulnerability_row(finding: dict) -> dict:
         "score": raw_score if raw_score is not None and raw_score != "" else "",
         "severity": vuln.get("severity") or "",
         "description": vuln.get("description") or "",
-        "url": first_ref.get("url") or "",
+        "url": _reference_url(vuln),
         "epss": format_epss(shim),
         "maturity": format_exploit(shim),
         "reachability": format_reachability(shim),
         "fix_resolution": top_fix.get("fixResolution") or "",
         "fix_type": top_fix.get("type") or "",
+        "fix_date": top_fix.get("date") or "",
         "fix_url": top_fix.get("url") or "",
         "publish_date": vuln.get("publishDate") or "",
     }
@@ -388,3 +406,40 @@ def render_inputs(entry: dict) -> dict:
     result["parents"] = _parents(findings)
     result["vulnerabilities"] = _vulnerabilities(findings)
     return result
+
+
+def library_url(entry: dict) -> str:
+    """The library's page in Mend, written onto the work item as its Hyperlink relation.
+
+    ComponentReferencesDTO.url is the library page; homePage is the upstream project's own site.
+    The first is what an operator wants one click away, so homePage is only a fallback. Returns
+    "" for a license entry (violations carry no component) or anything malformed -- the caller
+    writes no relation at all rather than an empty one.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    for finding in entry.get("findings") or []:
+        references = _walk(finding, "component", "references")
+        if isinstance(references, dict):
+            url = references.get("url") or references.get("homePage")
+            if url:
+                return url
+    return ""
+
+
+def license_policy_name(entry: dict) -> str:
+    """The policy that a license violation breached, for the "License Policy Violation - " line.
+
+    ProjectViolationDTOV3.name is prefixed with a bracketed tag exactly as the 1.4 policy name
+    was (e.g. "[Legal] No GPL"), and the 1.4 path stripped everything up to and including the
+    first "]" -- kept identical so the rendered line does not change shape.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    for violation in entry.get("findings") or []:
+        if not isinstance(violation, dict):
+            continue
+        name = violation.get("name") or ""
+        if name:
+            return name[name.find("]") + 1:].strip()
+    return ""

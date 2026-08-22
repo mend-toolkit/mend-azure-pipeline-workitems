@@ -17,8 +17,9 @@ from identity import license_title, matches_library
 from reconcile import CLOSE, CREATE, REOPEN, SKIP, UPDATE, plan_actions
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
-from source3 import (normalise_findings, normalise_licenses, normalise_projects,
-                     normalise_violations, select_projects, severity_floor)
+from source3 import (library_url, license_policy_name, normalise_findings, normalise_licenses,
+                     normalise_projects, normalise_violations, render_inputs, select_projects,
+                     severity_floor)
 from syncstate import (TAG_FAILED, TAG_LASTRUN, VERDICT_FAILED,
                        VERDICT_OK, build_selection, failed_stamp, is_stale,
                        count_parseable_rows, field_for, parse_tag_map,
@@ -2050,6 +2051,322 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         return (VERDICT_FAILED if item_failed else VERDICT_OK), message
     except Exception as err:
         return VERDICT_FAILED, f"[{ex()}] Work item creation failed: {err}"
+
+
+
+def build_enrich_html_v3(row: dict, reachability_on: bool) -> str:
+    """The enrichment lines spliced into a 3.0 CVE section.
+
+    ASYMMETRY, DELIBERATE. EPSS and Exploit Code Maturity render UNCONDITIONALLY here: the
+    MEND_EPSS gate existed because 1.4 had to pay an extra getProjectAlertsByType call per
+    project to learn them, so an org that did not want the columns should not pay for them. On
+    3.0 both values arrive inline with the finding at no cost, so gating them only buys an
+    operator a missing column.
+
+    MEND_REACHABILITY stays a gate. Reachability is blank for an org that has not enabled
+    reachability analysis, and the toggle spares them a column of dashes.
+    """
+    html = ""
+    if reachability_on:
+        html += f"<br><b>Reachability:</b> {row.get('reachability', '')}"
+    html += f"<br><b>EPSS:</b> {row.get('epss', '')}" \
+            f"<br><b>Exploit Code Maturity:</b> {row.get('maturity', '')}"
+    return html
+
+
+def build_license_html_v3(licenses: list, policy_name: str) -> str:
+    """The <details> License Details block, same shape the 1.4 path renders it in.
+
+    `licenses` is the list Task 2 attaches to every entry ({"name", "url", "reference_file"}).
+    """
+    lic_data = ""
+    for lic_ in licenses or []:
+        ref_ = lic_.get("reference_file", "") if isinstance(lic_, dict) else ""
+        name_ = lic_.get("name", "") if isinstance(lic_, dict) else ""
+        url_ = lic_.get("url", "") if isinstance(lic_, dict) else ""
+        lic_data = lic_data + f"<a href='{url_}'>{name_}</a>" + \
+            f"<br><b>License Reference File: </b><a href='{ref_}'>{ref_}</a><br>" \
+            f"<b>License Policy Violation - </b>{policy_name}<br>"
+    return generate_expandable_section("<b>License Details</b>", lic_data)
+
+
+def max_score_v3(rows: list) -> str:
+    """The highest CVSS score across a library's findings, as it appears in the title.
+
+    Returned as the RAW value, not a reformatted float: the title is the match key's carrier and
+    "9.8" must not become "9.80". "" when nothing is scored -- identity.matches_library tolerates
+    an empty score group precisely for this case.
+    """
+    best, best_val = "", None
+    for row in rows or []:
+        raw = row.get("score", "")
+        value = try_or_error(lambda raw=raw: float(raw), None)
+        if value is None:
+            continue
+        if best_val is None or value > best_val:
+            best, best_val = raw, value
+    return best
+
+
+def vuln_section_v3(row: dict, inputs: dict, reachability_on: bool) -> str:
+    """One CVE's <details> body, mirroring the 1.4 per-CVE section field for field."""
+    return "<b>Vulnerable Library:</b>" + inputs["library"] + \
+        "<br><b>Path to dependency file: </b>" + inputs["dependency_file"] + \
+        "<br><b>Path to library:</b>" + inputs["library_path"] + \
+        "<br><b>Vulnerability Details:</b> " + row.get("description", "") + \
+        "<br><b>Publish Date:</b> " + row.get("publish_date", "") + \
+        f"<br><b>URL:</b> <a href='{row.get('url', '')}'>{row.get('name', '')}</a>" + \
+        "<br><b>CVSS 3 Score Details </b>(" + str(row.get("score", "")) + ")" + \
+        build_enrich_html_v3(row, reachability_on) + \
+        "<br><b>Suggested Fix:</b> " + row.get("fix_type", "") + \
+        f"<br><b>Origin:</b> <a href='{row.get('fix_url', '')}'></a><br>" \
+        f"<b>Release Date:</b> " + row.get("fix_date", "") + \
+        "<br><b>Fix Resolution:</b> " + row.get("fix_resolution", "")
+
+
+def library_block_v3(inputs: dict, with_hierarchy: bool) -> str:
+    """The library header block both MEND_DEPENDENCY branches open their description with."""
+    block = "<b>Library - </b>" + inputs["library"] + \
+        "<br>" + inputs["description"] + \
+        "<br><b>Path to dependency file: </b>" + inputs["dependency_file"] + \
+        "<br><b>Path to library:</b>" + inputs["library_path"] + \
+        "<br><b>Vulnerable Library: </b>" + inputs["library"]
+    if with_hierarchy:
+        block += "<br><b>Dependency Hierarchy: </b><br>" + \
+                 generate_html_bulleted_list(items=inputs["parents"])
+    home = inputs["home_page"]
+    return block + f"<br><b> Library home page: </b><a href='{home}'>{home}</a>"
+
+
+def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool) -> list:
+    """One `desired` entry -> the work items it should produce, as
+    [{"title", "desc", "score", "exact"}, ...].
+
+    Rendering is split out of create_wi_v3 so the HTML and, far more importantly, the TITLES can
+    be tested without an Azure DevOps double.
+
+    TITLES ARE A CONTRACT, not cosmetics. Every title here must round-trip through
+    classify_title back to the (kind, library) key it was built for, because Plan 4's closure
+    reads Azure by title and closes on the key it decodes. A title that does not round-trip
+    either strands a work item open forever or closes somebody else's.
+
+    "exact" says how the item is matched against what Azure already holds: a dependency-mode
+    vulnerability title carries a finding count and a max score, both of which move on every
+    rescore, so it matches on the library name alone (identity.matches_library). Licences and
+    per-CVE titles have no moving parts and match exactly. Same rule as the 1.4 path.
+    """
+    inputs = render_inputs(entry)
+    rows = inputs["vulnerabilities"]
+    licenses = entry.get("licenses") or [] if isinstance(entry, dict) else []
+
+    if kind == "license":
+        desc = library_block_v3(inputs, with_hierarchy=False) + \
+            build_license_html_v3(licenses, license_policy_name(entry))
+        return [{"title": license_title(library), "desc": desc, "score": "", "exact": True}]
+
+    if conf.dependency.lower() == "true":
+        if not rows:
+            return []
+        table_data = []
+        sections = ""
+        for row in rows:
+            # URL must stay the LAST key written: create_html_table renders the first column as
+            # a link to row["URL"] and drops the final cell by position, so any key after URL
+            # vanishes from the table.
+            table_row = {
+                "CVE": row.get("name", ""),
+                "Severity": row.get("severity", ""),
+                "CVSS": row.get("score", ""),
+                "EPSS": row.get("epss", ""),
+                "Exploit": row.get("maturity", ""),
+                "Dependency": inputs["library"],
+                "Type": inputs["dependency_type"],
+                "Fixed in": row.get("fix_resolution", ""),
+            }
+            if reachability_on:
+                table_row["Reachability"] = row.get("reachability", "")
+            table_row["URL"] = row.get("url", "")
+            table_data.append(table_row)
+            sections += generate_expandable_section(row.get("name", ""),
+                                                    vuln_section_v3(row, inputs, reachability_on))
+        # len(entry["findings"]) rather than len(rows): the count in the title is the number of
+        # findings the entry holds, and the two are one-to-one by construction (_vulnerabilities
+        # emits exactly one row per finding).
+        count = len(entry.get("findings") or []) if isinstance(entry, dict) else len(rows)
+        max_severity = max_score_v3(rows)
+        title = f"{library}: {count} vulnerabilities (highest severity is {max_severity})"
+        desc = generate_expandable_section(f"Vulnerable library - {library}",
+                                           library_block_v3(inputs, with_hierarchy=True)) + \
+            "<br>" + create_html_table(data=table_data) + "<b>Details:</b><br>" + sections
+        return [{"title": title, "desc": desc, "score": max_severity, "exact": False}]
+
+    items = []
+    for row in rows:
+        vul_name = row.get("name", "")
+        if not vul_name:
+            continue
+        severity = str(row.get("severity", "")).capitalize()
+        desc = library_block_v3(inputs, with_hierarchy=True) + \
+            vuln_section_v3(row, inputs, reachability_on)
+        items.append({"title": f"{vul_name} ({severity}) detected in {library}",
+                      "desc": desc, "score": row.get("score", ""), "exact": True})
+    return items
+
+
+def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: str,
+                project_name: str):
+    """Create or update ONE work item from a rendered 3.0 item. Returns "created", "updated"
+    or "failed".
+
+    Matching, the wrong-type DELETE-and-recreate, and the exist_wis cache refresh are all
+    identical to create_wi's -- the 1.4 and 3.0 paths must agree on which work item a title
+    identifies, or the changeover in Task 4 orphans every item the 1.4 path created.
+    """
+    global global_errors, exist_wis, updated_wi
+    title = item["title"]
+    if item["exact"]:
+        exist_id = check_wi_id(id=title, project_name=project_name)
+    else:
+        exist_id = check_wi_id_matching(lambda t: matches_library(t, item["library"]),
+                                        project_name=project_name)
+    wi_data, err_ = {}, 2
+    if exist_id > 0:
+        wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
+                                       data={}, project=conf.azure_project)
+    wi_type_ = try_or_error(lambda: wi_data["fields"]["System.WorkItemType"], "")
+    if exist_id == 0:
+        azure_operation = "add"
+    # err_ == 0 is required: a transiently-failed (e.g. throttled) GET must not be read as
+    # "wrong type" and trigger a DELETE of a work item that is perfectly fine.
+    elif err_ == 0 and wi_type_.lower() != wi_type.lower():
+        call_azure_api(api_type="DELETE", api=f"wit//workitems/{exist_id}",
+                       data={}, project=conf.azure_project)
+        azure_operation = "add"
+    else:
+        azure_operation = "replace"
+
+    if exist_id > 0 and exist_id in updated_wi:
+        # Two Mend projects routed to one Azure project can both hold the same library. The
+        # second write would overwrite the first with its own project's content; skip it and
+        # say so rather than letting the work item flip contents run to run.
+        logger.warning(f"[{fn()}] Work item {exist_id} ('{title}') was already written this "
+                       f"run; skipping the duplicate write for {project_name}.")
+        return "skipped"
+
+    data = [
+        {"op": azure_operation, "path": "/fields/System.Title", "value": title},
+        {"op": azure_operation, "path": "/fields/Microsoft.VSTS.Common.Priority",
+         "value": item["priority"]},
+        {"op": azure_operation, "path": "/fields/System.Tags", "value": ",".join(tags)},
+    ]
+    if conf.description == "Description":
+        desc_field = "/fields/System.Description"
+    elif conf.description == "ReproSteps":
+        desc_field = "/fields/Microsoft.VSTS.TCM.ReproSteps"
+    elif conf.description:
+        desc_field = get_field_ref(conf.description, cstm_flds)
+    else:
+        desc_field = ""
+    if desc_field:
+        data.append({"op": azure_operation, "path": desc_field, "value": item["desc"]})
+
+    for custom_ in cstm_flds:
+        fld_name, fld_val = analyze_fields(custom_, item["source"])
+        if fld_val and not any(fld_name in el_["path"] for el_ in data):
+            data.append({"op": "add", "path": f"/fields/{fld_name}", "value": fld_val})
+        elif not fld_val and "Custom." in fld_name:
+            data.append({"op": "remove", "path": f"/fields/{fld_name}"})
+
+    if conf.azure_area:
+        create_area(conf.azure_area)
+        data.append({"op": azure_operation, "path": "/fields/System.AreaPath",
+                     "value": f"{conf.azure_area}"})
+
+    try:
+        if azure_operation == "add":
+            if lib_url:
+                # The operator's one click from the work item to the library in Mend.
+                # Deliberately NO attributes.comment -- that carried "{projectToken},{issueUuid}"
+                # for the reverse sync, which no longer exists and nothing reads.
+                data.append({"op": "add", "path": "/relations/-",
+                             "value": {"rel": "Hyperlink", "url": lib_url}})
+            r, errcode = call_azure_api(api_type="POST", api=f"wit/workitems/${wi_type}",
+                                        data=data, project=conf.azure_project)
+            status_op = "created"
+        else:
+            r, errcode = call_azure_api(api_type="PATCH", api=f"wit/workitems/{exist_id}",
+                                        data=data, project=conf.azure_project)
+            status_op = "updated"
+        if errcode == 0:
+            claimed_id = exist_id if exist_id > 0 else try_or_error(lambda: r["id"], 0)
+            if claimed_id:
+                # A PATCH can rename the item, and exist_wis is read again later this same run,
+                # so the stale entry is replaced rather than left cached under its old title.
+                for d in list(exist_wis):
+                    if claimed_id in try_or_error(lambda d=d: list(d.values())[0], {}):
+                        exist_wis.remove(d)
+                exist_wis.append({title: {claimed_id: {
+                    "tags": ",".join(tags),
+                    "state": try_or_error(lambda: r["fields"]["System.State"], "")}}})
+                updated_wi.append(claimed_id)
+            logger.info(f"{conf.azure_type} {try_or_error(lambda: r['id'], claimed_id)} {status_op}")
+            return status_op
+        if errcode == 1:
+            logger.warning(f"{conf.azure_type} creation/update failed: "
+                           f"{try_or_error(lambda: r['message'], r)}")
+        else:
+            logger.error(f"[{fn()}] {try_or_error(lambda: r.pop(), r)}")
+        return "failed"
+    except Exception as err:
+        logger.error(f"[{ex()}] Work item creation/update failed: {err}")
+        global_errors += 1
+        return "failed"
+
+
+def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
+    """Create and update Azure work items from one project's 3.0 `desired` state.
+
+    Returns (created, updated, failed). The 3.0 twin of create_wi: it renders the SAME work
+    items from 3.0 findings instead of 1.4 policy issues, reusing the same renderers, the same
+    matching and the same tags, so a backlog created by the 1.4 path is picked up rather than
+    duplicated when Task 4 changes the wiring.
+
+    NO CALLERS until Task 4 -- this ships alongside create_wi, which is still the live path.
+    """
+    global conf
+    conf = startup() if not conf else conf
+    project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
+    reachability_on = reachability_enabled()
+    created = updated = failed = 0
+    for (kind, library), entry in (desired or {}).items():
+        try:
+            tags = build_wi_tags(
+                project_name,
+                Tags.get_el_by_name("LICENSE" if kind == "license" else "VULNERABILITY_SCORE"),
+                conf.routing, conf.reponame)
+            lib_url = library_url(entry)
+            for item in render_entry_v3(kind, library, entry, reachability_on):
+                if not item["desc"]:
+                    continue
+                item["library"] = library
+                item["source"] = entry
+                item["priority"] = set_priority(
+                    try_or_error(lambda item=item: float(item["score"]), 6)) \
+                    if conf.priority.lower() == "true" else DEFAULT_PRIORITY
+                outcome = write_wi_v3(item, tags, lib_url, cstm_flds, wi_type, project_name)
+                if outcome == "created":
+                    created += 1
+                elif outcome == "updated":
+                    updated += 1
+                elif outcome == "failed":
+                    failed += 1
+        except Exception as err:
+            failed += 1
+            logger.error(f"[{ex()}] Work item creation failed for "
+                         f"{kind} '{library}' in {project_name}: {err}")
+    logger.info(f"[{fn()}] {project_name}: {created} work item(s) created, {updated} updated, "
+                f"{failed} failed.")
+    return created, updated, failed
 
 
 def list_azure_projects():
