@@ -110,6 +110,16 @@ The following variables can be placed into the pipeline where the integration is
 | `MEND_MAXLOOKBACK`       | integer |    No    | `720` | Maximum hours to look back for any single Mend project when its stored sync state is missing or stale. Bounds the cost of a project that keeps failing. Set higher if repos may go unscanned for longer than 30 days. |
 
 >**_NOTE_**: `azure-wi-sync` would accept all environment variables with either `MEND_` or `WS_` prefix. For the Azure DevOps settings (`*AZUREURI`, `*AZUREPAT`, `*AZUREPROJECT`, `*AZUREAREA`, `*AZURETYPE`), if both prefixes are set for the same setting, the `WS_` variable wins.
+
+> **Changed:** work item titles are now keyed on the library name alone (and, with
+> `MEND_DEPENDENCY: false`, on the CVE and library). Previously they embedded the vulnerability
+> count and the highest severity score, which meant suppressing or rescoring a single
+> vulnerability renamed the work item — the tool then failed to recognise it, created a
+> duplicate and left the original open.
+>
+> On your first run after upgrading, existing work items are matched by their old title and
+> **renamed in place**. Their ids, comments, assignees, links and history are preserved. No
+> action is required.
 <br />
 
 ## Enrichment: Reachability, EPSS and Exploit Code Maturity
