@@ -62,6 +62,14 @@ def meets_threshold(score, floor: float) -> bool:
 # This single field is why v3 can close work items and 1.4 never could: 1.4 published no status,
 # so closure there had to be inferred from a finding's ABSENCE, and absence is indistinguishable
 # from a failed read.
+#
+# findingInfo.status is marked "deprecated": true in the 3.0 spec (title: "Deprecated Finding
+# Status") -- confirmed by inspecting references/3.0 (2).json directly. It is used anyway because
+# it is the ONLY field that expresses LIBRARY_REMOVED, which is what makes closure possible at
+# all. The non-deprecated replacement, findingInfo.findingStatus, is NOT a drop-in: its enum is
+# UNREVIEWED | IN_REVIEW | SUPPRESSED | ISSUE_CREATED | REMEDIATED -- a review-workflow state, not
+# a library-presence state -- and has no value that means "the library is gone". Do not switch to
+# it without first confirming, live, how a removed library is represented there (if at all).
 OPEN_STATUS = "ACTIVE"
 
 
@@ -151,7 +159,9 @@ def normalise_projects(rows):
         for tag in row.get("tags") or []:
             if not isinstance(tag, dict):
                 continue
-            key = tag.get("name")
+            # EntityTagDTO (spec) has exactly two properties: key and value -- there is no
+            # "name". `name` is accepted second only for tolerance; `key` is authoritative.
+            key = tag.get("key") or tag.get("name")
             if not key:
                 continue
             tags.setdefault(key, []).append(tag.get("value"))

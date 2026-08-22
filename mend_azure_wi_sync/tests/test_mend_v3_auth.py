@@ -95,6 +95,62 @@ def test_login_posts_to_the_api_host_not_the_sca_host():
     assert seen["url"] == "https://api-saas.mend.io/api/v2.0/login"
 
 
+def test_v3_call_with_method_post_goes_through_post_not_get():
+    """/projects/summaries is POST-only in the 3.0 spec; a GET-only transport would 404/405."""
+    _reset()
+    seen = {}
+
+    def fake_post(url, token, body, params):
+        seen["url"] = url
+        seen["body"] = body
+        seen["params"] = params
+        return {"response": []}, 0
+
+    def fail_get(*a, **k):
+        raise AssertionError("GET must not be used for a POST-only endpoint")
+
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "mend_v2_token", return_value="jwt-1"), \
+         mock.patch.object(core, "_post_v3", fake_post), \
+         mock.patch.object(core, "_get_v2", fail_get):
+        payload, errorcode = core.call_ws_api_v3("orgs/o-1/projects/summaries",
+                                                 params={"limit": 1000}, method="POST")
+    assert errorcode == 0
+    assert seen["url"] == "https://api-saas.mend.io/api/v3.0/orgs/o-1/projects/summaries"
+    assert seen["params"] == {"limit": 1000}
+
+
+def test_v3_call_defaults_to_get_so_existing_callers_are_unchanged():
+    _reset()
+
+    def fail_post(*a, **k):
+        raise AssertionError("GET callers must not be routed through POST")
+
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "mend_v2_token", return_value="jwt-1"), \
+         mock.patch.object(core, "_get_v2", return_value=({"response": []}, 0)), \
+         mock.patch.object(core, "_post_v3", fail_post):
+        payload, errorcode = core.call_ws_api_v3("orgs/o-1/projects")
+    assert errorcode == 0
+
+
+def test_a_401_on_a_post_call_re_mints_the_token_once_and_retries():
+    _reset()
+    calls = []
+
+    def fake_post(url, token, body, params):
+        calls.append(token)
+        return ({}, 401) if len(calls) == 1 else ({"response": []}, 0)
+
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "_post_v2_login",
+                           return_value=({"retVal": {"jwtToken": "jwt-2"}}, 0)), \
+         mock.patch.object(core, "_post_v3", fake_post):
+        payload, errorcode = core.call_ws_api_v3("orgs/o-1/projects/summaries", method="POST")
+    assert errorcode == 0
+    assert len(calls) == 2
+
+
 def test_a_persistent_failure_reports_errorcode_2():
     """Callers check for 2; a raw HTTP status leaking through would read as success."""
     _reset()

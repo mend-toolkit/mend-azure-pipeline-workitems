@@ -18,6 +18,20 @@ def test_projects_are_fetched_and_normalised():
     assert projects[0]["uuid"] == "p-1"
 
 
+def test_projects_are_fetched_with_method_post():
+    """/projects/summaries is POST-only in the 3.0 spec; a GET-only transport 404s/405s."""
+    captured = {}
+
+    def fake_pages(api, params=None, limit=1000, method="GET"):
+        captured["method"] = method
+        return [], True
+
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "fetch_v3_pages", fake_pages):
+        core.fetch_v3_projects()
+    assert captured["method"] == "POST"
+
+
 def test_a_failed_project_fetch_reports_not_ok():
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "fetch_v3_pages", return_value=([], False)):
@@ -76,6 +90,21 @@ def test_a_failed_violations_read_also_makes_it_not_ok():
          mock.patch.object(core, "fetch_v3_pages", fake_pages):
         _, ok = core.fetch_v3_desired("p-1", 7.0)
     assert ok is False
+
+
+def test_desired_reads_stay_get_not_post():
+    """findings/security and violations are both GET-only in the spec; only
+    /projects/summaries is POST. Guards against the POST fix leaking onto these calls."""
+    methods = []
+
+    def fake_pages(api, params=None, limit=1000, method="GET"):
+        methods.append(method)
+        return ([_finding()], True) if "findings/security" in api else ([_violation()], True)
+
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core, "fetch_v3_pages", fake_pages):
+        core.fetch_v3_desired("p-1", 7.0)
+    assert methods == ["GET", "GET"]
 
 
 def test_an_empty_project_is_ok_with_an_empty_desired():

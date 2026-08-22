@@ -800,6 +800,33 @@ def _get_v2(url: str, token: str, params: dict):
         return {f"[{ex()}] Mend 2.0 call failed": f"{err}"}, 2
 
 
+def _post_v3(url: str, token: str, body: dict, params: dict):
+    # Mirrors _get_v2's contract exactly (same InsecureRequestWarning one-shot suppression,
+    # verify=False, proxies=conf.proxy, (payload, errorcode) return) -- the only difference is
+    # the HTTP verb and that the payload travels as a JSON body instead of query params. This
+    # exists because /projects/summaries is POST-only in the 3.0 spec while every other 3.0
+    # endpoint in use is GET.
+    global WARNING_MSG
+    try:
+        with warnings.catch_warnings(record=True) as warning_list:
+            warnings.simplefilter("always", InsecureRequestWarning)
+            res_ = requests.post(url, params=params or {}, json=body or {}, verify=False,
+                                 proxies=conf.proxy,
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
+        if not WARNING_MSG:
+            for warning in warning_list:
+                if issubclass(warning.category, InsecureRequestWarning):
+                    index_of_see = str(warning.message).find("See:")
+                    logger.warning(str(warning.message)[:index_of_see].strip())
+                    WARNING_MSG = True
+        if res_.status_code == 200:
+            return json.loads(res_.text), 0
+        return try_or_error(lambda: json.loads(res_.text), {}), res_.status_code
+    except Exception as err:
+        return {f"[{ex()}] Mend 3.0 call failed": f"{err}"}, 2
+
+
 def call_ws_api_v2(api: str, params: dict = None):
     # Returns (payload, errorcode) with the same convention as call_azure_api:
     # 0 = success, non-zero = failure. One re-login covers a JWT that expired mid-run.
@@ -818,16 +845,26 @@ def call_ws_api_v2(api: str, params: dict = None):
     return payload, errorcode
 
 
-def call_ws_api_v3(api: str, params: dict = None):
+def call_ws_api_v3(api: str, params: dict = None, method: str = "GET", body: dict = None):
     # Same (payload, errorcode) convention as call_ws_api_v2. Mend 3.0 accepts the JWT
     # minted by the 2.0 login, so there is deliberately no separate 3.0 login path — but
     # 3.0 lives on the same API host as 2.0, not on the 1.4 SCA app host.
+    #
+    # method exists because the spec declares /projects/summaries as POST-only while every
+    # other 3.0 endpoint in use is GET; cursor/limit still travel as query params either way
+    # (the spec puts them `in: query` even on the POST), only the transport verb changes.
     global mend_v2_session
     url = f"{extract_url(conf.api_url)}/api/v3.0/{api}"
-    payload, errorcode = _get_v2(url, mend_v2_token(), params)
-    if errorcode in (401, 403):
-        mend_v2_session = None
+    if method == "POST":
+        payload, errorcode = _post_v3(url, mend_v2_token(), body or {}, params)
+        if errorcode in (401, 403):
+            mend_v2_session = None
+            payload, errorcode = _post_v3(url, mend_v2_token(), body or {}, params)
+    else:
         payload, errorcode = _get_v2(url, mend_v2_token(), params)
+        if errorcode in (401, 403):
+            mend_v2_session = None
+            payload, errorcode = _get_v2(url, mend_v2_token(), params)
     if errorcode != 0:
         logger.error(f"[{fn()}] Mend 3.0 call to '{api}' failed: {payload}")
         errorcode = 2
@@ -864,7 +901,7 @@ def _v3_total_items_ok(api: str, items: list, payload: dict) -> bool:
     return True
 
 
-def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000):
+def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000, method: str = "GET"):
     """Walk every cursor page of a 3.0 collection endpoint.
 
     Returns (items, ok). `ok` is False if ANY page failed, was malformed, the page cap was hit, a
@@ -873,6 +910,10 @@ def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000):
     treat ok=False as "I know nothing about this project" rather than as a shorter list. Returning
     the partial items alongside ok=False is deliberate: they are useful for creating and updating,
     which cannot do harm, while closure must be skipped entirely.
+
+    method defaults to GET, unchanged for the two existing GET callers (findings/security,
+    violations). Pass method="POST" for an endpoint like /projects/summaries that the spec
+    declares POST-only; cursor/limit still ride as query params on the POST, per spec.
     """
     items = []
     cursor = None
@@ -882,7 +923,10 @@ def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000):
         page_params["limit"] = limit
         if cursor is not None:
             page_params["cursor"] = cursor
-        payload, errorcode = call_ws_api_v3(api, page_params)
+        if method == "POST":
+            payload, errorcode = call_ws_api_v3(api, page_params, method="POST", body={})
+        else:
+            payload, errorcode = call_ws_api_v3(api, page_params)
         if errorcode != 0:
             return items, False
         rows = try_or_error(lambda: payload["response"], None)
@@ -2347,7 +2391,10 @@ def fetch_v3_projects():
     Replaces getAllProjects, getOrganizationProjectVitals, getOrganizationProjectTags and
     get_prj_list_modified -- all four collapse into this.
     """
-    rows, ok = fetch_v3_pages(f"orgs/{org_uuid()}/projects/summaries")
+    # The spec declares this endpoint POST-only (getProjectSummaries) -- confirmed against
+    # references/3.0 (2).json, which lists only "post" under this path. Every other 3.0 endpoint
+    # in use is GET; this is the one exception.
+    rows, ok = fetch_v3_pages(f"orgs/{org_uuid()}/projects/summaries", method="POST")
     if not ok:
         logger.error(f"[{fn()}] Could not read Mend projects for org {org_uuid()}. "
                      f"Nothing is synced this run -- acting on a partial project list could "

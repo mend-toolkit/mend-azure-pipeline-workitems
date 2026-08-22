@@ -165,6 +165,47 @@ def test_total_items_as_a_matching_string_stays_ok():
     assert len(items) == 2
 
 
+def test_method_post_is_threaded_through_to_call_ws_api_v3():
+    """/projects/summaries is POST-only; fetch_v3_pages must be able to say so."""
+    calls = []
+
+    def fake(api, params=None, method="GET", body=None):
+        calls.append(method)
+        return {"response": [], "additionalData": {"totalItems": "0"}}, 0
+
+    with mock.patch.object(core, "call_ws_api_v3", fake):
+        items, ok = core.fetch_v3_pages("orgs/o-1/projects/summaries", method="POST")
+    assert ok is True
+    assert calls == ["POST"]
+
+
+def test_paging_still_walks_cursors_over_a_post_endpoint():
+    def fake(api, params=None, method="GET", body=None):
+        assert method == "POST"
+        cursor = (params or {}).get("cursor")
+        if cursor is None:
+            return {"response": [{"uuid": "a"}],
+                    "additionalData": {"cursor": 1, "totalItems": "2"}}, 0
+        return {"response": [{"uuid": "b"}], "additionalData": {"totalItems": "2"}}, 0
+
+    with mock.patch.object(core, "call_ws_api_v3", fake):
+        items, ok = core.fetch_v3_pages("orgs/o-1/projects/summaries", method="POST")
+    assert ok is True
+    assert [i["uuid"] for i in items] == ["a", "b"]
+
+
+def test_default_method_leaves_existing_get_callers_unchanged():
+    """Callers that never pass `method` must still invoke call_ws_api_v3 with its old
+    two-positional-argument shape."""
+    def fake(api, params=None):
+        return {"response": [{"uuid": "a"}], "additionalData": {"totalItems": "1"}}, 0
+
+    with mock.patch.object(core, "call_ws_api_v3", fake):
+        items, ok = core.fetch_v3_pages("orgs/o-1/projects")
+    assert ok is True
+    assert [i["uuid"] for i in items] == ["a"]
+
+
 def test_a_genuinely_empty_project_with_total_items_zero_stays_ok():
     """Closures depend on an empty project reporting ok=True -- otherwise nothing ever gets
     reconciled for a project with no live entities left."""

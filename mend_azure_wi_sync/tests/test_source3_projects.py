@@ -21,8 +21,8 @@ def test_a_row_normalises_to_the_expected_shape():
 def test_tags_become_a_key_to_values_map():
     """routing.py consumes {key: [values]} -- the same shape the 1.4 tag sweep produced."""
     [p] = source3.normalise_projects([_row(tags=[
-        {"name": "azure-project", "value": "Platform"},
-        {"name": "azure-repo", "value": "api-service"},
+        {"key": "azure-project", "value": "Platform"},
+        {"key": "azure-repo", "value": "api-service"},
     ])])
     assert p["tags"] == {"azure-project": ["Platform"], "azure-repo": ["api-service"]}
 
@@ -31,10 +31,19 @@ def test_a_repeated_tag_key_keeps_every_value():
     """A multi-valued routing tag is a real condition routing.py must see and rule on --
     collapsing it here would hide the ambiguity."""
     [p] = source3.normalise_projects([_row(tags=[
-        {"name": "azure-project", "value": "A"},
-        {"name": "azure-project", "value": "B"},
+        {"key": "azure-project", "value": "A"},
+        {"key": "azure-project", "value": "B"},
     ])])
     assert p["tags"]["azure-project"] == ["A", "B"]
+
+
+def test_tags_use_the_spec_shape_key_not_name():
+    """EntityTagDTO (the actual spec schema) has exactly `key` and `value` -- there is no `name`
+    field. A fixture or implementation written against `name` silently drops every real tag."""
+    [p] = source3.normalise_projects([_row(tags=[
+        {"key": "azure-project", "value": "Platform"},
+    ])])
+    assert p["tags"] == {"azure-project": ["Platform"]}
 
 
 def test_a_row_with_no_uuid_is_skipped():
