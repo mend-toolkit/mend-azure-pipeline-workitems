@@ -17,9 +17,9 @@ setuptools.setup(
     description=__description__,
     license='LICENSE.txt',
     python_requires='>=3.12',
-    long_description=open("README.md").read(),
+    long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
-    install_requires=[line.strip() for line in open("requirements.txt").readlines()],
+    install_requires=[line.strip() for line in open("requirements.txt", encoding="utf-8").readlines()],
     classifiers=[
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
