@@ -1216,15 +1216,15 @@ def apply_reopen(work_item_id, state: str) -> bool:
     return _patch_state(work_item_id, state, "reopen")
 
 
-def reconcile_project(project, floor):
+def reconcile_project(project):
     """Reconcile ONE Mend project against Azure. Returns (created, updated, closed, reopened,
     skipped).
 
     CREATE and UPDATE are counted and reported but deliberately NOT executed here. create_wi /
     create_wi_content are built end to end around Mend 1.4 policy-issue objects -- the HTML
     tables, the CVE sections, the custom-field resolution, the tags and the Hyperlink relation
-    that carries "{projectToken},{issueUuid}". Feeding 3.0 entries through them is a rendering
-    rewrite, not a wiring change. Creation keeps working on the existing 1.4 forward-sync path;
+    to the library's Mend page. Feeding 3.0 entries through them is a rendering rewrite, not a
+    wiring change. Creation keeps working on the existing 1.4 forward-sync path;
     this function adds only the closure half.
 
     The closure interlock (spec 6.1): on ok=False from fetch_v3_desired NOTHING is closed. An
@@ -1233,6 +1233,13 @@ def reconcile_project(project, floor):
     cannot destroy anything.
 
     SKIP makes no API call at all: see reconcile.plan_actions.
+
+    MEND_SEVERITY is INERT here and the floor passed to fetch_v3_desired is hard-coded 0.0. The
+    filter belongs to a future 3.0-driven CREATION path; creation today runs on 1.4, which applies
+    no severity filter at all. Filtering `desired` while creation is unfiltered would make every
+    work item 1.4 created for a below-floor finding absent from `desired`, hence CLOSED, hence
+    re-created by 1.4 on the next run -- an item flapping forever. conf.severity and
+    source3.severity_floor stay as they are; they just must not decide a closure.
     """
     project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
     closed_state = normalise_state(getattr(conf, "closed_state", ""), "Closed")
@@ -1241,13 +1248,28 @@ def reconcile_project(project, floor):
     # Read Azure FIRST, before anything in this run has written to it: entries added to exist_wis
     # after a POST/PATCH carry state "" and must never be mistaken for a real state.
     actual = actual_work_items(project_name)
-    desired, ok = fetch_v3_desired(project.get("uuid", ""), floor)
+    desired, ok = fetch_v3_desired(project.get("uuid", ""), 0.0)
 
     if not ok:
         logger.warning(f"[{fn()}] The Mend read for project {project_name} was incomplete. "
                        f"Closures are SKIPPED for this project -- a partial read looks exactly "
                        f"like a project whose findings were all remediated, and closing on it "
                        f"would be a mass-closure. Reopens and the rest of the run continue.")
+
+    # Key-space interlock. `actual` keys come from work item TITLES (1.4 builds them from
+    # library.filename); `desired` keys come from 3.0 component.name / originName. Those two
+    # spellings have never been verified byte-identical. If they differ at all, every `actual`
+    # key misses and EVERY work item in the project is closed, then re-created by 1.4 next run.
+    # Both sides non-empty with zero overlap is not a project that was fully remediated -- that
+    # case has an EMPTY `desired`, and its closures must still run.
+    if desired and actual and not (set(desired) & set(actual)):
+        logger.error(f"[{fn()}] Suspected key-space mismatch in project {project_name}: "
+                     f"{len(desired)} Mend finding(s) and {len(actual)} work item(s), and NOT "
+                     f"ONE key in common. Closures are SKIPPED for this project. Example Mend "
+                     f"keys: {sorted(map(str, desired))[:2]}. Example work item keys: "
+                     f"{sorted(map(str, actual))[:2]}. If those two spellings differ, that is "
+                     f"the bug -- not a remediated project.")
+        ok = False
 
     created = updated = closed = reopened = skipped = 0
     for action in plan_actions(desired, actual, closed_state):
@@ -1553,6 +1575,21 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             )
         try:
             if azure_operation == "add":
+                if lib_url:
+                    # Standalone value: the operator's one click from the work item to the
+                    # library in Mend. Deliberately NO attributes.comment -- that carried
+                    # "{projectToken},{issueUuid}" for the reverse sync, which no longer exists
+                    # and nothing reads.
+                    data.append(
+                        {
+                            "op": "add",
+                            "path": "/relations/-",
+                            "value": {
+                                "rel": "Hyperlink",
+                                "url": lib_url
+                            }
+                        }
+                    )
                 r, errcode = call_azure_api(api_type="POST", api=f"wit/workitems/${wi_type}", data=data,
                                             project=conf.azure_project)
                 try:
@@ -1662,6 +1699,11 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             if policy_type not in SUPPORTED_POLICY_TYPES:
                 skipped_types[policy_type or "unknown"] = skipped_types.get(policy_type or "unknown", 0) + 1
                 continue
+            # The library's Mend page. It is the operator's click-through link out of the work
+            # item, written below as a Hyperlink relation. It used to double as the reverse
+            # sync's carrier (attributes.comment = "{token},{uuid}"); the reverse sync is gone,
+            # the link is not.
+            lib_url = try_or_error(lambda: prj_el["library"]["url"], "")
             lib_name = prj_el["library"]["filename"]
             lib_key_id = try_or_error(lambda: prj_el["library"]["keyId"], "")
             policy_lic_name = try_or_error(

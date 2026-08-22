@@ -165,7 +165,7 @@ def test_an_incomplete_read_skips_closures():
                            return_value={("vulnerability", "log4j-core"): {"id": 42,
                                                                            "state": "Active"}}), \
          mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
-        stats = core.reconcile_project(PROJECT, 7.0)
+        stats = core.reconcile_project(PROJECT)
     assert closes == [], "an incomplete read must never close a work item"
     assert stats[2] == 0
 
@@ -180,7 +180,7 @@ def test_an_incomplete_read_still_reopens():
                            return_value={("vulnerability", "log4j-core"): {"id": 42,
                                                                            "state": "Closed"}}), \
          mock.patch.object(core, "apply_reopen", lambda *a: reopens.append(a) or True):
-        stats = core.reconcile_project(PROJECT, 7.0)
+        stats = core.reconcile_project(PROJECT)
     assert reopens == [(42, "New")]
     assert stats[3] == 1
 
@@ -193,7 +193,7 @@ def test_a_complete_read_does_close():
                            return_value={("vulnerability", "log4j-core"): {"id": 42,
                                                                            "state": "Active"}}), \
          mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
-        stats = core.reconcile_project(PROJECT, 7.0)
+        stats = core.reconcile_project(PROJECT)
     assert closes == [(42, "Closed")]
     assert stats[2] == 1
 
@@ -208,7 +208,7 @@ def test_an_already_closed_item_produces_no_api_call_at_all():
                                                                            "state": "Closed"}}), \
          mock.patch.object(core, "apply_close", lambda *a: calls.append(a) or True), \
          mock.patch.object(core, "apply_reopen", lambda *a: calls.append(a) or True):
-        stats = core.reconcile_project(PROJECT, 7.0)
+        stats = core.reconcile_project(PROJECT)
     assert calls == []
     assert stats[4] == 1
 
@@ -225,7 +225,7 @@ def test_creates_and_updates_are_counted_but_never_executed():
                                                                            "state": "Active"}}), \
          mock.patch.object(core, "call_azure_api", lambda *a, **k: calls.append(a) or ({}, 0)), \
          mock.patch.object(core, "create_wi", lambda *a, **k: calls.append(a)):
-        created, updated, closed, reopened, skipped = core.reconcile_project(PROJECT, 7.0)
+        created, updated, closed, reopened, skipped = core.reconcile_project(PROJECT)
     assert calls == []
     assert (created, updated, closed, reopened, skipped) == (1, 1, 0, 0, 0)
 
@@ -239,7 +239,7 @@ def test_azure_is_read_before_mend():
                            side_effect=lambda *a: order.append("mend") or ({}, True)), \
          mock.patch.object(core, "actual_work_items",
                            side_effect=lambda *a: order.append("azure") or {}):
-        core.reconcile_project(PROJECT, 7.0)
+        core.reconcile_project(PROJECT)
     assert order == ["azure", "mend"]
 
 
@@ -250,4 +250,91 @@ def test_a_failed_close_is_not_counted_as_closed():
                            return_value={("vulnerability", "log4j-core"): {"id": 42,
                                                                            "state": "Active"}}), \
          mock.patch.object(core, "apply_close", lambda *a: False):
-        assert core.reconcile_project(PROJECT, 7.0)[2] == 0
+        assert core.reconcile_project(PROJECT)[2] == 0
+
+
+# FINDING 1 -- MEND_SEVERITY must not decide a closure.
+
+def test_the_closure_read_uses_a_floor_of_zero():
+    """1.4 creation applies no severity filter, so `desired` must reflect everything 1.4 could
+    have created. Any other floor closes below-floor items that 1.4 re-creates next run."""
+    seen = {}
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired",
+                           side_effect=lambda uuid, floor: seen.update(floor=floor) or ({}, True)), \
+         mock.patch.object(core, "actual_work_items", return_value={}):
+        core.reconcile_project(PROJECT)
+    assert seen["floor"] == 0.0
+
+
+def test_a_low_severity_finding_is_not_closed():
+    """End to end through the real fetch_v3_desired: a CVSS 2.1 finding that is still ACTIVE in
+    Mend must keep its work item open, whatever MEND_SEVERITY says."""
+    low = {"findingInfo": {"status": "ACTIVE"}, "component": {"name": "log4j-core"},
+           "vulnerability": {"score": 2.1}}
+
+    def _pages(api, *args, **kwargs):
+        return ([low], True) if "findings/security" in api else ([], True)
+
+    closes = []
+    with mock.patch.object(core, "conf", mock.MagicMock(azure_project="P", closed_state="Closed",
+                                                        reopen_state="New", severity="9.0")), \
+         mock.patch.object(core, "org_uuid", return_value="org-1"), \
+         mock.patch.object(core, "fetch_v3_pages", side_effect=_pages), \
+         mock.patch.object(core, "actual_work_items",
+                           return_value={("vulnerability", "log4j-core"): {"id": 42,
+                                                                           "state": "Active"}}), \
+         mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
+        stats = core.reconcile_project(PROJECT)
+    assert closes == [], "a low-severity finding still present in Mend must not be closed"
+    assert stats[2] == 0
+
+
+# FINDING 2 -- the key-space interlock.
+
+def _actual_two():
+    return {("vulnerability", "log4j-core-2.14.1.jar"): {"id": 42, "state": "Active"},
+            ("license", "jackson-databind-2.9.jar"): {"id": 43, "state": "Active"}}
+
+
+def test_zero_key_overlap_skips_every_close_and_logs_the_two_key_spaces(caplog):
+    """actual keys come from work item titles (1.4: library.filename), desired keys from 3.0
+    component.name. Both sides full with NOT ONE key in common is a key-space mismatch, not a
+    fully remediated project -- closing there would close every work item in the project."""
+    desired = {("vulnerability", "log4j-core"): {}, ("license", "jackson-databind"): {}}
+    closes = []
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired", return_value=(desired, True)), \
+         mock.patch.object(core, "actual_work_items", return_value=_actual_two()), \
+         mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True), \
+         caplog.at_level("ERROR"):
+        stats = core.reconcile_project(PROJECT)
+    assert closes == []
+    assert stats[2] == 0
+    assert "log4j-core" in caplog.text and "log4j-core-2.14.1.jar" in caplog.text
+
+
+def test_an_empty_desired_still_closes_everything():
+    """The legitimate case: nothing left in Mend means everything really was remediated, and
+    those closes MUST still happen."""
+    closes = []
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired", return_value=({}, True)), \
+         mock.patch.object(core, "actual_work_items", return_value=_actual_two()), \
+         mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
+        stats = core.reconcile_project(PROJECT)
+    assert sorted(closes) == [(42, "Closed"), (43, "Closed")]
+    assert stats[2] == 2
+
+
+def test_a_partial_overlap_closes_only_the_missing_one():
+    """One shared key is enough to prove the key spaces agree; the genuinely absent item closes."""
+    desired = {("vulnerability", "log4j-core-2.14.1.jar"): {}}
+    closes = []
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired", return_value=(desired, True)), \
+         mock.patch.object(core, "actual_work_items", return_value=_actual_two()), \
+         mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
+        stats = core.reconcile_project(PROJECT)
+    assert closes == [(43, "Closed")]
+    assert stats[2] == 1
