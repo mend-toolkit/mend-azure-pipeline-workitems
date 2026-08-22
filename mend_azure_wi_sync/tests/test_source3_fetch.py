@@ -5,7 +5,7 @@ from mend_azure_wi_sync import core
 
 def _conf():
     return mock.MagicMock(org_uuid="org-1", ws_org_token="tok", email="a@b.com",
-                          api_url="api-saas.mend.io", proxy={})
+                          ws_url="saas.mend.io", proxy={})
 
 
 def test_projects_are_fetched_and_normalised():

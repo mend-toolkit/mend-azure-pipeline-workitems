@@ -168,11 +168,6 @@ def check_patterns():
         res.append(f"MEND_REACHABILITY must be 'true' or 'false', got '{conf.reachability}'")
     if try_or_error(lambda: int(conf.maxlookback) <= 0, True):
         res.append(f"MEND_MAXLOOKBACK must be a positive number of hours, got '{conf.maxlookback}'")
-    if conf.email and not conf.api_url:
-        res.append("MEND_APIURL is required when MEND_EMAIL is set (Mend 2.0/3.0 live on the "
-                   "API host, not the SCA host)")
-    if conf.api_url and not conf.email:
-        res.append("MEND_EMAIL is required when MEND_APIURL is set")
     return res
 
 
@@ -720,9 +715,9 @@ def fetch_project_alerts(prj_token: str) -> dict:
 
 def _post_v2_login():
     # Split out so tests can stub the transport without mocking requests itself.
-    # conf.api_url, NOT conf.ws_url: 2.0 lives on api-saas.mend.io while 1.4 lives on the
+    # mend_api_url(), NOT conf.ws_url: 2.0 lives on api-saas.mend.io while 1.4 lives on the
     # SCA app host. See the spec's servers block.
-    url = f"{extract_url(conf.api_url)}/api/v2.0/login"
+    url = f"{mend_api_url()}/api/v2.0/login"
     body = {"email": conf.email, "userKey": conf.ws_user_key, "orgToken": conf.ws_org_token}
     try:
         res_ = requests.post(url, json=body, verify=False, proxies=conf.proxy,
@@ -802,7 +797,7 @@ def call_ws_api_v2(api: str, params: dict = None):
     # Returns (payload, errorcode) with the same convention as call_azure_api:
     # 0 = success, non-zero = failure. One re-login covers a JWT that expired mid-run.
     global mend_v2_session
-    url = f"{extract_url(conf.api_url)}/api/v2.0/{api}"
+    url = f"{mend_api_url()}/api/v2.0/{api}"
     payload, errorcode = _get_v2(url, mend_v2_token(), params)
     if errorcode in (401, 403):
         # The JWT lives 10 minutes. The spec documents no 401 anywhere, so an expired token
@@ -825,7 +820,7 @@ def call_ws_api_v3(api: str, params: dict = None, method: str = "GET", body: dic
     # other 3.0 endpoint in use is GET; cursor/limit still travel as query params either way
     # (the spec puts them `in: query` even on the POST), only the transport verb changes.
     global mend_v2_session
-    url = f"{extract_url(conf.api_url)}/api/v3.0/{api}"
+    url = f"{mend_api_url()}/api/v3.0/{api}"
     if method == "POST":
         payload, errorcode = _post_v3(url, mend_v2_token(), body or {}, params)
         if errorcode in (401, 403):
@@ -2365,6 +2360,23 @@ def extract_url(url: str) -> str:
     return url_[0:pos] if pos > -1 else url_
 
 
+def mend_api_url() -> str:
+    """The 2.0/3.0 API host, derived from MEND_URL's host prefixed with 'api-'.
+
+    `conf.ws_url` (MEND_URL) is the SCA app host; the API host is always derivable from it
+    by prefixing the hostname with 'api-' (e.g. saas.mend.io -> api-saas.mend.io), per
+    product owner confirmation. Idempotent: a host already carrying the 'api-' prefix is
+    left alone. Empty `conf.ws_url` yields "" rather than "https://api-".
+    """
+    if not conf.ws_url:
+        return ""
+    normalised = extract_url(conf.ws_url)
+    host = normalised[len("https://"):]
+    if host.startswith("api-"):
+        return normalised
+    return f"https://api-{host}"
+
+
 def normalise_state(raw, default: str) -> str:
     """A work item state name, falling back to `default` for an unset or placeholder value.
 
@@ -2406,7 +2418,6 @@ def startup():
         reachability=varenvs.get_env("wsreachability").strip(),
         maxlookback=varenvs.get_env("wsmaxlookback").strip(),
         email=varenvs.get_env("wsemail").strip(),
-        api_url=varenvs.get_env("wsapiurl").strip(),
         org_uuid=varenvs.get_env("wsorguuid").strip(),
         severity=varenvs.get_env("wsseverity").strip(),
         closed_state=varenvs.get_env("wsclosedstate").strip(),

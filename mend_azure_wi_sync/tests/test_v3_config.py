@@ -4,7 +4,7 @@ from mend_azure_wi_sync import core
 
 
 def _conf(**kw):
-    base = dict(email="", api_url="", org_uuid="", ws_org_token="tok-abc", proxy={})
+    base = dict(email="", org_uuid="", ws_org_token="tok-abc", proxy={})
     base.update(kw)
     return mock.MagicMock(**base)
 
@@ -26,14 +26,13 @@ def test_org_uuid_is_stripped():
         assert core.org_uuid() == "uuid-xyz"
 
 
-def test_config_carries_the_three_new_fields():
+def test_config_carries_the_two_new_fields():
     """startup() must populate them; a missing attribute is an AttributeError at runtime."""
-    for field in ("email", "api_url", "org_uuid"):
+    for field in ("email", "org_uuid"):
         assert field in core.Config.__dataclass_fields__, f"Config is missing {field}"
 
 
-def test_env_aliases_exist_for_all_three():
+def test_env_aliases_exist_for_both():
     from mend_azure_wi_sync.config import varenvs
     assert varenvs.wsemail.value == ("WS_EMAIL", "MEND_EMAIL")
-    assert varenvs.wsapiurl.value == ("WS_APIURL", "MEND_APIURL")
     assert varenvs.wsorguuid.value == ("WS_ORGUUID", "MEND_ORGUUID")

@@ -54,7 +54,6 @@ class varenvs(Enum):  # Lit of Env.variables
     wsreachability = ("WS_REACHABILITY", "MEND_REACHABILITY")
     wsmaxlookback = ("WS_MAXLOOKBACK", "MEND_MAXLOOKBACK")
     wsemail = ("WS_EMAIL", "MEND_EMAIL")
-    wsapiurl = ("WS_APIURL", "MEND_APIURL")
     wsorguuid = ("WS_ORGUUID", "MEND_ORGUUID")
     wsseverity = ("WS_SEVERITY", "MEND_SEVERITY")
     wsclosedstate = ("WS_CLOSEDSTATE", "MEND_CLOSEDSTATE")
@@ -129,7 +128,6 @@ class Config:
     reachability: str
     maxlookback: str
     email: str
-    api_url: str
     org_uuid: str
     severity: str
     closed_state: str
@@ -163,7 +161,6 @@ class Config:
             "wsreachability": self.reachability,
             "wsmaxlookback": self.maxlookback,
             "wsemail": self.email,
-            "wsapiurl": self.api_url,
             "wsorguuid": self.org_uuid,
             "wsseverity": self.severity,
             "wsclosedstate": self.closed_state,
