@@ -101,3 +101,32 @@ def normalise_findings(findings, floor: float):
         entry = entries.setdefault(lib, {"library": lib, "kind": "vulnerability", "findings": []})
         entry["findings"].append(finding)
     return entries, unscored
+
+
+# Licenses are policy-driven: a license is a VIOLATION because a policy says so, which is why
+# they keep coming from /violations rather than from a severity threshold.
+LEGAL_FINDING_TYPE = "LEGAL"
+
+
+def normalise_violations(violations):
+    """3.0 project violations -> {library_name: entry} for license work items.
+
+    ASYMMETRY WORTH KNOWING: ProjectViolationDTOV3 carries NO status field, unlike a security
+    finding. So a license work item is closed by its violation being ABSENT from this list, while
+    a vulnerability work item is closed by an explicit status. This assumes /violations returns
+    only CURRENT violations -- spec gate G3, unverified against a live org. If it also returns
+    resolved ones, license work items will never close and this function needs a filter it
+    currently has no field to apply.
+    """
+    entries = {}
+    for violation in violations or []:
+        if not isinstance(violation, dict):
+            continue
+        if violation.get("findingType") != LEGAL_FINDING_TYPE:
+            continue
+        lib = violation.get("originName")
+        if not lib:
+            continue
+        entry = entries.setdefault(lib, {"library": lib, "kind": "license", "findings": []})
+        entry["findings"].append(violation)
+    return entries

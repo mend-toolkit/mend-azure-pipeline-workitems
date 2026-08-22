@@ -136,3 +136,38 @@ def test_a_finding_with_no_library_name_is_skipped_not_crashed():
 def test_garbage_input_returns_empty_rather_than_raising():
     assert source3.normalise_findings(None, 7.0) == ({}, 0)
     assert source3.normalise_findings(["not a dict"], 7.0) == ({}, 0)
+
+
+def _violation(lib="log4j-core", finding_type="LEGAL", name="GPL-3.0"):
+    return {"uuid": f"v-{lib}", "name": name, "findingType": finding_type,
+            "originName": lib, "originUuid": f"o-{lib}", "risk": "HIGH",
+            "violationType": "LICENSE"}
+
+
+def test_a_legal_violation_becomes_a_license_entry():
+    entries = source3.normalise_violations([_violation()])
+    assert list(entries) == ["log4j-core"]
+    assert entries["log4j-core"]["kind"] == "license"
+
+
+@pytest.mark.parametrize("finding_type", ["SECURITY", "LIBRARY"])
+def test_non_legal_finding_types_are_ignored(finding_type):
+    """SECURITY violations would duplicate the findings path; LIBRARY has no meaning here."""
+    assert source3.normalise_violations([_violation(finding_type=finding_type)]) == {}
+
+
+def test_several_violations_for_one_library_group_together():
+    entries = source3.normalise_violations(
+        [_violation(name="GPL-3.0"), _violation(name="AGPL-3.0")])
+    assert len(entries["log4j-core"]["findings"]) == 2
+
+
+def test_a_violation_with_no_origin_name_is_skipped():
+    broken = _violation()
+    del broken["originName"]
+    assert source3.normalise_violations([broken]) == {}
+
+
+def test_garbage_violations_return_empty_rather_than_raising():
+    assert source3.normalise_violations(None) == {}
+    assert source3.normalise_violations(["nope"]) == {}
