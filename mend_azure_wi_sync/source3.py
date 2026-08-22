@@ -13,6 +13,7 @@ import os
 import sys
 
 sys.path.append(os.path.dirname(__file__))
+from enrichment import format_epss, format_exploit, format_reachability
 
 # CVSS v3 band floors. A band names the BOTTOM of its range, so "high" selects 7.0 and up.
 _BANDS = {"low": 0.1, "medium": 4.0, "high": 7.0, "critical": 9.0}
@@ -203,3 +204,154 @@ def select_projects(projects, include_uuids, exclude_uuids):
             continue
         selected.append(project)
     return selected, unresolved
+
+
+def _dependency_type(component: dict, finding: dict) -> str:
+    """component.dependencyType wins; otherwise fall back to the first dependencyContexts
+    entry's isDirect flag. Neither present -> "" (the caller renders that as unknown, not
+    as a guess)."""
+    dep_type = component.get("dependencyType")
+    if dep_type:
+        return dep_type
+    contexts = finding.get("dependencyContexts")
+    if isinstance(contexts, list) and contexts and isinstance(contexts[0], dict):
+        is_direct = contexts[0].get("isDirect")
+        if is_direct is True:
+            return "Direct"
+        if is_direct is False:
+            return "Transitive"
+    return ""
+
+
+def _parents(findings: list) -> list:
+    """Every dependencyContexts[].directRoots[] entry across all findings for this library,
+    rendered as "name@version" and deduped in first-seen order."""
+    parents = []
+    seen = set()
+    for finding in findings:
+        contexts = finding.get("dependencyContexts")
+        if not isinstance(contexts, list):
+            continue
+        for context in contexts:
+            if not isinstance(context, dict):
+                continue
+            roots = context.get("directRoots")
+            if not isinstance(roots, list):
+                continue
+            for root in roots:
+                if not isinstance(root, dict):
+                    continue
+                label = f"{root.get('rootLibraryName') or ''}@{root.get('rootLibraryVersion') or ''}"
+                if label not in seen:
+                    seen.add(label)
+                    parents.append(label)
+    return parents
+
+
+def _vulnerability_row(finding: dict) -> dict:
+    """One finding -> the flat vulnerability row the CVE table renders.
+
+    format_epss/format_exploit expect vulnerability.threatAssessment.*, and
+    format_reachability expects a top-level "reachability" key -- both shaped after the 1.4
+    policy element they were written for. A 3.0 finding carries threatAssessment and
+    reachability top-level instead, so a small shim dict is built to match rather than
+    reshaping those formatters (they encode hard-won EPSS/maturity/reachability display
+    rules that must not be re-derived here).
+    """
+    vuln = finding.get("vulnerability")
+    vuln = vuln if isinstance(vuln, dict) else {}
+    top_fix = finding.get("topFix")
+    top_fix = top_fix if isinstance(top_fix, dict) else {}
+    refs = vuln.get("references")
+    first_ref = refs[0] if isinstance(refs, list) and refs and isinstance(refs[0], dict) else {}
+
+    shim = {
+        "reachability": finding.get("reachability"),
+        "vulnerability": {"threatAssessment": finding.get("threatAssessment")},
+    }
+
+    raw_score = vuln.get("score")
+    return {
+        "name": vuln.get("name") or "",
+        "score": raw_score if raw_score is not None and raw_score != "" else "",
+        "severity": vuln.get("severity") or "",
+        "description": vuln.get("description") or "",
+        "url": first_ref.get("url") or "",
+        "epss": format_epss(shim),
+        "maturity": format_exploit(shim),
+        "reachability": format_reachability(shim),
+        "fix_resolution": top_fix.get("fixResolution") or "",
+        "fix_type": top_fix.get("type") or "",
+        "fix_url": top_fix.get("url") or "",
+        "publish_date": vuln.get("publishDate") or "",
+    }
+
+
+def _vulnerabilities(findings: list) -> list:
+    """One row per finding, sorted by score descending with unscored findings last.
+
+    An operator scans this table top-down, so the most severe, comparable finding must lead.
+    0.0 is a real score (sorts normally); None/"" is unscored and always sorts after every
+    scored row, regardless of value.
+    """
+    rows = [_vulnerability_row(f) for f in findings]
+
+    def sort_key(row):
+        score = row["score"]
+        if score == "":
+            return (1, 0.0)
+        try:
+            return (0, -float(score))
+        except (TypeError, ValueError):
+            return (1, 0.0)
+
+    rows.sort(key=sort_key)
+    return rows
+
+
+def render_inputs(entry: dict) -> dict:
+    """One `desired` entry ({"library", "kind", "findings"}) -> the flat inputs the HTML
+    description builders consume.
+
+    Never raises: every missing or malformed key yields "" or [], not None. A `kind ==
+    "license"` entry carries violation objects, not findings -- those have no
+    component/vulnerability to read, so it returns just the library name with everything
+    else empty. Task 2 attaches license data separately.
+    """
+    library = entry.get("library") if isinstance(entry, dict) else ""
+    result = {
+        "library": library or "",
+        "version": "",
+        "description": "",
+        "home_page": "",
+        "dependency_type": "",
+        "dependency_file": "",
+        "library_path": "",
+        "parents": [],
+        "vulnerabilities": [],
+    }
+    if not isinstance(entry, dict) or entry.get("kind") != "vulnerability":
+        return result
+
+    findings = [f for f in (entry.get("findings") or []) if isinstance(f, dict)]
+    if not findings:
+        return result
+
+    component = _walk(findings[0], "component")
+    component = component if isinstance(component, dict) else {}
+    references = component.get("references")
+    references = references if isinstance(references, dict) else {}
+    locations = component.get("libraryLocations")
+    first_location = locations[0] if isinstance(locations, list) and locations and isinstance(locations[0], dict) \
+        else {}
+
+    result["version"] = component.get("version") or ""
+    result["description"] = component.get("description") or ""
+    result["home_page"] = references.get("homePage") or ""
+    result["dependency_type"] = _dependency_type(component, findings[0])
+    result["dependency_file"] = component.get("dependencyFile") or first_location.get("dependencyFile") or ""
+    result["library_path"] = component.get("localPath") or component.get("path") or first_location.get(
+        "localPath") or ""
+    result["parents"] = _parents(findings)
+    result["vulnerabilities"] = _vulnerabilities(findings)
+    return result
