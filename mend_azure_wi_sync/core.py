@@ -1713,12 +1713,9 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                             try_or_error(lambda: policy_el["vulnerability"]["name"], "")
                         if "License Policy Violation" in vul_name or not is_ignored(cve=vul_name, ignored=ignore_alerts):
                             issue_id = policy_el["issueUuid"]
-                            vul_severity = try_or_error(lambda: policy_el["vulnerability"]["cvss3_severity"],
-                                                        try_or_error(lambda: policy_el["vulnerability"]["severity"], ""))
                             if not vul_name:
                                 break
-                            vul_title = f"{vul_name} detected in {lib_name}" if is_license else \
-                                f"{vul_name} ({str(vul_severity).capitalize()}) detected in {lib_name}"
+                            vul_title = cve_title(vul_name, lib_name)
 
                             vul_score = try_or_error(lambda: policy_el["vulnerability"]["cvss3_score"],
                                                      try_or_error(lambda: policy_el["vulnerability"]["score"], ""))
@@ -1731,7 +1728,12 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                             vul_fix_type = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["type"], "")
                             vul_fix_release_date = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["date"], "")
 
-                            exist_id = check_wi_id(id=vul_title,project_name=f"{prd_name}/{prj_name}")
+                            # Migration from the severity-bearing title. See Task 4.
+                            exist_id = resolve_wi_id(
+                                vul_title,
+                                None if is_license else (
+                                    lambda t: is_legacy_cve_title(t, vul_name, lib_name)),
+                                project_name=f"{prd_name}/{prj_name}")
                             if exist_id > 0:
                                 wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
                                                                data={}, project=conf.azure_project)
