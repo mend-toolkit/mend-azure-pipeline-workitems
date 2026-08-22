@@ -56,6 +56,7 @@ class varenvs(Enum):  # Lit of Env.variables
     wsemail = ("WS_EMAIL", "MEND_EMAIL")
     wsapiurl = ("WS_APIURL", "MEND_APIURL")
     wsorguuid = ("WS_ORGUUID", "MEND_ORGUUID")
+    wsseverity = ("WS_SEVERITY", "MEND_SEVERITY")
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -128,6 +129,7 @@ class Config:
     email: str
     api_url: str
     org_uuid: str
+    severity: str
 
     def conf_json(self):
         return {
@@ -159,6 +161,7 @@ class Config:
             "wsemail": self.email,
             "wsapiurl": self.api_url,
             "wsorguuid": self.org_uuid,
+            "wsseverity": self.severity,
         }
 
     def get_values(self):
@@ -190,6 +193,8 @@ class Config:
                     value = "720" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "branches":
                     value = "main,master" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "severity":
+                    value = "high" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "proxy":
                     if properties[key]:
                         if type(properties[key]) is dict:

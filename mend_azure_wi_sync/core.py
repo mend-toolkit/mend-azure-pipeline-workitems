@@ -2344,6 +2344,7 @@ def startup():
         email=varenvs.get_env("wsemail").strip(),
         api_url=varenvs.get_env("wsapiurl").strip(),
         org_uuid=varenvs.get_env("wsorguuid").strip(),
+        severity=varenvs.get_env("wsseverity").strip(),
     )
     try:
         return conf
