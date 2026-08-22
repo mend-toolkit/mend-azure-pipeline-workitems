@@ -16,6 +16,8 @@ from enrichment import (build_alert_index, decorate_policy_violations, format_ep
 from identity import license_title, matches_library
 from routing import (parse_route, build_table, classify, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
+from source3 import (normalise_findings, normalise_projects, normalise_violations,
+                     select_projects, severity_floor)
 from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_PROJECT, TAG_REVSYNC, VERDICT_FAILED,
                        VERDICT_OK, build_selection, clamp, failed_stamp, is_stale,
                        count_parseable_rows, field_for, keep_or_clamp, parse_tag_map,
@@ -2337,6 +2339,54 @@ def org_uuid() -> str:
     Every 3.0 caller goes through here -- never read conf.org_uuid directly.
     """
     return (conf.org_uuid or conf.ws_org_token or "").strip()
+
+
+def fetch_v3_projects():
+    """Every project in the org, with its routing tags and last scan time. One paged call.
+
+    Replaces getAllProjects, getOrganizationProjectVitals, getOrganizationProjectTags and
+    get_prj_list_modified -- all four collapse into this.
+    """
+    rows, ok = fetch_v3_pages(f"orgs/{org_uuid()}/projects/summaries")
+    if not ok:
+        logger.error(f"[{fn()}] Could not read Mend projects for org {org_uuid()}. "
+                     f"Nothing is synced this run -- acting on a partial project list could "
+                     f"close work items for projects we simply failed to read.")
+    return normalise_projects(rows), ok
+
+
+def fetch_v3_desired(project_uuid: str, floor: float):
+    """One project's desired end state: {(kind, library): entry}.
+
+    `ok` is the AND of both reads and is the closure interlock from spec 6.1 -- reconciliation
+    closes work items absent from `desired`, so a partial read must never be mistaken for a
+    shrunken one. A caller seeing ok=False may still create and update (which cannot destroy
+    anything) but must NOT close.
+
+    Keyed by (kind, library) rather than library: one library can carry both a vulnerability and
+    a license work item, and they are separate items with different titles.
+    """
+    findings, findings_ok = fetch_v3_pages(
+        f"projects/{project_uuid}/dependencies/findings/security")
+    violations, violations_ok = fetch_v3_pages(
+        f"orgs/{org_uuid()}/projects/{project_uuid}/violations")
+
+    vuln_entries, unscored = normalise_findings(findings, floor)
+    lic_entries = normalise_violations(violations)
+
+    if unscored:
+        # Spec 5.1 requires this to be an explicit rule, not an accident of a missing key.
+        logger.info(f"[{fn()}] {unscored} unscored vulnerability finding(s) in project "
+                    f"{project_uuid} were INCLUDED: they cannot be compared to MEND_SEVERITY, "
+                    f"and a real finding vanishing because Mend has not scored it yet is the "
+                    f"worse failure.")
+
+    desired = {}
+    for lib, entry in vuln_entries.items():
+        desired[("vulnerability", lib)] = entry
+    for lib, entry in lic_entries.items():
+        desired[("license", lib)] = entry
+    return desired, (findings_ok and violations_ok)
 
 
 def extract_url(url: str) -> str:
