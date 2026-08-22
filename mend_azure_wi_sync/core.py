@@ -15,16 +15,15 @@ from enrichment import (build_alert_index, decorate_policy_violations, format_ep
                         format_exploit, format_reachability)
 from identity import license_title, matches_library
 from reconcile import CLOSE, CREATE, REOPEN, SKIP, UPDATE, plan_actions
-from routing import (parse_route, build_table, classify, coverage_report, LOUD_OUTCOMES,
+from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 from source3 import (normalise_findings, normalise_projects, normalise_violations,
                      select_projects, severity_floor)
-from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_PROJECT, TAG_REVSYNC, VERDICT_FAILED,
-                       VERDICT_OK, build_selection, clamp, failed_stamp, is_stale,
-                       count_parseable_rows, field_for, keep_or_clamp, parse_tag_map,
+from syncstate import (TAG_FAILED, TAG_LASTRUN, VERDICT_FAILED,
+                       VERDICT_OK, build_selection, failed_stamp, is_stale,
+                       count_parseable_rows, field_for, parse_tag_map,
                        parse_raw_tags, parse_tag_values, selection_floor, superseded, tag_ops,
                        window_start)
-from syncstate import _parse as _parse_timestamp
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -55,9 +54,8 @@ mend_v2_session = None
 API_VERSION = "1.4"
 AGENT_INFO = {"agent": f"{__tool_name__.replace('_', '-')}", "agentVersion": __version__}
 DEFAULT_PRIORITY = 2
-# The reverse sync selects only these two (see update_wi_for_project's tag clause), so a work
-# item created for any other policy match type can never round-trip to Mend. Creating one
-# orphans it, and #4 means nothing ever closes it.
+# Only these two policy match types are supported: every other type renders no usable work
+# item content, so creating one orphans it.
 SUPPORTED_POLICY_TYPES = ("LICENSE", "VULNERABILITY_SCORE")
 uuid_pattern = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 token_pattern = r"^[0-9a-zA-Z]{64}$"
@@ -85,8 +83,8 @@ TAG_WARNED = False            # WARNING_MSG-style guard so 400 projects log one 
 ALERTS_WARNED = False         # same guard for the enrichment alerts fetch: a user key that
                                # cannot read alerts fails for all ~107 projects identically
 product_token_expansion_cache = {}   # {producttoken string: [expanded project tokens]},
-                               # memoized so the forward and reverse paths don't each pay
-                               # one Mend call per product token in the same run. Only a
+                               # memoized so the routed and unrouted selection paths don't
+                               # each pay one Mend call per product token in the same run. Only a
                                # SUCCESSFUL expansion is cached -- a failure must stay
                                # failing, never papered over by a stale cache entry.
 
@@ -414,34 +412,6 @@ def record_verdict(prj_token: str, verdict: str, todate: str, state: dict):
     apply_tag_ops(prj_token, tag_ops(verdict, todate, failed_stamp(prj_token, state)))
 
 
-def save_project_addr(prj_token: str, state: dict):
-    """Persist TAG_PROJECT for one Mend project, but only when the value differs from what
-    the read-once tag map already holds -- zero writes in steady state.
-
-    Sourced from `synced_projects` (populated unconditionally by create_wi, regardless of
-    verdict) rather than recomputed, so the stored address always matches the exact tag
-    string create_wi wrote onto the work items themselves. A project create_wi never reached
-    this run (job timeout, exception outside its try) has no synced_projects entry, so this
-    is a no-op for it -- there is nothing yet to address, and the previously stored address
-    (if any) is left untouched.
-
-    On a successful write, also updates `state` in place. `state` is the same dict object
-    fetch_project_tag_state() memoises as `project_tag_state`, so this lets the same run's
-    update_wi_in_thread (which reads that same memoised map) see the address a project was
-    just given, instead of the reverse sync skipping it until the following run. It also
-    means a token addressed twice in the same run short-circuits on the second call via the
-    "already differs" check above, rather than re-writing.
-    """
-    project_tag = next((tag for token, tag, _ in synced_projects if token == prj_token), "")
-    if not project_tag:
-        return
-    desired = f"{conf.azure_project}|{project_tag}"
-    if (state.get(prj_token) or {}).get("project") == desired:
-        return
-    if replace_project_tag(prj_token, TAG_PROJECT, desired):
-        state.setdefault(prj_token, {})["project"] = desired
-
-
 def project_window(prj_token: str, state: dict, todate: str, max_hours, reset_on: bool) -> str:
     """window_start, plus the warning a stale watermark owes the operator.
 
@@ -460,7 +430,7 @@ def project_window(prj_token: str, state: dict, todate: str, max_hours, reset_on
 
 
 def fetch_project_tag_state() -> dict:
-    """{token: {lastrun, failed, revsync}} for the whole org, read once per run.
+    """{token: {lastrun, failed}} for the whole org, read once per run.
 
     Memoised for the run -- one sweep answers every caller. An unreadable sweep returns {} and marks state
     unavailable rather than raising: every window then falls back to the clamp, which is correct
@@ -1303,237 +1273,6 @@ def reconcile_project(project, floor):
     return created, updated, closed, reopened, skipped
 
 
-def clamp_revsync(prj_token, state, todate, max_hours, reset_on):
-    """window_start reads TAG_LASTRUN; the reverse direction needs TAG_REVSYNC.
-
-    Same rule as project_window: a stored watermark is honoured however old, because narrowing
-    it would drop the work item changes in between and the next success would write over them.
-
-    An absent (or unparseable) watermark is the "first-ever reverse sync" case and must not be
-    floored at MEND_MAXLOOKBACK -- that would silently start only 30 days back. It looks back
-    reset_back_time instead, once per project.
-    """
-    if reset_on:
-        return clamp(None, todate, reset_back_time)
-    stored = (state.get(prj_token) or {}).get("revsync")
-    if _parse_timestamp(stored) is None:
-        return clamp(None, todate, reset_back_time)
-    if is_stale(stored, todate, max_hours):
-        logger.warning(f"[{fn()}] Mend project {prj_token} last pushed work item state "
-                      f"{stored}, older than MEND_MAXLOOKBACK ({max_hours}h). Its reverse "
-                      f"window stays that wide rather than skipping the gap.")
-    return keep_or_clamp(stored, todate, max_hours)
-
-
-def update_wi_for_project(prj_token: str, project_tag: str, todate: str):
-    global conf, global_errors, run_failed
-    if conf is None:
-        conf = startup()
-        conf.update_properties()
-    state = fetch_project_tag_state()
-    reset_on = conf.reset.lower() == "true"
-    max_hours = try_or_error(lambda: int(conf.maxlookback), 720)
-    # Scoped to one Mend project so its watermark can live on that project as a tag. The extra
-    # tag clause also shrinks every result set, which relieves the 20,000-row WIQL cap (#5).
-    since = clamp_revsync(prj_token, state, todate, max_hours, reset_on)
-    try:
-        logger.info(f"Start to update Mend's data for {project_tag}")
-        first_id = 0
-        executed_wi = 0
-        project_failed = False
-        tag_lic = Tags.get_el_by_name("LICENSE")
-        tag_vul = Tags.get_el_by_name("VULNERABILITY_SCORE")
-        while True:
-            data = {"query": f'select [System.Id] From WorkItems Where '
-                             f'[System.ChangedDate] > "{since}" And '
-                             f'[System.TeamProject] = "{conf.azure_project}" And [System.Id] > {first_id} '
-                             f'AND ([System.Tags] CONTAINS "{project_tag}") '
-                             f'AND (([System.Tags] CONTAINS "{tag_lic}") or ([System.Tags] CONTAINS "{tag_vul}")) '
-                             f'And [System.State] <> "Removed" AND [System.State] <> "Deleted" '
-                             f'ORDER BY [System.Id]'}
-            r, errocode = call_azure_api(api_type="POST", api="wit/wiql", version="7.0", project=conf.azure_project,
-                                         data=data, header="application/json",
-                                         cmd_type=f"?timePrecision=True&$top={max_wi}&")
-            if errocode != 0:
-                logger.error(f"[{fn()}] Reverse sync WIQL query failed: {r}")
-                global_errors += 1
-                run_failed = True
-                project_failed = True
-                break
-            results_wi = r["workItems"]
-            if not results_wi:
-                break
-            id_str = ""
-            for pos_number, wi_ in enumerate(results_wi):
-                id_str += str(wi_["id"]) + ","
-            first_id = try_or_error(lambda: wi_["id"], 0)
-            id_str = id_str[:-1] if results_wi else ""
-
-            if id_str:
-                wi, errcode = call_azure_api(api_type="GET", api=f"wit/workitems?ids={id_str}&$expand=Relations",
-                                             data={}, project=conf.azure_project, cmd_type="&")
-                if errcode != 0:
-                    logger.error(f"[{fn()}] Reverse sync hydration failed for ids {id_str}: {wi}")
-                    global_errors += 1
-                    run_failed = True
-                    project_failed = True
-                if errcode == 0:
-                    for wq_el in wi['value']:
-                        issue_id = wq_el['id']
-                        issue_wi_title = wq_el['fields']['System.Title']
-                        if tag_set(try_or_error(lambda: wq_el['fields']['System.Tags'], "")) & \
-                                {tag_vul, tag_lic}:
-                            # If we have completely another task in the same Azure Project then just pass it
-                            # Now Vulnerability and License violation are produced only
-                            try:
-                                uuid = ""
-                                wi_prj_token = ""
-                                for wq_el_rel_ in wq_el['relations']:
-                                    if wq_el_rel_['rel'] == "Hyperlink":
-                                        wi_prj_token = try_or_error(lambda: wq_el_rel_['attributes']['comment'].split(",")[0], "")
-                                        uuid = try_or_error(lambda: wq_el_rel_['attributes']['comment'].split(",")[1], "")
-
-                                wq_el_url = wq_el['url'][0:wq_el['url'].find("apis")] + f"workitems/edit/{issue_id}"
-                                ext_issues = [{"identifier": f"{issue_wi_title}",
-                                               "url": wq_el_url,
-                                               "status": wq_el['fields']['System.State'],
-                                               "lastModified": wq_el['fields']['System.ChangedDate'],
-                                               "created": wq_el['fields']['System.CreatedDate']
-                                               }]
-                                try:
-                                    if uuid and wi_prj_token:
-                                        data = json.dumps(
-                                            {"requestType": "updateExternalIntegrationIssues",
-                                             "userKey": conf.ws_user_key,
-                                             "orgToken": conf.ws_org_token,
-                                             "projectToken": wi_prj_token,
-                                             "wsPolicyIssueItemUuid": uuid,
-                                             "externalIssues": ext_issues
-                                             })
-                                        json.loads(call_ws_api(data=data))
-                                        #logger.info(f"Work item #{issue_id} updated corresponded to Mend's data successfully.")
-                                except Exception as err:
-                                    logger.error(f"[{ex()}] Work item #{issue_id} update Mend's data failed: {err}")
-                                    global_errors += 1
-                                executed_wi += 1
-                            except Exception as err:
-                                pass
-        if not project_failed:
-            replace_project_tag(prj_token, TAG_REVSYNC, todate)
-            return f"Updated {executed_wi} work item(s) for {project_tag}"
-        # Same string on both paths made a project whose WIQL blew up indistinguishable from
-        # an empty success in the joined summary line.
-        return (f"Updated {executed_wi} work item(s) for {project_tag} before failing; "
-                f"its reverse sync state was not advanced and will be retried")
-    except Exception as err:
-        global_errors += 1
-        run_failed = True
-        return f"[{ex()}] Update Mend's data failed: {err}"
-
-
-def reverse_targets(state: dict) -> list:
-    """[(token, azure_project, project_tag)] for every project the tag map has an address for.
-
-    Deliberately independent of this run's forward outcome (spec 5.6.1): a dormant or archived
-    repo's closed work items must still reach Mend, so this walks the whole read-once tag map
-    rather than `synced_projects` (which only supplies the address create_wi resolves this run,
-    for save_project_addr to persist).
-
-    A malformed or half-empty stored value -- an empty Azure project, an empty tag half, or a
-    tag half that would make the WIQL "CONTAINS" clause match every project (a leading or
-    trailing "/") -- is skipped and logged, never guessed at nor defaulted to conf.azure_project:
-    guessing here risks pushing an unrelated work item's state to the wrong Mend project. Both
-    halves are stripped before validation, so a whitespace-padded half neither slips a padded
-    (non-matching) value into the WIQL clause nor a whitespace-only half past the emptiness check.
-    """
-    out = []
-    for token, entry in sorted((state or {}).items()):
-        stored = (entry or {}).get("project") or ""
-        if not stored:
-            continue
-        azure_project, _, project_tag = stored.partition("|")
-        azure_project, project_tag = azure_project.strip(), project_tag.strip()
-        if not azure_project or not project_tag or project_tag.startswith("/") \
-                or project_tag.endswith("/"):
-            logger.error(f"[{fn()}] Skipping reverse sync for {token}: malformed "
-                         f"{TAG_PROJECT} value '{stored}'.")
-            continue
-        out.append((token, azure_project, project_tag))
-    return out
-
-
-def update_wi_in_thread():
-    # Kept under the original name because azure_wi_sync.py imports it by that name.
-    # Visits every Mend project the tag map has an address for, every run -- not this run's
-    # forward outcome, and not get_prj_list_modified. That is what closes the regression
-    # against pre-branch behaviour: a quiet/dormant repo whose work items get closed must
-    # still be pushed back to Mend even though nothing about it changed on the forward side.
-    global conf, global_errors, run_failed
-    if conf is None:
-        conf = startup()
-        conf.update_properties()
-    targets = reverse_targets(fetch_project_tag_state())
-    if not targets:
-        return "No Mend project has a stored reverse-sync address; reverse sync skipped."
-
-    # Mirror run_sync_routed's scope narrowing (core.py, expand_product_tokens caller)
-    # exactly, so a run scoped to one product/project does not pay a WIQL query plus a
-    # work-item hydration for every project the org has ever tagged. Absent config narrows
-    # nothing (spec 5.6.1's dormant-repo guarantee).
-    scope = set()
-    if conf.wsproducttoken:
-        expanded = expand_product_tokens(conf.wsproducttoken)
-        if expanded is None:
-            # Failing to expand must never widen scope -- silently visiting every tagged
-            # project would be the exact bug this filtering exists to fix.
-            global_errors += 1
-            run_failed = True
-            return "Aborted: could not expand MEND_PRODUCTTOKEN; refusing to widen reverse sync scope."
-        scope.update(expanded)
-    if conf.wsprojecttoken:
-        scope.update(conf.wsprojecttoken.split(","))
-    if scope:
-        targets = [t for t in targets if t[0] in scope]
-    excluded = set(t for t in conf.wsexcludetoken.split(",") if t)
-    if excluded:
-        targets = [t for t in targets if t[0] not in excluded]
-    if conf.routing.lower() == "true":
-        # Under routing the token lists are not the selector -- the routing tags are -- so the
-        # narrowing above filters nothing in a routed run. A stored address says where a
-        # project's work items LIVE; its routing tags say whether the project is still ours to
-        # sync. Without this, enabling routing on an org where one project carries tags still
-        # cost a WIQL query plus a work-item hydration for every project that had ever been
-        # addressed, including ones whose tags were removed runs ago.
-        #
-        # classify() is reused rather than reimplemented so this cannot drift from the forward
-        # side's definition of routable. The stored Azure project is passed as the known-projects
-        # set so its destination check passes trivially: the reverse sync visits the address the
-        # work items were actually written to, which is not necessarily where the routing tags
-        # point today, and re-deriving that here would send state to the wrong project.
-        routable = {token for token, azure_project, _ in targets
-                    if classify(parse_route((project_raw_tags or {}).get(token) or {}),
-                                {azure_project}, conf.branches) == SKIP_OK}
-        addressed = len(targets)
-        targets = [t for t in targets if t[0] in routable]
-        if len(targets) != addressed:
-            # Deliberately a count, not a token list: an org where routing covers a handful of
-            # projects would otherwise print most of its project tokens on every single run.
-            logger.info(f"Reverse sync filtered to match the project filter: "
-                        f"{len(targets)} of {addressed} project(s) with a stored address.")
-    if not targets:
-        return "No Mend project in scope has a stored reverse-sync address; reverse sync skipped."
-
-    original_azure_project = conf.azure_project
-    todate = (datetime.datetime.now() +
-              datetime.timedelta(hours=conf.utc_delta)).strftime("%Y-%m-%d %H:%M:%S")
-    results = []
-    for prj_token, azure_project, project_tag in targets:
-        conf.azure_project = azure_project
-        results.append(f"{project_tag}: {update_wi_for_project(prj_token, project_tag, todate)}")
-    conf.azure_project = original_azure_project
-    return "; ".join(results)
-
-
 def build_wi_tags(project_tag: str, policy_tag: str, routing: str, reponame: str) -> list:
     # Repo identity is a work item tag because the client declined Area Path. Taking the
     # values as arguments keeps this testable without constructing a whole Config.
@@ -1753,7 +1492,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 return f"/fields/{c_fld_['referenceName']}"
         return f"/fields/Custom.{fld_name}"
 
-    def create_wi_content(issue_id):
+    def create_wi_content():
         nonlocal item_failed
         global data, count_item, global_errors
         data = [
@@ -1814,19 +1553,6 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             )
         try:
             if azure_operation == "add":
-                if issue_id:
-                    data.append(
-                        {
-                            "op": "add",
-                            "path": "/relations/-",
-                            "value": {
-                                "rel": "Hyperlink",
-                                "url": lib_url,
-                                "attributes": {"comment": prj_token + "," + issue_id}
-                            }
-                        }
-                    )
-
                 r, errcode = call_azure_api(api_type="POST", api=f"wit/workitems/${wi_type}", data=data,
                                             project=conf.azure_project)
                 try:
@@ -1936,7 +1662,6 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
             if policy_type not in SUPPORTED_POLICY_TYPES:
                 skipped_types[policy_type or "unknown"] = skipped_types.get(policy_type or "unknown", 0) + 1
                 continue
-            lib_url = prj_el["library"]["url"]
             lib_name = prj_el["library"]["filename"]
             lib_key_id = try_or_error(lambda: prj_el["library"]["keyId"], "")
             policy_lic_name = try_or_error(
@@ -1997,8 +1722,6 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 else:
                     azure_operation = "replace"
                 if exist_id not in updated_wi:
-                    issue_id = try_or_error(lambda: prj_el["policyViolations"][0]["issueUuid"], "")
-                    # For link take first IssuedID
                     if is_license:  # Different description creation for License and Vulnerability
                         lic_data = ""
                         for lic_data_ in lic_data_arr:
@@ -2090,7 +1813,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                     priority = set_priority(try_or_error(lambda: float(max_severity), 6)) if conf.priority.lower() == "true" else DEFAULT_PRIORITY
                     # Default priority is 2
                     if desc:  # Creation WI just in case existing data
-                        create_wi_content(issue_id=issue_id)
+                        create_wi_content()
                 else:
                     # FINDING 1: two distinct libraries sharing a title (e.g. same filename,
                     # different keyId -- a real Maven/npm case) resolve to the same exist_id.
@@ -2111,7 +1834,6 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                         vul_name = f"License Policy Violation{lic_num_vuln}" if is_license else \
                             try_or_error(lambda: policy_el["vulnerability"]["name"], "")
                         if "License Policy Violation" in vul_name or not is_ignored(cve=vul_name, ignored=ignore_alerts):
-                            issue_id = policy_el["issueUuid"]
                             vul_severity = try_or_error(lambda: policy_el["vulnerability"]["cvss3_severity"],
                                                         try_or_error(lambda: policy_el["vulnerability"]["severity"], ""))
                             if not vul_name:
@@ -2180,7 +1902,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                        "<br><b>Dependency Hierarchy: </b><br>" + hierarchy_libs + \
                                        f"<br><b> Library home page: " \
                                        f"</b><a href='{lib_home_page}'>{lib_home_page}</a>" + vul_data + lic_data
-                                create_wi_content(issue_id=issue_id)
+                                create_wi_content()
                             else:
                                 # FINDING 1: same exposure as the dependency-mode branch above --
                                 # two distinct libraries (e.g. same filename, different keyId) can
@@ -2203,11 +1925,9 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
         message = f"{count_item} {conf.azure_type} work items created/updated for Mend project " \
                   f"'{prj_name}' (Product '{prd_name}')" if count_item > 0 else \
             f"No {conf.azure_type} work items {status_op} for Mend project '{prj_name}' (Product '{prd_name}')"
-        # Written unconditionally: a forward work-item write failure says nothing about
-        # whether this project's existing work items changed state (spec 5.6.1). Only
-        # create_wi resolves the (product, project) tag string the reverse sync needs; the
-        # reverse sync's own project_failed flag still withholds its watermark on a reverse
-        # failure.
+        # Written unconditionally, whatever the verdict: this is the run's record of which
+        # Mend projects resolved to which Azure project, keyed by the same (product, project)
+        # tag string create_wi writes onto the work items themselves.
         synced_projects.append((prj_token, f"{prd_name}/{prj_name}", conf.azure_project))
         return (VERDICT_FAILED if item_failed else VERDICT_OK), message
     except Exception as err:
@@ -2418,7 +2138,6 @@ def run_sync_routed(modified_projects: list, end_date: str, custom_flds: list,
             verdict, message = create_wi(token, project_start, end_date, custom_flds, wi_type)
             logger.info(message)
             record_verdict(token, verdict, end_date, state)
-            save_project_addr(token, state)
             synced += 1
 
     conf.azure_project = original_azure_project
@@ -2476,7 +2195,6 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
         verdict, message = create_wi(prj_el, project_start, end_date, custom_flds, wi_type)
         logger.info(message)
         record_verdict(prj_el, verdict, end_date, state)
-        save_project_addr(prj_el, state)
 
     return f"{len(res)} project(s) processed" if res else "Nothing to create/update"
 

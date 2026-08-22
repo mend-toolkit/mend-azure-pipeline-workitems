@@ -10,12 +10,6 @@ sys.path.append(os.path.dirname(__file__))
 # ignores keys it does not know (routing.py:41-43), so these are invisible to it.
 TAG_LASTRUN = "azure-wi-lastrun"
 TAG_FAILED = "azure-wi-failed"
-TAG_REVSYNC = "azure-wi-revsync"
-# Carries "{azure_project}|{product}/{project}" -- the address the reverse sync needs to visit
-# this Mend project on its own, independent of whether the forward sync touched it this run
-# (core.reverse_targets). Written only when it differs from what is already stored, so steady
-# state is zero writes.
-TAG_PROJECT = "azure-wi-project"
 
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -25,8 +19,6 @@ VERDICT_FAILED = "failed"
 _TAG_FIELDS = {
     TAG_LASTRUN: "lastrun",
     TAG_FAILED: "failed",
-    TAG_REVSYNC: "revsync",
-    TAG_PROJECT: "project",
 }
 
 
@@ -90,7 +82,7 @@ def parse_tag_values(rows) -> dict:
 def parse_raw_tags(rows) -> dict:
     """{token: {raw tag key: [values]}} -- every tag on every project, ours and everyone else's.
 
-    parse_tag_values deliberately keeps only the four keys this module owns, keyed by field
+    parse_tag_values deliberately keeps only the keys this module owns, keyed by field
     name, because parse_tag_map derives its winners from it. Routing needs the raw keys
     (azure-project, azure-repo, azure-branch) under their own names, so it gets its own reader
     over the same rows rather than a widened one whose extra keys could reach parse_tag_map.
@@ -132,7 +124,7 @@ def count_parseable_rows(rows) -> int:
 
 
 def parse_tag_map(rows) -> dict:
-    """Project tag rows -> {token: {lastrun, failed, revsync, project}}, keys present only when tagged.
+    """Project tag rows -> {token: {lastrun, failed}}, keys present only when tagged.
 
     Deliberately tolerant: a malformed row is skipped, never fatal. This runs over every project
     in the organization, so one bad row must not cost the whole run its state.

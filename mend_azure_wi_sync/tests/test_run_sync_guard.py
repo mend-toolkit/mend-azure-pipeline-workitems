@@ -9,16 +9,6 @@ def _conf():
     return mock.MagicMock(wsproducttoken="", wsprojecttoken="", wsexcludetoken="")
 
 
-def _reverse_conf():
-    # The reverse sync path (update_wi_in_thread / update_wi_for_project) needs a real
-    # numeric utc_delta (it lands inside a datetime.timedelta) and a real string for
-    # reset/maxlookback (they're .lower()'d and int()'d respectively), unlike the
-    # forward-sync-only _conf() above.
-    return mock.MagicMock(azure_project="AzureTestProject", utc_delta=0, reset="false",
-                          maxlookback="720", wsproducttoken="", wsprojecttoken="",
-                          wsexcludetoken="")
-
-
 def test_run_sync_aborts_when_existing_items_cannot_be_read():
     """A failed WIQL query must never be treated as 'this project has no work items yet'."""
     with mock.patch.object(core, "get_prj_list_modified", return_value=["prj-token-1"]), \
@@ -63,52 +53,3 @@ def test_a_function_reads_live_state_but_an_imported_value_is_frozen():
     core.global_errors = 5
     assert sync_had_fatal_error() is True      # function -> live
     assert frozen_counter == 0                 # value    -> frozen at import time
-
-
-def test_a_failed_reverse_sync_wiql_query_sets_the_fatal_flag():
-    """A failed WIQL query in the reverse sync must never be treated as 'no more work items
-    changed' — that would let the project's revsync tag advance past updates that were
-    never actually read."""
-    core.project_tag_state = {"tok-1": {"project": "AzureTestProject|Prod/Proj"}}
-    with mock.patch.object(core, "call_azure_api", return_value=({"message": "boom"}, 2)), \
-         mock.patch.object(core, "save_project_tag") as save, \
-         mock.patch.object(core, "conf", _reverse_conf()):
-        before = core.global_errors
-        core.update_wi_in_thread()
-
-    assert core.sync_had_fatal_error() is True
-    assert core.global_errors == before + 1
-    save.assert_not_called()
-
-
-def test_a_genuinely_empty_reverse_sync_result_is_not_treated_as_a_failure():
-    """A successful WIQL query that legitimately finds nothing changed must not be
-    confused with a failed one — that distinction is the entire point of this fix."""
-    core.project_tag_state = {"tok-1": {"project": "AzureTestProject|Prod/Proj"}}
-    with mock.patch.object(core, "call_azure_api", return_value=({"workItems": []}, 0)), \
-         mock.patch.object(core, "save_project_tag", return_value=True), \
-         mock.patch.object(core, "conf", _reverse_conf()):
-        before = core.global_errors
-        result = core.update_wi_in_thread()
-
-    assert core.sync_had_fatal_error() is False
-    assert core.global_errors == before
-    assert "Updated 0" in result
-
-
-def test_a_failed_reverse_sync_hydration_batch_sets_the_fatal_flag():
-    """A failed wit/workitems hydration call must not silently drop that page of updates."""
-    core.project_tag_state = {"tok-1": {"project": "AzureTestProject|Prod/Proj"}}
-    wiql_page = ({"workItems": [{"id": 1}]}, 0)
-    failed_hydration = ({"message": "boom"}, 2)
-    empty_next_page = ({"workItems": []}, 0)
-    with mock.patch.object(core, "call_azure_api",
-                           side_effect=[wiql_page, failed_hydration, empty_next_page]), \
-         mock.patch.object(core, "save_project_tag") as save, \
-         mock.patch.object(core, "conf", _reverse_conf()):
-        before = core.global_errors
-        core.update_wi_in_thread()
-
-    assert core.sync_had_fatal_error() is True
-    assert core.global_errors == before + 1
-    save.assert_not_called()

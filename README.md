@@ -42,7 +42,7 @@ It utilizes Mend's [Issue Tracking API](https://docs.mend.io/bundle/integrations
 The PAT needs **Work Items (Read, write & manage)** and **Project and Team (Read)**.
 
 *Manage project properties* is **no longer required.** Sync state is stored as tags on the Mend
-project (`azure-wi-lastrun`, `azure-wi-failed`, `azure-wi-revsync`), so the `MEND_USERKEY` must be
+project (`azure-wi-lastrun`, `azure-wi-failed`), so the `MEND_USERKEY` must be
 permitted to save project tags instead. If tag writes fail, the tool still runs correctly — every
 window falls back to `MEND_MAXLOOKBACK` and overlapping work is repeated each run, with one error
 logged per run explaining why.

@@ -31,7 +31,6 @@ def test_incremental_sync_notice_is_info_not_warning():
          mock.patch.object(azure_wi_sync, "load_wi_json", return_value=("Task", [{}])), \
          mock.patch.object(azure_wi_sync, "migration_seed", return_value=""), \
          mock.patch.object(azure_wi_sync, "run_sync", return_value="ok"), \
-         mock.patch.object(azure_wi_sync, "update_wi_in_thread", return_value="ok"), \
          mock.patch.object(azure_wi_sync, "sync_had_fatal_error", return_value=False), \
          mock.patch.object(azure_wi_sync, "error_count", return_value=0), \
          mock.patch.object(azure_wi_sync.logger, "info") as info, \

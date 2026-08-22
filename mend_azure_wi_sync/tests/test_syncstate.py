@@ -1,17 +1,15 @@
 from mend_azure_wi_sync import syncstate
 
 
-def test_parses_our_three_tags_and_ignores_others():
+def test_parses_our_tags_and_ignores_others():
     rows = [{"name": "p", "token": "tok-1", "tags": {
         "azure-wi-lastrun": "2026-08-20 10:00:00",
         "azure-wi-failed": "2026-08-19 10:00:00",
-        "azure-wi-revsync": "2026-08-20 09:00:00",
         "azure-project": "Payments",
     }}]
     assert syncstate.parse_tag_map(rows) == {"tok-1": {
         "lastrun": "2026-08-20 10:00:00",
         "failed": "2026-08-19 10:00:00",
-        "revsync": "2026-08-20 09:00:00",
     }}
 
 
@@ -216,11 +214,6 @@ def test_no_verdict_writes_nothing():
     assert syncstate.tag_ops("", "2026-08-20 12:00:00") == []
 
 
-def test_the_project_tag_is_parsed_into_the_state_map():
-    rows = [{"token": "tok-1", "tags": {"azure-wi-project": "Payments|Prod/Proj"}}]
-    assert syncstate.parse_tag_map(rows) == {"tok-1": {"project": "Payments|Prod/Proj"}}
-
-
 # --- getOrganizationProjectTags returns list-valued tags (verified live 2026-08-21) ---
 # The 1.4 sweep's real row shape is {"name":…, "token":…, "tags": {key: [value, …]}} — the
 # tags container is a dict, but every value is a LIST of strings. Requiring str values here
@@ -229,7 +222,6 @@ def test_the_project_tag_is_parsed_into_the_state_map():
 
 def test_list_valued_tags_are_read_the_way_the_1_4_api_returns_them():
     rows = [{"name": "Test Workitems_master", "token": "tok-1", "tags": {
-        "azure-wi-project": ["Test Pipeline Workitems|Test Pipeline Workitems/Test Workitems_master"],
         "test": ["test"],
         "azure-branch": ["refs/heads/master"],
         "azure-project": ["Test Pipeline Workitems"],
@@ -237,7 +229,6 @@ def test_list_valued_tags_are_read_the_way_the_1_4_api_returns_them():
     }}]
     assert syncstate.parse_tag_map(rows) == {"tok-1": {
         "lastrun": "2026-08-21 14:36:34",
-        "project": "Test Pipeline Workitems|Test Pipeline Workitems/Test Workitems_master",
     }}
 
 
@@ -263,10 +254,10 @@ def test_a_multi_valued_tag_takes_the_latest_value():
 def test_every_value_is_retained_for_pruning_even_though_one_wins():
     rows = [{"token": "tok-1", "tags": {
         "azure-wi-lastrun": ["2026-08-21 14:36:34", "2026-08-21 14:55:01"],
-        "azure-wi-revsync": ["2026-08-21 14:56:00"]}}]
+        "azure-wi-failed": ["2026-08-21 14:56:00"]}}]
     assert syncstate.parse_tag_values(rows) == {"tok-1": {
         "lastrun": ["2026-08-21 14:36:34", "2026-08-21 14:55:01"],
-        "revsync": ["2026-08-21 14:56:00"]}}
+        "failed": ["2026-08-21 14:56:00"]}}
 
 
 def test_superseded_never_includes_the_value_in_use():

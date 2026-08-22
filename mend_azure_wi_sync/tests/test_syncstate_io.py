@@ -194,9 +194,7 @@ def test_the_live_1_4_row_shape_is_read_without_a_shape_warning(caplog):
          mock.patch.object(core, "call_ws_api", return_value=LIVE_SHAPE), \
          caplog.at_level("ERROR"):
         state = core.fetch_project_tag_state()
-    assert state == {"tok-routed": {
-        "lastrun": "2026-08-21 14:36:34",
-        "project": "Test Pipeline Workitems|Test Pipeline Workitems/Test Workitems_master"}}
+    assert state == {"tok-routed": {"lastrun": "2026-08-21 14:36:34"}}
     assert core.tag_state_available is True
     assert caplog.records == []
 
@@ -313,24 +311,6 @@ def test_the_verdict_path_prunes_the_previous_watermark_and_every_failed_value()
     assert ("removeProjectTag", syncstate.TAG_LASTRUN, "2026-08-20 10:00:00") in calls
     assert ("removeProjectTag", syncstate.TAG_FAILED, "2026-08-19 09:00:00") in calls
     assert ("removeProjectTag", syncstate.TAG_FAILED, "2026-08-20 09:00:00") in calls
-
-
-def test_the_reverse_watermark_and_the_address_are_pruned_too():
-    """Every one of the four keys is written by a different call site. A site left on the raw
-    save keeps accumulating values under its key while the other three stay clean."""
-    _reset_tag_globals({"tok-1": {"revsync": ["2026-08-20 09:00:00"],
-                                  "project": ["Old Project|Prod/Proj"]}})
-    state = {"tok-1": {"project": "Old Project|Prod/Proj"}}
-    with mock.patch.object(core, "conf", _conf()), \
-         mock.patch.object(core, "call_ws_api", return_value='{"projectTags": {}}') as api:
-        core.replace_project_tag("tok-1", syncstate.TAG_REVSYNC, "2026-08-21 14:56:00")
-        with mock.patch.object(core, "synced_projects", [("tok-1", "Prod/Proj", "")]):
-            core.conf.azure_project = "New Project"
-            core.save_project_addr("tok-1", state)
-    calls = _tag_calls(api)
-    assert ("removeProjectTag", syncstate.TAG_REVSYNC, "2026-08-20 09:00:00") in calls
-    assert ("saveProjectTag", syncstate.TAG_PROJECT, "New Project|Prod/Proj") in calls
-    assert ("removeProjectTag", syncstate.TAG_PROJECT, "Old Project|Prod/Proj") in calls
 
 
 # --- what counts as a successful write ---
