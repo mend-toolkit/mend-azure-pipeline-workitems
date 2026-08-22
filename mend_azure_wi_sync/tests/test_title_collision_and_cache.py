@@ -82,7 +82,7 @@ def test_replace_updates_exist_wis_cache_with_the_new_title():
     one entry for that id, keyed by the NEW title."""
     conf = _conf_dependency()
     stale_title = "shared-name.jar: 3 vulnerabilities (highest severity is 5.0)"
-    seeded_exist_wis = [{stale_title: {42: "Prod/Proj; security vulnerability"}}]
+    seeded_exist_wis = [{stale_title: {42: {"tags": "Prod/Proj; security vulnerability", "state": "Active"}}}]
     with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "fetch_prj_policy",
                            return_value=["Prod", "Proj", _lib_el(1)]), \

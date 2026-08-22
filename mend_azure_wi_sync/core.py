@@ -1053,14 +1053,21 @@ def get_exist_wi():
                 continue
             payload = {
                 "ids": batch_ids,
-                "fields": ["System.Id", "System.Title", "System.Tags", "System.WorkItemType"],  #"System.WorkItemType",
+                "fields": ["System.Id", "System.Title", "System.Tags", "System.State",
+                           "System.WorkItemType"],  #"System.WorkItemType",
             }
             response, err = call_azure_api(api_type="POST", api="wit/workitemsbatch", version="6.0",
                                            data=payload, project=conf.azure_project, header="application/json")
             if err != 0:
                 logger.error(f"[{fn()}] Work item batch hydration failed: {response}")
                 return None
-            work_items.extend([{x["fields"]["System.Title"]: {x["fields"]["System.Id"]: try_or_error(lambda: x["fields"]["System.Tags"],"")}} for x in response["value"]])
+            # System.State is carried so reconciliation can tell an open item from a closed one
+            # without a second round trip; a closed item that looked absent would be recreated
+            # as a duplicate and the original would never reopen.
+            work_items.extend([{x["fields"]["System.Title"]: {x["fields"]["System.Id"]: {
+                "tags": try_or_error(lambda x=x: x["fields"]["System.Tags"], ""),
+                "state": try_or_error(lambda x=x: x["fields"]["System.State"], "")}}}
+                for x in response["value"]])
                                #if x["fields"]["System.WorkItemType"].lower() == conf.azure_type.lower()])
 
         return work_items
@@ -1116,14 +1123,16 @@ def check_wi_id_matching(title_matches, project_name: str):
     is the part that must not be duplicated.
     """
     def owns(entry):
-        # entry is {work_item_id: raw_tags}; a malformed entry must skip, not abort the search.
+        # entry is {work_item_id: {"tags": raw_tags, "state": state}}; a malformed entry must
+        # skip, not abort the search.
         # ';' joins multiple values so a tag at the end of one value can't weld onto the start
         # of the next; the needle is stripped since tag_set() only strips the haystack; both
         # sides are casefolded because Azure Boards tags are case-insensitive for identity
         # (case-preserving on first write, lowercased on read back), so an exact case-sensitive
         # comparison would miss an existing tag forever and create a duplicate every run.
         return try_or_error(lambda: project_name.strip().casefold() in
-                            {t.casefold() for t in tag_set(';'.join(entry.values()))}, False)
+                            {t.casefold() for t in tag_set(
+                                ';'.join(v.get("tags", "") for v in entry.values()))}, False)
 
     try:
         values = []
@@ -1143,6 +1152,48 @@ def check_wi_id_matching(title_matches, project_name: str):
 
 def check_wi_id(id: str, project_name: str):
     return check_wi_id_matching(lambda title: title == id, project_name)
+
+
+def classify_title(title: str):
+    """A work item title -> (kind, library), or None if it is not one of ours.
+
+    Inverts the two shipped title formats:
+      "License Policy Violation detected in {lib}"                        -> license
+      "{lib}: {N} vulnerabilities (highest severity is {S})"              -> vulnerability
+    """
+    text = (title or "").strip()
+    prefix = "License Policy Violation detected in "
+    if text.startswith(prefix):
+        lib = text[len(prefix):].strip()
+        return ("license", lib) if lib else None
+    head = text.split(":", 1)[0].strip()
+    if head and matches_library(text, head):
+        return ("vulnerability", head)
+    return None
+
+
+def actual_work_items(project_name: str):
+    """{(kind, library): {"id", "state"}} for the live work items belonging to one Mend project.
+
+    The reverse of check_wi_id: that answers "does THIS title exist", this answers "what does
+    Azure currently hold for this project". Reconciliation needs the second question.
+
+    A title matching neither known format is IGNORED, never adopted. A person's hand-created work
+    item that happens to carry the Mend tag must never be closed by this tool.
+    """
+    found = {}
+    for entry_dict in exist_wis:
+        for title, entry in try_or_error(lambda: list(entry_dict.items()), []):
+            wid, meta = try_or_error(lambda: list(entry.items())[0], (None, None))
+            if wid is None or not isinstance(meta, dict):
+                continue
+            if not try_or_error(lambda: project_name.strip().casefold() in
+                                {t.casefold() for t in tag_set(meta.get("tags", ""))}, False):
+                continue
+            key = classify_title(title)
+            if key:
+                found[key] = {"id": wid, "state": meta.get("state", "")}
+    return found
 
 
 def clamp_revsync(prj_token, state, todate, max_hours, reset_on):
@@ -1672,7 +1723,9 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 r, errcode = call_azure_api(api_type="POST", api=f"wit/workitems/${wi_type}", data=data,
                                             project=conf.azure_project)
                 try:
-                    exist_wis.append({vul_title: {r["id"]: ",".join(tags)}})
+                    exist_wis.append({vul_title: {r["id"]: {
+                        "tags": ",".join(tags),
+                        "state": try_or_error(lambda: r["fields"]["System.State"], "")}}})
                 except Exception as err:
                     pass
                     #logger.warning(f"[{ex()}] Work item creation/update failed: {r}")
@@ -1692,7 +1745,9 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                             if exist_id in try_or_error(lambda d=d: list(d.values())[0], {}):
                                 exist_wis.remove(d)
                                 break
-                        exist_wis.append({vul_title: {exist_id: ",".join(tags)}})
+                        exist_wis.append({vul_title: {exist_id: {
+                            "tags": ",".join(tags),
+                            "state": try_or_error(lambda: r["fields"]["System.State"], "")}}})
                     except Exception as err:
                         pass
             try:
