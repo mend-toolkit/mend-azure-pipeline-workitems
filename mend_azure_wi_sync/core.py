@@ -9,7 +9,6 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
-from enrichment import format_epss, format_exploit, format_reachability
 from identity import cve_key, license_title, matches_cve, matches_library, parse_cve_title
 from reconcile import CLOSE, CREATE, REOPEN, SKIP, UPDATE, plan_actions
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
@@ -183,29 +182,6 @@ def get_azure_prj_id(prj_name: str):
 
 def reachability_enabled() -> bool:
     return conf.reachability.lower() == "true"
-
-
-def epss_exploit_row_fields(policy_el: dict) -> dict:
-    """The EPSS/Exploit row keys. Ungated: both values arrive inline with the Mend 3.0 finding,
-    so there is nothing to spare an org by hiding them, and both always carry a value."""
-    return {"EPSS": format_epss(policy_el), "Exploit": format_exploit(policy_el)}
-
-
-def reachability_row_field(policy_el: dict, reachability_on: bool) -> dict:
-    """The Reachability row key, gated on MEND_REACHABILITY alone."""
-    return {"Reachability": format_reachability(policy_el)} if reachability_on else {}
-
-
-def build_enrich_html(policy_el: dict, reachability_on: bool) -> str:
-    """The enrichment lines spliced into a CVE's description. EPSS and Exploit Code Maturity
-    always render; Reachability is gated on MEND_REACHABILITY, because it is blank for an org
-    that has not enabled reachability analysis."""
-    html = ""
-    if reachability_on:
-        html += f"<br><b>Reachability:</b> {format_reachability(policy_el)}"
-    html += f"<br><b>EPSS:</b> {format_epss(policy_el)}" \
-                f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}"
-    return html
 
 
 def _post_v2_login():
