@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _version import __tool_name__, __version__, __description__
 from core import run_sync, startup, migration_seed, load_wi_json, AGENT_INFO, \
-    check_patterns, sync_had_fatal_error, error_count
+    check_patterns, sync_had_fatal_error, error_count, reconcile_after_sync
 
 logger = logging.getLogger(__tool_name__)
 logging.getLogger('urllib3').setLevel(logging.INFO)
@@ -53,6 +53,9 @@ def main():
     # No write probe and no exit: sync state lives in Mend project tags now, so a missing
     # *Manage project properties* permission is no longer fatal — or needed.
     logger.info(run_sync(migration_seed(), todate, wi_fields, wi_type))
+    # After the forward sync for EVERY project, so core.synced_projects is complete. Gated on
+    # MEND_CLOSE and internally non-fatal: a failure here must not cost a sync that succeeded.
+    reconcile_after_sync()
     if sync_had_fatal_error():
         logger.error("The sync did not complete. Per-project sync state advanced only for the "
                      "Mend projects that finished; the rest were left untouched and will be "

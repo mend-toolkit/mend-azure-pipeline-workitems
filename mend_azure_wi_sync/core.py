@@ -1290,6 +1290,72 @@ def reconcile_project(project):
     return created, updated, closed, reopened, skipped
 
 
+def reconcile_after_sync():
+    """Close work items whose Mend findings are gone, for every project synced this run.
+
+    Runs AFTER the forward sync, off `synced_projects` -- the (prj_token, "Product/Project",
+    azure_project) tuples create_wi appends. That third element is the join that makes this
+    routing-safe: run_sync_routed re-points conf.azure_project per target, so the Azure project a
+    Mend project was written to is the only one its work items may be closed in.
+    """
+    global conf, global_errors
+    conf = startup() if not conf else conf
+    conf.update_properties()
+    logger.info(f"[{fn()}] Reconciliation starting for {len(synced_projects)} synced "
+                f"project(s): work items whose Mend finding is gone move to MEND_CLOSEDSTATE, "
+                f"and items whose finding came back move to MEND_REOPENSTATE.")
+
+    original_azure_project = conf.azure_project
+    try:
+        projects, ok = fetch_v3_projects()
+        if not ok:
+            logger.error(f"[{fn()}] Could not read the Mend project list. NOTHING is closed this "
+                         f"run: a partial list makes a project we simply failed to read look "
+                         f"exactly like one whose findings are all gone.")
+            return
+
+        lookup = {}
+        for project in projects or []:
+            key = f"{project.get('application_name', '')}/{project.get('name', '')}".casefold()
+            lookup[key] = project
+
+        closed = reopened = skipped = matched = unmatched = 0
+        for prj_token, product_project, azure_project in list(synced_projects):
+            project = lookup.get(str(product_project).casefold())
+            if not project:
+                unmatched += 1
+                logger.warning(f"[{fn()}] Mend project '{product_project}' was synced this run "
+                               f"but is not in the Mend 3.0 project list. It is SKIPPED -- "
+                               f"guessing which 3.0 project it is could close work items "
+                               f"belonging to a different project.")
+                continue
+            try:
+                # Per-project Azure target, restored afterwards. Leaking one project's target
+                # into the next closes work items in the wrong Azure project.
+                conf.azure_project = azure_project
+                _, _, prj_closed, prj_reopened, prj_skipped = reconcile_project(project)
+                closed += prj_closed
+                reopened += prj_reopened
+                skipped += prj_skipped
+                matched += 1
+            except Exception as err:
+                global_errors += 1
+                logger.error(f"[{ex()}] Reconciliation failed for '{product_project}': {err}. "
+                             f"The remaining projects are still reconciled.")
+            finally:
+                conf.azure_project = original_azure_project
+
+        logger.info(f"[{fn()}] Reconciliation summary: {closed} work item(s) closed, "
+                    f"{reopened} reopened, {skipped} already closed and skipped; "
+                    f"{matched} project(s) reconciled, {unmatched} unmatched and skipped.")
+    except Exception as err:
+        global_errors += 1
+        logger.error(f"[{ex()}] Reconciliation did not complete: {err}. The forward sync that "
+                     f"already succeeded is unaffected.")
+    finally:
+        conf.azure_project = original_azure_project
+
+
 def build_wi_tags(project_tag: str, policy_tag: str, routing: str, reponame: str) -> list:
     # Repo identity is a work item tag because the client declined Area Path. Taking the
     # values as arguments keeps this testable without constructing a whole Config.
