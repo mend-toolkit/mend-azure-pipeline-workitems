@@ -118,8 +118,9 @@ The following variables can be placed into the pipeline where the integration is
 > duplicate and left the original open.
 >
 > On your first run after upgrading, existing work items are matched by their old title and
-> **renamed in place**. Their ids, comments, assignees, links and history are preserved. No
-> action is required.
+> **renamed in place**. Their ids, comments, assignees, links and history are preserved, unless
+> `MEND_AZURETYPE` has changed since the item was created — in that case the mismatched item is
+> deleted and recreated, and the id and history do not carry over. No other action is required.
 <br />
 
 ## Enrichment: Reachability, EPSS and Exploit Code Maturity

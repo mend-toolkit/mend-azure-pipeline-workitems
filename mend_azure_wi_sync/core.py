@@ -63,6 +63,10 @@ global_errors = 0
 exist_wis = []
 synced_projects = []   # [(prj_token, "Product/Project", azure_project)] appended by create_wi
 updated_wi = []
+# Tracks which library keyId first claimed each exist_id this run, so a second library that
+# happens to render the same title (see FINDING 1 in the strict-title review) can be detected
+# instead of silently dropped by the `exist_id not in updated_wi` guard below.
+wi_claim_keyid = {}
 run_failed = False
 project_tag_state = None      # one getOrganizationProjectTags sweep per run
 project_tag_values = {}       # {token: {field: [every value]}} from that same sweep
@@ -1479,8 +1483,27 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 r, errcode = call_azure_api(api_type="PATCH", api=f"wit/workitems/{exist_id}", data=data,
                                             project=conf.azure_project)
                 status_op = "updated"
+                if errcode == 0:
+                    # FINDING 2: a PATCH here can rename the item (legacy-title migration, or any
+                    # other title change), and exist_wis is read again later this same run
+                    # (check_wi_id_matching). Replace the stale cache entry so it reflects the new
+                    # title instead of leaving the id cached under the old one too.
+                    try:
+                        for d in exist_wis:
+                            if exist_id in try_or_error(lambda d=d: list(d.values())[0], {}):
+                                exist_wis.remove(d)
+                                break
+                        exist_wis.append({vul_title: {exist_id: ",".join(tags)}})
+                    except Exception as err:
+                        pass
             try:
-                updated_wi.append(exist_id if exist_id > 0 else r["id"])
+                claimed_id = exist_id if exist_id > 0 else r["id"]
+                updated_wi.append(claimed_id)
+                # FINDING 1: record which library keyId claimed this work item id. exist_id is
+                # 0 for a brand-new item until the POST above returns its real id, so this must
+                # happen here (after the real id is known) rather than where exist_id was first
+                # resolved -- keying on exist_id there would key every new item under 0.
+                wi_claim_keyid[claimed_id] = (lib_key_id, lib_name)
             except Exception as err:
                 pass
 
@@ -1523,7 +1546,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
     def is_ignored(cve, ignored):
         return cve in ignored
 
-    global conf, global_errors, exist_wis, updated_wi, count_item, synced_projects
+    global conf, global_errors, exist_wis, updated_wi, wi_claim_keyid, count_item, synced_projects
     try:
         item_failed = False
         ws_prj = fetch_prj_policy(prj_token, sdate, edate)
@@ -1554,6 +1577,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                 continue
             lib_url = prj_el["library"]["url"]
             lib_name = prj_el["library"]["filename"]
+            lib_key_id = try_or_error(lambda: prj_el["library"]["keyId"], "")
             policy_lic_name = try_or_error(
                 lambda: prj_el['policy']['name'][prj_el['policy']['name'].find("]") + 1:].strip(), "")
             tags = build_wi_tags(f"{prd_name}/{prj_name}",
@@ -1704,6 +1728,18 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                     # Default priority is 2
                     if desc:  # Creation WI just in case existing data
                         create_wi_content(issue_id=issue_id)
+                else:
+                    # FINDING 1: two distinct libraries sharing a title (e.g. same filename,
+                    # different keyId -- a real Maven/npm case) resolve to the same exist_id.
+                    # The guard above already skips the second library's violations; make that
+                    # skip visible instead of silent.
+                    claimant_key, claimant_name = wi_claim_keyid.get(exist_id, (lib_key_id, lib_name))
+                    if claimant_key != lib_key_id:
+                        logger.warning(
+                            f"[{fn()}] Work item {exist_id} for title '{vul_title}' was already "
+                            f"claimed by library '{claimant_name}' (keyId={claimant_key}); "
+                            f"library '{lib_name}' (keyId={lib_key_id}) shares the same title and "
+                            f"its violations were skipped.")
             else:
                 for i, policy_el in enumerate(prj_el["policyViolations"]):
                     if (is_license and policy_el["violationType"] == "LICENSE") or (
@@ -1784,6 +1820,18 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                        f"<br><b> Library home page: " \
                                        f"</b><a href='{lib_home_page}'>{lib_home_page}</a>" + vul_data + lic_data
                                 create_wi_content(issue_id=issue_id)
+                            else:
+                                # FINDING 1: same exposure as the dependency-mode branch above --
+                                # two distinct libraries (e.g. same filename, different keyId) can
+                                # render the same per-CVE title and silently collide on exist_id.
+                                claimant_key, claimant_name = wi_claim_keyid.get(exist_id, (lib_key_id, lib_name))
+                                if claimant_key != lib_key_id:
+                                    logger.warning(
+                                        f"[{fn()}] Work item {exist_id} for title '{vul_title}' was "
+                                        f"already claimed by library '{claimant_name}' "
+                                        f"(keyId={claimant_key}); library '{lib_name}' "
+                                        f"(keyId={lib_key_id}) shares the same title and its "
+                                        f"violations were skipped.")
 
         if skipped_types:
             detail = ", ".join(f"{name} x{count}" for name, count in sorted(skipped_types.items()))
