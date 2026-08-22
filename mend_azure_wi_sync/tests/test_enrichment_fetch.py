@@ -110,8 +110,13 @@ def test_a_raising_fetch_never_reaches_create_wi():
 
 
 def test_the_2_0_and_3_0_transports_are_gone():
-    """Guards the deletion. These names existing again means the consolidation regressed."""
-    for gone in ("call_ws_api_v3", "fetch_project_enrichment", "resolve_project_uuids",
+    """Guards the deletion. These names existing again means the consolidation regressed.
+
+    call_ws_api_v3 is deliberately excluded from this list: Plan 2 Task 2 restored it (the
+    product owner reversed the single-transport goal), so its presence is no longer a
+    regression. See test_mend_v3_auth.py for its coverage.
+    """
+    for gone in ("fetch_project_enrichment", "resolve_project_uuids",
                  "prepare_enrichment", "project_uuid_map", "enrichment_disabled",
                  "ENRICHMENT_PAGE_LIMIT", "ENRICHMENT_MAX_PAGES"):
         assert not hasattr(core, gone), f"{gone} should have been deleted"
