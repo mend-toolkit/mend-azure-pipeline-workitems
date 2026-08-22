@@ -37,7 +37,6 @@ class varenvs(Enum):  # Lit of Env.variables
     wsazureuri = ("WS_AZUREURI","MEND_AZUREURI")
     wsazurepat = ("WS_AZUREPAT","MEND_AZUREPAT")
     wsazureproject = ("WS_AZUREPROJECT","MEND_AZUREPROJECT")
-    wsreset = ("WS_RESET","MEND_RESET")
     wsexcludetoken = ("WS_EXCLUDETOKEN","MEND_EXCLUDETOKEN")
     wsazurearea = ("WS_AZUREAREA","MEND_AZUREAREA")
     wsazuretype = ("WS_AZURETYPE","MEND_AZURETYPE")
@@ -52,7 +51,6 @@ class varenvs(Enum):  # Lit of Env.variables
     wsbranches = ("WS_BRANCHES", "MEND_BRANCHES")
     wsepss = ("WS_EPSS", "MEND_EPSS")
     wsreachability = ("WS_REACHABILITY", "MEND_REACHABILITY")
-    wsmaxlookback = ("WS_MAXLOOKBACK", "MEND_MAXLOOKBACK")
     wsemail = ("WS_EMAIL", "MEND_EMAIL")
     wsorguuid = ("WS_ORGUUID", "MEND_ORGUUID")
     wsseverity = ("WS_SEVERITY", "MEND_SEVERITY")
@@ -109,7 +107,6 @@ class Config:
     azure_project: str
     azure_pat: str
     utc_delta: int
-    reset: str
     wsproducttoken: str
     wsprojecttoken: str
     wsexcludetoken: str
@@ -126,7 +123,6 @@ class Config:
     branches: str
     epss: str
     reachability: str
-    maxlookback: str
     email: str
     org_uuid: str
     severity: str
@@ -146,7 +142,6 @@ class Config:
             "wsproducttoken": self.wsproducttoken,
             "wsprojecttoken": self.wsprojecttoken,
             "wsexcludetoken": self.wsexcludetoken,
-            "wsreset": self.reset,
             "wsazuretype": self.azure_type,
             "wscustomfields": self.azure_custom,
             "wsdependency" : self.dependency,
@@ -159,7 +154,6 @@ class Config:
             "wsbranches": self.branches,
             "wsepss": self.epss,
             "wsreachability": self.reachability,
-            "wsmaxlookback": self.maxlookback,
             "wsemail": self.email,
             "wsorguuid": self.org_uuid,
             "wsseverity": self.severity,
@@ -192,8 +186,6 @@ class Config:
                     value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "reachability":
                     value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
-                elif key == "maxlookback":
-                    value = "720" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "branches":
                     value = "main,master" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "severity":

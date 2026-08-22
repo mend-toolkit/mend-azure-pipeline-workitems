@@ -34,11 +34,11 @@ def _valid_conf(**overrides):
     from mend_azure_wi_sync.config import Config
     fields = dict(ws_user_key=VALID, ws_org_token=VALID, ws_url="https://saas.mend.io",
                   azure_uri="https://dev.azure.com/org/", azure_project="Platform",
-                  azure_pat=VALID, utc_delta=0, reset="false", wsproducttoken="",
+                  azure_pat=VALID, utc_delta=0, wsproducttoken="",
                   wsprojecttoken="", wsexcludetoken="", azure_area="", azure_type="Task",
                   azure_custom="", dependency="true", reponame="", description="ReproSteps",
                   priority="false", wsalert="true", proxy="", routing="false",
-                  branches="main,master", epss="false", reachability="false", maxlookback="720",
+                  branches="main,master", epss="false", reachability="false",
                   email="", org_uuid="", severity="high",
                   closed_state="Closed", reopen_state="New")
     fields.update(overrides)

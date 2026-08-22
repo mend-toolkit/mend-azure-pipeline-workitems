@@ -18,9 +18,6 @@ from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
 from source3 import (library_url, license_policy_name, normalise_findings, normalise_licenses,
                      normalise_projects, normalise_violations, render_inputs, select_projects,
                      severity_floor)
-from syncstate import (VERDICT_FAILED, failed_stamp, is_stale, count_parseable_rows, field_for,
-                       parse_tag_map, parse_raw_tags, parse_tag_values, superseded, tag_ops,
-                       window_start)
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -41,7 +38,6 @@ logger_vsts = logging.getLogger('vsts')
 logger_vsts.setLevel(logging.INFO)
 logger_msrest = logging.getLogger('msrest')
 logger_msrest.setLevel(logging.INFO)
-reset_back_time = 87600  # 10 years in hours
 
 conf = None
 max_wi = 100
@@ -64,17 +60,6 @@ updated_wi = []
 # instead of silently dropped by the `exist_id not in updated_wi` guard below.
 wi_claim_keyid = {}
 run_failed = False
-project_tag_state = None      # one getOrganizationProjectTags sweep per run
-project_tag_values = {}       # {token: {field: [every value]}} from that same sweep
-project_raw_tags = {}         # {token: {raw tag key: [values]}} from that same sweep, used by
-                               # fetch_project_tags for routing (routing tags are not ours)
-tag_state_available = True    # False once any tag call fails; drives the once-per-run warning
-tag_sweep_ok = True           # False only when the getOrganizationProjectTags sweep ITSELF
-                               # failed or was unreadable -- unlike tag_state_available, a later
-                               # tag WRITE failure does not flip this. fetch_project_tags gates
-                               # on this, not tag_state_available, so one failed saveProjectTag
-                               # mid-run does not abort routing for the rest of the run.
-TAG_WARNED = False            # WARNING_MSG-style guard so 400 projects log one error, not 400
 ALERTS_WARNED = False         # same guard for the enrichment alerts fetch: a user key that
                                # cannot read alerts fails for all ~107 projects identically
 
@@ -156,8 +141,6 @@ def check_patterns():
         res.append(f"MEND_EPSS must be 'true' or 'false', got '{conf.epss}'")
     if conf.reachability.lower() not in ("true", "false"):
         res.append(f"MEND_REACHABILITY must be 'true' or 'false', got '{conf.reachability}'")
-    if try_or_error(lambda: int(conf.maxlookback) <= 0, True):
-        res.append(f"MEND_MAXLOOKBACK must be a positive number of hours, got '{conf.maxlookback}'")
     return res
 
 
@@ -202,235 +185,6 @@ def get_azure_prj_id(prj_name: str):
     except Exception as err:
         pass
     return res
-
-
-def _warn_tag_state_once(detail: str):
-    """One error per run, not one per project. set_lastrun's per-call increment is exactly the
-    trap this avoids: 400 identical failures would drown the error count."""
-    global TAG_WARNED, tag_state_available, global_errors
-    tag_state_available = False
-    if TAG_WARNED:
-        return
-    TAG_WARNED = True
-    global_errors += 1
-    logger.error(f"[{fn()}] Could not persist sync state as Mend project tags ({detail}). "
-                f"Windows fall back to MEND_MAXLOOKBACK and overlapping work is repeated each "
-                f"run. Read the response above before assuming a permissions problem: this "
-                f"warning used to blame MEND_USERKEY for writes that had in fact succeeded.")
-
-
-def _tag_call(request_type: str, prj_token: str, key: str, value: str) -> bool:
-    body = {"requestType": request_type,
-            "userKey": conf.ws_user_key,
-            "orgToken": conf.ws_org_token,
-            "projectToken": prj_token,
-            "tagKey": key,
-            "tagValue": value}
-    # The call stays inside try_or_error: the original one-liner wrapped json.dumps and
-    # call_ws_api as well as the parse, so an exception from either was tolerated. Hoisting
-    # only the parse out would turn a survivable transport failure into a dead run.
-    raw = try_or_error(lambda: call_ws_api(data=json.dumps(body)), "")
-    payload = try_or_error(lambda: json.loads(raw), None)
-    logger.debug(f"[{fn()}] {request_type} {key} on {prj_token} -> {str(raw)[:300]}")
-    # Success is "no error reported", NOT the presence of a "projectTags" key. Requiring that key
-    # (nothing documents it on a write) made every successful save look failed: verified live
-    # 2026-08-21, where a save warned here at 14:55:38 and its value -- the run's todate,
-    # 2026-08-21 14:55:01 -- was in the org's tags immediately afterwards. Mend 1.4 reports
-    # failure in the body, the way get_prj_list_modified already reads it. errorCode 0 is
-    # success, so only a truthy code or any errorMessage counts.
-    error = ""
-    if isinstance(payload, dict):
-        error = str(payload.get("errorMessage") or "")
-        code = payload.get("errorCode")
-        if not error and code not in (None, 0, "0", ""):
-            error = f"errorCode {code}"
-    if payload is None or error:
-        # An empty body cannot be told apart from a rejected write: call_ws_api returns "" for
-        # every non-200 and the status code is gone by the time it reaches here. Report it.
-        detail = (f"returned {error}" if error else
-                  f"returned {str(raw)[:200]}" if str(raw).strip() else
-                  "returned an empty body: non-200 or transport failure")
-        _warn_tag_state_once(f"{request_type} of '{key}' on {prj_token} {detail}")
-        return False
-    return True
-
-
-def save_project_tag(prj_token: str, key: str, value: str) -> bool:
-    return _tag_call("saveProjectTag", prj_token, key, value)
-
-
-def remove_project_tag(prj_token: str, key: str, value: str = "") -> bool:
-    # removeProjectTag takes the same tagKey/tagValue pair as save and matches on the VALUE,
-    # deleting only that one and leaving any others under the key (verified live 2026-08-21:
-    # pruning the superseded azure-wi-lastrun left exactly the current value behind). So callers
-    # must pass the value the org sweep actually read back -- "" would name nothing.
-    return _tag_call("removeProjectTag", prj_token, key, value)
-
-
-def replace_project_tag(prj_token: str, key: str, value: str) -> bool:
-    """Save one tag value and delete the ones it supersedes.
-
-    saveProjectTag does NOT replace: it adds another value under the same key (verified live
-    2026-08-21 in both the API and the Mend UI -- two runs left azure-wi-lastrun carrying two
-    timestamps). Nothing removes the old one on its own, so each key would grow by one value per
-    run per project, against a tag value limit that is still unverified.
-
-    Save first, prune second, and never prune the value just written. If the prune fails, the key
-    keeps both values and parse_tag_map's latest-wins reading is still correct; the reverse order
-    would leave a project with no watermark at all whenever the save failed, silently widening its
-    next window to MEND_MAXLOOKBACK.
-    """
-    if not save_project_tag(prj_token, key, value):
-        return False
-    field = field_for(key)
-    if not field:
-        return True
-    stored = (project_tag_values.get(prj_token) or {}).get(field) or []
-    for stale in superseded(stored, value):
-        remove_project_tag(prj_token, key, stale)
-    # Track what this run wrote, so a second save for the same key prunes the value this run
-    # superseded rather than re-issuing a remove for one already gone.
-    project_tag_values.setdefault(prj_token, {})[field] = [value]
-    return True
-
-
-def clear_project_tag(prj_token: str, key: str, value: str = ""):
-    """Delete every value stored under one key, not just the one the caller named.
-
-    tag_ops names a single TAG_FAILED value (the winner of the read-once map). With append
-    semantics a project that failed several runs carries several, and one value left behind keeps
-    it in the retry queue forever.
-    """
-    field = field_for(key)
-    stored = list((project_tag_values.get(prj_token) or {}).get(field) or []) if field else []
-    for stale in sorted(set(stored + ([value] if value else []))):
-        remove_project_tag(prj_token, key, stale)
-    if field:
-        project_tag_values.setdefault(prj_token, {}).pop(field, None)
-
-
-def apply_tag_ops(prj_token: str, ops: list):
-    """Apply an ordered op list from syncstate.tag_ops, stopping if an advance fails.
-
-    A failed advance must not be followed by clearing TAG_FAILED: that would drop the project
-    from the retry queue while its watermark still points at a window we never read.
-    """
-    for op, key, value in ops or []:
-        if op == "save":
-            if not replace_project_tag(prj_token, key, value):
-                return
-        elif op == "remove":
-            clear_project_tag(prj_token, key, value)
-
-
-def record_verdict(prj_token: str, verdict: str, todate: str, state: dict):
-    """Persist one project's verdict and make a FAILED one visible in the run.
-
-    Without this the only trace of a wholly failed project is a tag in Mend: main() would
-    print "Sync process completed successfully" and exit 0.
-
-    run_failed is deliberately NOT set. One project's failure must not withhold every other
-    project's state — that all-or-nothing withhold is exactly what this design removed.
-    """
-    global global_errors
-    if verdict == VERDICT_FAILED:
-        global_errors += 1
-        logger.error(f"[{fn()}] Mend project {prj_token} did not sync completely. Its sync state "
-                    f"is not advanced and it will be retried on the next run.")
-    apply_tag_ops(prj_token, tag_ops(verdict, todate, failed_stamp(prj_token, state)))
-
-
-def project_window(prj_token: str, state: dict, todate: str, max_hours, reset_on: bool) -> str:
-    """window_start, plus the warning a stale watermark owes the operator.
-
-    A stored watermark is used as stored however old (syncstate.keep_or_clamp): flooring it
-    would skip everything between it and the floor, and the next OK verdict would close that
-    gap for good. The price is a window wider than MEND_MAXLOOKBACK, which must not be silent.
-    """
-    start = window_start(prj_token, state, todate, max_hours, reset_on, reset_back_time)
-    if not reset_on and is_stale((state or {}).get(prj_token, {}).get("lastrun"),
-                                 todate, max_hours):
-        logger.warning(f"[{fn()}] Mend project {prj_token} last synced {start}, which is older "
-                      f"than MEND_MAXLOOKBACK ({max_hours}h), so its window is wider than that "
-                      f"limit. Narrowing it would permanently discard everything raised in "
-                      f"between. Expect extra idempotent work until it succeeds once.")
-    return start
-
-
-def fetch_project_tag_state() -> dict:
-    """{token: {lastrun, failed}} for the whole org, read once per run.
-
-    Memoised for the run -- one sweep answers every caller. An unreadable sweep returns {} and marks state
-    unavailable rather than raising: every window then falls back to the clamp, which is correct
-    but repeats work, so the operator needs the warning and the run needs to continue.
-
-    Also sets tag_sweep_ok = False on either of its own two failure paths (unreadable body;
-    rows present but structurally unparseable). fetch_project_tags gates on that flag, so this
-    is a genuinely new behaviour versus the pre-Task-4 code: previously a structurally-bad sweep
-    only warned and let every window fall back to the per-project clamp, with routing untouched
-    (routing read the separate 2.0 /entities call). Now project_raw_tags -- the routing tags --
-    comes from this same sweep, so the same failure also aborts a routed run outright rather
-    than silently routing nothing. Deliberate: failing loudly beats routing nothing silently.
-    """
-    global project_tag_state, project_tag_values, project_raw_tags, tag_sweep_ok
-    if project_tag_state is not None:
-        return project_tag_state
-    body = {"requestType": "getOrganizationProjectTags",
-            "userKey": conf.ws_user_key,
-            "orgToken": conf.ws_org_token}
-    payload = try_or_error(lambda: json.loads(call_ws_api(data=json.dumps(body))), None)
-    rows = try_or_error(lambda: payload["projectTags"], None)
-    if rows is None:
-        _warn_tag_state_once("getOrganizationProjectTags")
-        tag_sweep_ok = False
-        project_tag_state = {}
-        return project_tag_state
-    # All three views come from the one sweep: the winners the run reads, every value (which is
-    # what replace_project_tag has to name to delete a superseded one), and the raw per-token tag
-    # dict routing reads (see fetch_project_tags) -- routing tags are not ours, so they are not
-    # in project_tag_values/parse_tag_map's four-key contract.
-    project_tag_values = parse_tag_values(rows)
-    project_raw_tags = parse_raw_tags(rows)
-    project_tag_state = parse_tag_map(rows)
-    if rows and not count_parseable_rows(rows):
-        # Rows the parser cannot structurally read means the row shape is not what parse_tag_map
-        # expects. Without this the run logs "Sync state: Mend project tags", every window
-        # silently falls to the clamp, no project is ever retried, and migration_seed re-reads
-        # the frozen legacy property forever. Deliberately no guessing at alternative key names:
-        # this exists to make a mismatch loud, not to paper over it.
-        #
-        # The test is structural, NOT "did any project yield state". Most projects in an org
-        # carry only CLI scan tags (CTX, commitId, repoFullName) and none of ours, so on the
-        # first run after upgrade every row parses to nothing — normal, and it used to spend
-        # this run's one warning on a mismatch that did not exist.
-        _warn_tag_state_once("getOrganizationProjectTags returned rows in an unexpected shape")
-        tag_sweep_ok = False
-    return project_tag_state
-
-
-def fetch_project_tags(tokens: list) -> dict:
-    """Map Mend 1.4 project token -> that project's tags, from the org sweep.
-
-    Returns None (the whole call) if the sweep was unreadable OR structurally unparseable
-    (fetch_project_tag_state's tag_sweep_ok), matching the previous all-or-nothing convention:
-    a partial map would make a real project look untagged and route nothing, silently. The
-    structurally-unparseable case is new: it used to only cost sync state its watermark and let
-    routing continue via the separate 2.0 /entities call; now routing tags come from the same
-    sweep, so the same bad shape means no routing tags exist for anyone and the whole call fails
-    rather than quietly routing nothing.
-
-    This used to join 2.0 /entities rows to 1.4 tokens on (productName, projectName), because
-    1.4 tokens and 2.0 uuids are different identifier spaces. The 1.4 sweep carries the same
-    routing tags keyed by the token directly (verified live 2026-08-21), which removes the
-    join, the getAllProducts/getAllProjects fan-out behind it, and the duplicate-name-pair
-    ambiguity that forced SKIP_UNKNOWN for two projects sharing a name pair. Per-token None
-    (the collision signal) is gone with it: tokens cannot collide, so an unresolved token is
-    simply untagged ({}), same as a resolved-but-tagless one.
-    """
-    fetch_project_tag_state()
-    if not tag_sweep_ok:
-        return None
-    return {token: dict(project_raw_tags.get(token) or {}) for token in tokens}
 
 
 def epss_enabled() -> bool:
@@ -2160,7 +1914,6 @@ def startup():
         azure_uri=varenvs.get_env("wsazureuri").strip(),
         azure_pat=varenvs.get_env("wsazurepat").strip(),
         azure_project=varenvs.get_env("wsazureproject").strip(),
-        reset=varenvs.get_env("wsreset", "False").strip(),
         wsexcludetoken=varenvs.get_env("wsexcludetoken").strip(),
         azure_area=varenvs.get_env("wsazurearea").strip(),
         azure_type=varenvs.get_env("wsazuretype", "Task").strip(),
@@ -2176,7 +1929,6 @@ def startup():
         branches=varenvs.get_env("wsbranches").strip(),
         epss=varenvs.get_env("wsepss").strip(),
         reachability=varenvs.get_env("wsreachability").strip(),
-        maxlookback=varenvs.get_env("wsmaxlookback").strip(),
         email=varenvs.get_env("wsemail").strip(),
         org_uuid=varenvs.get_env("wsorguuid").strip(),
         severity=varenvs.get_env("wsseverity").strip(),
