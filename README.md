@@ -35,6 +35,7 @@ There is no watermark, no "modified since" window and no stored sync state. A ru
 - [Enrichment: Reachability, EPSS and Exploit Code Maturity](#enrichment-reachability-epss-and-exploit-code-maturity)
 - [Setting Scan Tags for Tag-Based Routing](#setting-scan-tags-for-tag-based-routing)
 - [Closing and Reopening Work Items](#closing-and-reopening-work-items)
+- [Unchanged Work Items and State Preservation](#unchanged-work-items-and-state-preservation)
 - [Execution](#execution)
 - [Custom Field Mapping](#custom-field-mapping)
   - [Available `MEND:` Paths](#available-mend-paths)
@@ -195,6 +196,16 @@ Closing sets the Work Item's `System.State` to `MEND_CLOSEDSTATE` (default `Clos
 >**_NOTE_**: Reconciliation identifies Work Items by their **title** and by the `{product}/{project}` tag the integration writes. A Work Item whose title was hand-edited is no longer recognised, and will neither be updated nor closed — a second Work Item is created for the finding instead. Do not rename the titles the integration generates.
 
 >**_NOTE_**: In `MEND_DEPENDENCY: true` (the default) one Work Item covers one library, so it is closed only once **every** vulnerability in that library is gone. In `MEND_DEPENDENCY: false` one Work Item is one CVE and is closed as soon as that CVE is gone.
+<br />
+
+## Unchanged Work Items and State Preservation
+**A Work Item whose content has not changed is not written at all.** Before updating a Work Item the integration compares what it is about to write — title, priority, tags, the description field selected by `MEND_DESCRIPTION`, the area path, and any custom fields — against what Azure DevOps already holds. When every one of them already matches, the update is skipped and the run logs it (at `DEBUG`) as unchanged. Tags are compared as a set and case-insensitively, so Azure's own `"; "` formatting never counts as a change. If the Work Item could not be read, the update is issued anyway — an unreadable item is never assumed to be up to date.
+
+This matters beyond saving API calls. **Some Azure DevOps processes have a rule that resets a Work Item's state whenever the item is edited.** With such a rule in place, an update that changed nothing would still drag a Work Item an operator had moved to `Active` back to `New`, once per run. Skipping the write removes that entirely for the Work Items that did not change.
+
+**When a content update genuinely is needed, the previous state is restored.** The integration records the Work Item's `System.State` before the update and checks it afterwards. If a process rule moved it, the original value is written back and the run logs at `INFO` that the state was restored. A restore that itself fails is logged and the run carries on — it never costs a Work Item or fails the run.
+
+>**_NOTE_**: This does **not** interfere with [closing and reopening](#closing-and-reopening-work-items). Those deliberately set `System.State` to `MEND_CLOSEDSTATE` / `MEND_REOPENSTATE`, run as a separate reconciliation step after the content updates, and are never undone by state preservation.
 <br />
 
 ## Execution

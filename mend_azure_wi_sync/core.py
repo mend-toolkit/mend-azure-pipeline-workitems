@@ -1194,6 +1194,80 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
     return items
 
 
+def wi_content_unchanged(ops: list, fields: dict) -> bool:
+    """True when every field this run would write already holds that value in Azure.
+
+    The point is NOT to save an API call: some Azure DevOps process rules reset a work item's
+    state on every edit, so a PATCH that changes nothing still drags an operator's Active item
+    back to New. Not issuing that PATCH is the fix. Anything this cannot prove identical -- an
+    op it does not understand, a field missing from the GET -- returns False, because writing
+    twice is harmless and skipping a real change is not.
+    """
+    if not fields:
+        return False
+    for op_ in ops or []:
+        path = op_.get("path", "")
+        if not path.startswith("/fields/"):
+            return False
+        name = path[len("/fields/"):]
+        cur_val = fields.get(name)
+        if op_.get("op") == "remove":
+            # A remove only matters when Azure still holds something to remove.
+            if cur_val not in (None, ""):
+                return False
+            continue
+        new_val = op_.get("value")
+        if name == "System.Tags":
+            # Azure returns "; "-delimited and this tool writes comma-joined, and tag identity
+            # is case-insensitive there -- comparing the raw strings would report a change on
+            # every single run and skip nothing at all.
+            if {t.lower() for t in tag_set(str(new_val or ""))} != \
+                    {t.lower() for t in tag_set(str(cur_val or ""))}:
+                return False
+        elif name == "Microsoft.VSTS.Common.Priority":
+            # Azure hands priority back as an int or a string depending on the field type.
+            if try_or_error(lambda: int(float(new_val)), new_val) != \
+                    try_or_error(lambda: int(float(cur_val)), cur_val):
+                return False
+        elif str(new_val if new_val is not None else "") != str(cur_val if cur_val is not None else ""):
+            return False
+    return True
+
+
+def restore_wi_state(exist_id: int, prior_state: str, patch_result) -> str:
+    """Put the work item's `System.State` back after a content PATCH that Azure reset.
+
+    Only ever called from write_wi_v3's update path. apply_close/apply_reopen change state on
+    purpose and run later, from reconcile_project, so this can never fight them. A failure here
+    is logged and swallowed -- an unrestored state must not cost the run or the work item.
+    """
+    try:
+        current = try_or_error(lambda: patch_result["fields"]["System.State"], "")
+        if not current:
+            # Only when the PATCH response carried no fields -- no second round trip otherwise.
+            chk, cerr = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
+                                       data={}, project=conf.azure_project)
+            if cerr != 0:
+                return prior_state
+            current = try_or_error(lambda: chk["fields"]["System.State"], "")
+        if not current or current == prior_state:
+            return current or prior_state
+        _, err_r = call_azure_api(
+            api_type="PATCH", api=f"wit/workitems/{exist_id}",
+            data=[{"op": "replace", "path": "/fields/System.State", "value": prior_state}],
+            project=conf.azure_project)
+        if err_r != 0:
+            logger.warning(f"[{fn()}] Work item {exist_id} was reset from '{prior_state}' to "
+                           f"'{current}' on update and could not be restored.")
+            return current
+        logger.info(f"[{fn()}] Work item {exist_id} state restored to '{prior_state}' after the "
+                    f"update (Azure DevOps had reset it to '{current}').")
+        return prior_state
+    except Exception as err:
+        logger.error(f"[{ex()}] Could not restore the state of work item {exist_id}: {err}")
+        return prior_state
+
+
 def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: str,
                 project_name: str):
     """Create or update ONE work item from a rendered 3.0 item. Returns "created", "updated"
@@ -1269,6 +1343,15 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
         data.append({"op": azure_operation, "path": "/fields/System.AreaPath",
                      "value": f"{conf.azure_area}"})
 
+    # err_ == 0 is required: a failed GET proves nothing, so it falls through to the PATCH.
+    prior_state = try_or_error(lambda: wi_data["fields"]["System.State"], "") if err_ == 0 else ""
+    if azure_operation == "replace" and err_ == 0 and wi_content_unchanged(
+            data, try_or_error(lambda: wi_data["fields"], {}) or {}):
+        logger.debug(f"[{fn()}] Work item {exist_id} ('{title}') is unchanged; skipping the "
+                     f"update so an Azure DevOps process rule cannot reset its state.")
+        updated_wi.append(exist_id)
+        return "unchanged"
+
     try:
         if azure_operation == "add":
             if lib_url:
@@ -1286,6 +1369,9 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
             status_op = "updated"
         if errcode == 0:
             claimed_id = exist_id if exist_id > 0 else try_or_error(lambda: r["id"], 0)
+            wi_state = try_or_error(lambda: r["fields"]["System.State"], "")
+            if azure_operation == "replace" and prior_state:
+                wi_state = restore_wi_state(exist_id, prior_state, r)
             if claimed_id:
                 # A PATCH can rename the item, and exist_wis is read again later this same run,
                 # so the stale entry is replaced rather than left cached under its old title.
@@ -1294,7 +1380,7 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
                         exist_wis.remove(d)
                 exist_wis.append({title: {claimed_id: {
                     "tags": ",".join(tags),
-                    "state": try_or_error(lambda: r["fields"]["System.State"], "")}}})
+                    "state": wi_state}}})
                 updated_wi.append(claimed_id)
             logger.info(f"{conf.azure_type} {try_or_error(lambda: r['id'], claimed_id)} {status_op}")
             return status_op
@@ -1321,7 +1407,7 @@ def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
     conf = startup() if not conf else conf
     project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
     reachability_on = reachability_enabled()
-    created = updated = failed = 0
+    created = updated = failed = unchanged = 0
     for (kind, key), entry in (desired or {}).items():
         # The KEY is the work item's identity ("{cve}|{lib}" in per-CVE mode); the LIBRARY is what
         # the renderers need. They are the same string only in dependency mode, so the library is
@@ -1348,12 +1434,14 @@ def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
                     updated += 1
                 elif outcome == "failed":
                     failed += 1
+                elif outcome == "unchanged":
+                    unchanged += 1
         except Exception as err:
             failed += 1
             logger.error(f"[{ex()}] Work item creation failed for "
                          f"{kind} '{key}' in {project_name}: {err}")
     logger.info(f"[{fn()}] {project_name}: {created} work item(s) created, {updated} updated, "
-                f"{failed} failed.")
+                f"{unchanged} unchanged and left alone, {failed} failed.")
     return created, updated, failed
 
 
