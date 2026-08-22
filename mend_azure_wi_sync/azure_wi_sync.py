@@ -53,8 +53,9 @@ def main():
     # No write probe and no exit: sync state lives in Mend project tags now, so a missing
     # *Manage project properties* permission is no longer fatal — or needed.
     logger.info(run_sync(migration_seed(), todate, wi_fields, wi_type))
-    # After the forward sync for EVERY project, so core.synced_projects is complete. Gated on
-    # MEND_CLOSE and internally non-fatal: a failure here must not cost a sync that succeeded.
+    # After the forward sync for EVERY project, so core.synced_projects is complete. Runs
+    # unconditionally -- there is no opt-in flag -- and is internally non-fatal: a failure here
+    # must not cost a sync that already succeeded.
     reconcile_after_sync()
     if sync_had_fatal_error():
         logger.error("The sync did not complete. Per-project sync state advanced only for the "
