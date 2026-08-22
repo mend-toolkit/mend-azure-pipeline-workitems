@@ -1196,6 +1196,37 @@ def actual_work_items(project_name: str):
     return found
 
 
+def _patch_state(work_item_id, state: str, verb: str) -> bool:
+    """PATCH System.State and NOTHING else.
+
+    Deliberately not a description rewrite: this path has no enrichment join, so rewriting the
+    description would blank the EPSS and reachability columns (observed live), and a closed work
+    item is a record worth preserving exactly as the operator last saw it.
+    """
+    data = [{"op": "replace", "path": "/fields/System.State", "value": state}]
+    try:
+        response, errorcode = call_azure_api(api_type="PATCH", api=f"wit/workitems/{work_item_id}",
+                                             data=data, project=conf.azure_project)
+        if errorcode != 0:
+            logger.error(f"[{fn()}] Could not {verb} work item {work_item_id} to state "
+                         f"'{state}': {response}. This one item is left as it was; the run "
+                         f"continues.")
+            return False
+        logger.info(f"[{fn()}] Work item {work_item_id} {verb}d ({state})")
+        return True
+    except Exception as err:
+        logger.error(f"[{ex()}] Could not {verb} work item {work_item_id}: {err}")
+        return False
+
+
+def apply_close(work_item_id, state: str) -> bool:
+    return _patch_state(work_item_id, state, "close")
+
+
+def apply_reopen(work_item_id, state: str) -> bool:
+    return _patch_state(work_item_id, state, "reopen")
+
+
 def clamp_revsync(prj_token, state, todate, max_hours, reset_on):
     """window_start reads TAG_LASTRUN; the reverse direction needs TAG_REVSYNC.
 

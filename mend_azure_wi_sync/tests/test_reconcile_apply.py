@@ -1,3 +1,5 @@
+from unittest import mock
+
 from mend_azure_wi_sync import core
 from mend_azure_wi_sync.config import Config, varenvs
 
@@ -86,3 +88,48 @@ def test_a_malformed_entry_is_skipped_not_fatal():
 def test_an_empty_cache_returns_empty():
     core.exist_wis = []
     assert core.actual_work_items("ProductX/api") == {}
+
+
+def test_close_patches_only_the_state_field():
+    """No description rewrite: the close path has no enrichment data and would blank the
+    EPSS and reachability columns of a work item nobody is going to look at again."""
+    seen = {}
+
+    def fake(api_type, api, data=None, **kw):
+        seen["type"], seen["api"], seen["data"] = api_type, api, data
+        return {"id": 42}, 0
+
+    with mock.patch.object(core, "conf", mock.MagicMock(azure_project="P")), \
+         mock.patch.object(core, "call_azure_api", fake):
+        assert core.apply_close(42, "Closed") is True
+    assert seen["type"] == "PATCH"
+    assert "42" in seen["api"]
+    assert [d["path"] for d in seen["data"]] == ["/fields/System.State"]
+    assert seen["data"][0]["value"] == "Closed"
+
+
+def test_reopen_patches_only_the_state_field():
+    seen = {}
+
+    def fake(api_type, api, data=None, **kw):
+        seen["data"] = data
+        return {"id": 42}, 0
+
+    with mock.patch.object(core, "conf", mock.MagicMock(azure_project="P")), \
+         mock.patch.object(core, "call_azure_api", fake):
+        assert core.apply_reopen(42, "New") is True
+    assert [d["path"] for d in seen["data"]] == ["/fields/System.State"]
+    assert seen["data"][0]["value"] == "New"
+
+
+def test_an_invalid_transition_fails_one_item_without_raising():
+    """Some processes disallow Closed -> New. That must cost one work item, not the run."""
+    with mock.patch.object(core, "conf", mock.MagicMock(azure_project="P")), \
+         mock.patch.object(core, "call_azure_api", return_value=({"message": "bad transition"}, 1)):
+        assert core.apply_close(42, "Closed") is False
+
+
+def test_a_transport_failure_also_returns_false_without_raising():
+    with mock.patch.object(core, "conf", mock.MagicMock(azure_project="P")), \
+         mock.patch.object(core, "call_azure_api", side_effect=Exception("boom")):
+        assert core.apply_close(42, "Closed") is False
