@@ -358,3 +358,125 @@ def test_a_partial_overlap_closes_only_the_missing_one():
         stats = core.reconcile_project(PROJECT)
     assert closes == [(43, "Closed")]
     assert stats[2] == 1
+
+
+# --- per-CVE mode (MEND_DEPENDENCY=false) closure ---------------------------------------------
+#
+# Closure used to be dependency-mode only: classify_title could not decode
+# "{CVE} ({Severity}) detected in {lib}", so actual_work_items never saw those items and
+# reconciliation could neither close nor reopen them. These drive the WHOLE loop -- fetch, create,
+# reconcile -- with only the two transports doubled, because the defect lived in the seam between
+# the key `desired` is built on and the key a title decodes to, and a test that stubs either half
+# cannot see it.
+
+PER_CVE_TITLE = "CVE-2021-44228 (Critical) detected in log4j-core"
+PER_CVE_KEY = ("vulnerability", "CVE-2021-44228|log4j-core")
+
+
+def _per_cve_conf():
+    return mock.MagicMock(azure_project="P", closed_state="Closed", reopen_state="New",
+                          severity="high", dependency="false", azure_type="Task",
+                          reachability="false", reponame="", routing="false",
+                          description="Description", priority="false", azure_area="",
+                          org_uuid="org-1", ws_url="saas.mend.io", proxy={})
+
+
+def _security_finding(status="ACTIVE", cve="CVE-2021-44228", lib="log4j-core", severity="critical"):
+    return {"component": {"name": lib, "version": "2.14.1", "references": {}},
+            "vulnerability": {"name": cve, "score": 10.0, "severity": severity,
+                              "description": "RCE", "references": []},
+            "findingInfo": {"status": status}}
+
+
+def _drive(findings, azure, conf):
+    """One whole sync_project_v3 pass: 3.0 read -> create/update -> reconcile."""
+    def pages(api, **kw):
+        return (findings, True) if "findings/security" in api else ([], True)
+
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core, "call_azure_api", azure), \
+         mock.patch.object(core, "fetch_v3_pages", side_effect=pages), \
+         mock.patch.object(core, "fetch_v3_licenses", return_value=({}, True)), \
+         mock.patch.object(core, "updated_wi", []), \
+         mock.patch.object(core, "synced_projects", []):
+        core.sync_project_v3(PROJECT, 7.0, [], "Task")
+
+
+def _calls(azure, api_type):
+    return [c.kwargs for c in azure.call_args_list if c.kwargs.get("api_type") == api_type]
+
+
+def test_a_suppressed_cve_closes_its_work_item_in_per_cve_mode():
+    """The gap this closes. Run 1 creates the item; run 2 sees the finding IGNORED (suppressed
+    in Mend) and must PATCH it Closed -- which needs classify_title to decode the per-CVE title
+    into the very key `desired` was built on."""
+    conf = _per_cve_conf()
+    core.exist_wis = []
+    created = mock.MagicMock(return_value=({"id": 101, "fields": {"System.State": "New"}}, 0))
+    _drive([_security_finding()], created, conf)
+    posted = [c for c in _calls(created, "POST") if "wit/workitems/$" in c["api"]]
+    assert len(posted) == 1
+    assert next(op["value"] for op in posted[0]["data"]
+                if op["path"] == "/fields/System.Title") == PER_CVE_TITLE
+    assert core.actual_work_items("ProductX/api")[PER_CVE_KEY]["id"] == 101
+
+    # Run 2: the same finding, now suppressed in Mend. Nothing else changes.
+    closed = mock.MagicMock(return_value=({"id": 101, "fields": {"System.State": "Closed", "System.WorkItemType": "Task"}}, 0))
+    _drive([_security_finding(status="IGNORED")], closed, conf)
+    patches = [c for c in _calls(closed, "PATCH") if c["api"] == "wit/workitems/101"]
+    assert len(patches) == 1, "the suppressed CVE's work item was not closed"
+    assert patches[0]["data"] == [{"op": "replace", "path": "/fields/System.State",
+                                  "value": "Closed"}]
+
+
+def test_a_returning_cve_reopens_the_same_work_item_not_a_new_one():
+    """Reopen, not re-create: the operator's history, comments and links live on item 101."""
+    conf = _per_cve_conf()
+    # Azure holds the item this tool created and later closed -- the state a fresh get_exist_wi
+    # sweep returns at the start of the next run.
+    core.exist_wis = [_wi(PER_CVE_TITLE, 101, TAGS, state="Closed")]
+    azure = mock.MagicMock(return_value=({"id": 101, "fields": {"System.State": "Closed", "System.WorkItemType": "Task"}}, 0))
+    _drive([_security_finding()], azure, conf)
+
+    assert [c for c in _calls(azure, "POST") if "wit/workitems/$" in c["api"]] == [], \
+        "a returning CVE must reopen its work item, never create a second one"
+    reopens = [c for c in _calls(azure, "PATCH")
+               if c["data"] == [{"op": "replace", "path": "/fields/System.State",
+                                 "value": "New"}]]
+    assert len(reopens) == 1
+    assert reopens[0]["api"] == "wit/workitems/101"
+
+
+def test_a_rescored_cve_updates_its_work_item_rather_than_duplicating_it():
+    """The severity word in the title moves on a rescore. Matching it exactly would create a
+    second work item and strand the first open -- the defect this project exists to fix."""
+    conf = _per_cve_conf()
+    core.exist_wis = [_wi(PER_CVE_TITLE, 101, TAGS, state="Active")]
+    azure = mock.MagicMock(return_value=({"id": 101, "fields": {"System.State": "Active", "System.WorkItemType": "Task"}}, 0))
+    _drive([_security_finding(severity="high")], azure, conf)
+
+    assert [c for c in _calls(azure, "POST") if "wit/workitems/$" in c["api"]] == []
+    updates = [c for c in _calls(azure, "PATCH") if c["api"] == "wit/workitems/101"]
+    assert len(updates) == 1
+    assert next(op["value"] for op in updates[0]["data"]
+                if op["path"] == "/fields/System.Title") == \
+        "CVE-2021-44228 (High) detected in log4j-core"
+
+
+def test_two_libraries_sharing_one_cve_hold_two_work_items_open():
+    """Keying on the CVE alone would make these one key: the second work item would be absent
+    from `desired` and closed on the very run that created it."""
+    conf = _per_cve_conf()
+    core.exist_wis = [_wi(PER_CVE_TITLE, 101, TAGS, state="Active"),
+                      _wi("CVE-2021-44228 (Critical) detected in log4j-api", 102, TAGS,
+                          state="Active")]
+    azure = mock.MagicMock(return_value=({"id": 0, "fields": {"System.State": "Active", "System.WorkItemType": "Task"}}, 0))
+    _drive([_security_finding(), _security_finding(lib="log4j-api")], azure, conf)
+
+    closes = [c for c in _calls(azure, "PATCH")
+              if c["data"] == [{"op": "replace", "path": "/fields/System.State",
+                                "value": "Closed"}]]
+    assert closes == [], "both CVEs are still ACTIVE in Mend; neither item may be closed"
+    actual = core.actual_work_items("ProductX/api")
+    assert actual[PER_CVE_KEY]["id"] == 101
+    assert actual[("vulnerability", "CVE-2021-44228|log4j-api")]["id"] == 102

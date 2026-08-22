@@ -23,7 +23,10 @@ def _is_closed(state, closed_state: str) -> bool:
 
 
 def plan_actions(desired, actual, closed_state: str):
-    """One action per work item key. Keys are (kind, library).
+    """One action per work item key. Keys are (kind, identity-key) -- the identity being the
+    library in MEND_DEPENDENCY=true mode and "{cve}|{library}" in per-CVE mode, since that mode
+    puts one CVE on each work item. This module never inspects a key; it only matches the two
+    sides, which is why the change of shape leaves it untouched.
 
     Every key in `desired` or `actual` appears exactly once in the result: a key that was both
     created and closed would fight itself on every run.

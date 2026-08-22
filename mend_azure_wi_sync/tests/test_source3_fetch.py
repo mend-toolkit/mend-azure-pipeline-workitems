@@ -3,9 +3,11 @@ from unittest import mock
 from mend_azure_wi_sync import core
 
 
-def _conf():
+def _conf(dependency="true"):
+    # dependency is explicit: fetch_v3_desired now reads it to choose the grouping, and a bare
+    # MagicMock attribute is not "true", which would silently put every test in per-CVE mode.
     return mock.MagicMock(org_uuid="org-1", ws_org_token="tok", email="a@b.com",
-                          ws_url="saas.mend.io", proxy={})
+                          ws_url="saas.mend.io", proxy={}, dependency=dependency)
 
 
 def test_projects_are_fetched_and_normalised():

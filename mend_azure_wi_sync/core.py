@@ -10,7 +10,7 @@ sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
 from enrichment import format_epss, format_exploit, format_reachability
-from identity import license_title, matches_library
+from identity import cve_key, license_title, matches_cve, matches_library, parse_cve_title
 from reconcile import CLOSE, CREATE, REOPEN, SKIP, UPDATE, plan_actions
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
@@ -616,17 +616,32 @@ def check_wi_id(id: str, project_name: str):
 
 
 def classify_title(title: str):
-    """A work item title -> (kind, library), or None if it is not one of ours.
+    """A work item title -> (kind, key), or None if it is not one of ours.
 
-    Inverts the two shipped title formats:
-      "License Policy Violation detected in {lib}"                        -> license
-      "{lib}: {N} vulnerabilities (highest severity is {S})"              -> vulnerability
+    Inverts the three shipped title formats:
+      "License Policy Violation detected in {lib}"             -> ("license", lib)
+      "{lib}: {N} vulnerabilities (highest severity is {S})"   -> ("vulnerability", lib)
+      "{CVE} ({Severity}) detected in {lib}"                   -> ("vulnerability", "{CVE}|{lib}")
+
+    The key is the work item's IDENTITY, which is what differs between the two MEND_DEPENDENCY
+    modes: dependency mode puts every CVE of a library on one work item, per-CVE mode puts each
+    CVE on its own. Both the CVE and the library are in the per-CVE key -- the CVE alone collides
+    when one CVE affects two libraries in a project, the library alone is dependency mode.
+
+    The moving parts of every format are wildcards (the count, the max score, the severity word),
+    because Mend rescores and a number baked into the key orphans the work item on the next run.
+
+    A title matching NONE of the three returns None and is never adopted: a person's hand-created
+    work item that happens to carry a Mend tag must not be closed by this tool.
     """
     text = (title or "").strip()
     prefix = "License Policy Violation detected in "
     if text.startswith(prefix):
         lib = text[len(prefix):].strip()
         return ("license", lib) if lib else None
+    parsed = parse_cve_title(text)
+    if parsed:
+        return ("vulnerability", cve_key(*parsed))
     head = text.split(":", 1)[0].strip()
     if head and matches_library(text, head):
         return ("vulnerability", head)
@@ -634,7 +649,11 @@ def classify_title(title: str):
 
 
 def actual_work_items(project_name: str):
-    """{(kind, library): {"id", "state"}} for the live work items belonging to one Mend project.
+    """{(kind, key): {"id", "state"}} for the live work items belonging to one Mend project.
+
+    The key is whatever classify_title decodes -- the library name in dependency mode, and
+    "{cve}|{library}" in per-CVE mode -- so it matches the key fetch_v3_desired builds `desired`
+    on. The two must agree exactly or reconciliation closes everything.
 
     The reverse of check_wi_id: that answers "does THIS title exist", this answers "what does
     Azure currently hold for this project". Reconciliation needs the second question.
@@ -659,7 +678,7 @@ def actual_work_items(project_name: str):
             if previous is None:
                 found[key] = candidate
                 continue
-            # Two live work items for one (kind, library). The winner is the LOWEST id, so the
+            # Two live work items for one key. The winner is the LOWEST id, so the
             # choice is deterministic across runs rather than "whichever the cache listed last".
             # The loser is left alone -- we cannot tell which is canonical, and closing the wrong
             # one destroys a record an operator may be using. Leaving it open is today's
@@ -704,6 +723,20 @@ def apply_close(work_item_id, state: str) -> bool:
 
 def apply_reopen(work_item_id, state: str) -> bool:
     return _patch_state(work_item_id, state, "reopen")
+
+
+def per_cve_mode() -> bool:
+    """MEND_DEPENDENCY=false -- one work item per CVE instead of one per library.
+
+    The ONE place conf.dependency is turned into a boolean, so grouping (fetch_v3_desired),
+    rendering (render_entry_v3) and matching (write_wi_v3) can never disagree about which mode
+    the run is in. Disagreement means the key `desired` is built on is not the key closure
+    decodes, and reconciliation then closes every work item in the project.
+
+    Config.update_properties defaults an unset MEND_DEPENDENCY to "True", so anything that is not
+    "true" is per-CVE -- the same test render_entry_v3 has always applied.
+    """
+    return str(getattr(conf, "dependency", "")).lower() != "true"
 
 
 def run_severity_floor() -> float:
@@ -1110,10 +1143,11 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
     reads Azure by title and closes on the key it decodes. A title that does not round-trip
     either strands a work item open forever or closes somebody else's.
 
-    "exact" says how the item is matched against what Azure already holds: a dependency-mode
-    vulnerability title carries a finding count and a max score, both of which move on every
-    rescore, so it matches on the library name alone (identity.matches_library). Licences and
-    per-CVE titles have no moving parts and match exactly. Same rule as the 1.4 path.
+    "exact" says how the item is matched against what Azure already holds. Only a LICENCE title
+    is matched exactly -- it has no moving parts. A dependency-mode title carries a finding count
+    and a max score and a per-CVE title carries a severity word; all three move on a rescore, so
+    those match on identity instead (identity.matches_library / identity.matches_cve). A per-CVE
+    item also carries "cve", which is what picks the second matcher.
     """
     inputs = render_inputs(entry)
     rows = inputs["vulnerabilities"]
@@ -1124,7 +1158,7 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
             build_license_html_v3(licenses, license_policy_name(entry))
         return [{"title": license_title(library), "desc": desc, "score": "", "exact": True}]
 
-    if conf.dependency.lower() == "true":
+    if not per_cve_mode():
         if not rows:
             return []
         table_data = []
@@ -1169,7 +1203,8 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
         desc = library_block_v3(inputs, with_hierarchy=True) + \
             vuln_section_v3(row, inputs, reachability_on)
         items.append({"title": f"{vul_name} ({severity}) detected in {library}",
-                      "desc": desc, "score": row.get("score", ""), "exact": True})
+                      "desc": desc, "score": row.get("score", ""), "exact": False,
+                      "cve": vul_name})
     return items
 
 
@@ -1186,6 +1221,12 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
     title = item["title"]
     if item["exact"]:
         exist_id = check_wi_id(id=title, project_name=project_name)
+    elif item.get("cve"):
+        # Per-CVE mode: the severity word in the title moves on a rescore, so the item is found
+        # by CVE + library -- the same key classify_title decodes for closure. Matching the title
+        # exactly here would create a duplicate on every rescore and strand the original open.
+        exist_id = check_wi_id_matching(
+            lambda t: matches_cve(t, item["cve"], item["library"]), project_name=project_name)
     else:
         exist_id = check_wi_id_matching(lambda t: matches_library(t, item["library"]),
                                         project_name=project_name)
@@ -1295,7 +1336,11 @@ def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
     project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
     reachability_on = reachability_enabled()
     created = updated = failed = 0
-    for (kind, library), entry in (desired or {}).items():
+    for (kind, key), entry in (desired or {}).items():
+        # The KEY is the work item's identity ("{cve}|{lib}" in per-CVE mode); the LIBRARY is what
+        # the renderers need. They are the same string only in dependency mode, so the library is
+        # read off the entry rather than taken apart from the key.
+        library = (entry.get("library") if isinstance(entry, dict) else "") or key
         try:
             tags = build_wi_tags(
                 project_name,
@@ -1320,7 +1365,7 @@ def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
         except Exception as err:
             failed += 1
             logger.error(f"[{ex()}] Work item creation failed for "
-                         f"{kind} '{library}' in {project_name}: {err}")
+                         f"{kind} '{key}' in {project_name}: {err}")
     logger.info(f"[{fn()}] {project_name}: {created} work item(s) created, {updated} updated, "
                 f"{failed} failed.")
     return created, updated, failed
@@ -1667,8 +1712,11 @@ def fetch_v3_desired(project_uuid: str, floor: float):
     mistaken for a shrunken one. A caller seeing ok=False may still create and update (which
     cannot destroy anything) but must NOT close.
 
-    Keyed by (kind, library) rather than library: one library can carry both a vulnerability and
-    a license work item, and they are separate items with different titles.
+    Keyed by (kind, identity-key) rather than by library: one library can carry both a
+    vulnerability and a license work item, and they are separate items with different titles.
+    The vulnerability half of that key depends on MEND_DEPENDENCY -- the library name in
+    dependency mode, "{cve}|{library}" in per-CVE mode, because that mode makes one work item per
+    CVE. conf is read HERE and threaded into normalise_findings as a flag; source3 stays pure.
 
     Every entry carries "licenses" (a list, [] when the library has none) so downstream
     rendering never has to guard for the key's absence.
@@ -1679,7 +1727,7 @@ def fetch_v3_desired(project_uuid: str, floor: float):
         f"orgs/{org_uuid()}/projects/{project_uuid}/violations")
     licenses, licenses_ok = fetch_v3_licenses(project_uuid)
 
-    vuln_entries, unscored = normalise_findings(findings, floor)
+    vuln_entries, unscored = normalise_findings(findings, floor, per_cve=per_cve_mode())
     lic_entries = normalise_violations(violations)
 
     if unscored:
@@ -1690,9 +1738,10 @@ def fetch_v3_desired(project_uuid: str, floor: float):
                     f"worse failure.")
 
     desired = {}
-    for lib, entry in vuln_entries.items():
-        entry["licenses"] = licenses.get(lib, [])
-        desired[("vulnerability", lib)] = entry
+    for key, entry in vuln_entries.items():
+        # licenses are indexed by LIBRARY, and `key` is not the library in per-CVE mode.
+        entry["licenses"] = licenses.get(entry["library"], [])
+        desired[("vulnerability", key)] = entry
     for lib, entry in lic_entries.items():
         entry["licenses"] = licenses.get(lib, [])
         desired[("license", lib)] = entry

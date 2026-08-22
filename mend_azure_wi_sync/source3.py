@@ -14,6 +14,7 @@ import sys
 
 sys.path.append(os.path.dirname(__file__))
 from enrichment import format_epss, format_exploit, format_reachability
+from identity import cve_key
 
 # CVSS v3 band floors. A band names the BOTTOM of its range, so "high" selects 7.0 and up.
 _BANDS = {"low": 0.1, "medium": 4.0, "high": 7.0, "critical": 9.0}
@@ -82,15 +83,31 @@ def _walk(obj, *path):
     return obj
 
 
-def normalise_findings(findings, floor: float):
-    """3.0 security findings -> ({library_name: entry}, unscored_count).
+def normalise_findings(findings, floor: float, per_cve: bool = False):
+    """3.0 security findings -> ({identity_key: entry}, unscored_count).
 
     Only ACTIVE findings at or above `floor` survive. findingInfo.findingStatus is deliberately
     NOT consulted -- see OPEN_STATUS.
 
-    A library whose findings are all excluded produces NO entry, which is what tells
-    reconciliation to close its work item. An entry with an empty findings list would keep the
-    item open forever, so entries are only created when something survives.
+    A key whose findings are all excluded produces NO entry, which is what tells reconciliation to
+    close its work item. An entry with an empty findings list would keep the item open forever, so
+    entries are only created when something survives.
+
+    `per_cve` is MEND_DEPENDENCY=false and it changes the GROUPING, because in that mode one work
+    item is one CVE rather than one library, and the key must be the work item's identity or
+    reconciliation cannot find it:
+      - False -> key is the library name; every CVE of a library shares one entry.
+      - True  -> key is "{cve}|{library}" (identity.cve_key); one entry per CVE per library. Both
+                 halves are in the key: the CVE alone collides when one CVE hits two libraries in
+                 a project, the library alone is dependency mode.
+    Every entry carries "library" either way, so callers never have to take it apart again.
+
+    The flag is a PARAMETER, not a Config read: this module is pure, and conf is read in
+    core.fetch_v3_desired and threaded down.
+
+    In per-CVE mode a finding with no vulnerability name is dropped: the renderer skips it (there
+    is no title to build), so keeping it would put an entry in `desired` that no work item can
+    ever satisfy.
     """
     entries = {}
     unscored = 0
@@ -105,9 +122,15 @@ def normalise_findings(findings, floor: float):
         score = _walk(finding, "vulnerability", "score")
         if not meets_threshold(score, floor):
             continue
+        key = lib
+        if per_cve:
+            cve = _walk(finding, "vulnerability", "name")
+            if not cve:
+                continue
+            key = cve_key(cve, lib)
         if score is None or score == "":
             unscored += 1
-        entry = entries.setdefault(lib, {"library": lib, "kind": "vulnerability", "findings": []})
+        entry = entries.setdefault(key, {"library": lib, "kind": "vulnerability", "findings": []})
         entry["findings"].append(finding)
     return entries, unscored
 

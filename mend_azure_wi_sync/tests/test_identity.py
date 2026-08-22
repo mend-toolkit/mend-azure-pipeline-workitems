@@ -62,6 +62,62 @@ def test_license_title_is_unchanged_from_the_shipped_format():
         "License Policy Violation detected in log4j-core"
 
 
+# --- per-CVE identity (MEND_DEPENDENCY=false) -------------------------------------------------
+
+def test_parses_the_shipped_per_cve_title():
+    assert identity.parse_cve_title("CVE-2021-44228 (Critical) detected in log4j-core") == \
+        ("CVE-2021-44228", "log4j-core")
+
+
+def test_the_severity_word_is_a_wildcard():
+    """The point: Mend rescores, the word changes, the work item does not."""
+    assert identity.matches_cve("CVE-2021-44228 (Critical) detected in log4j-core",
+                                "CVE-2021-44228", "log4j-core") is True
+    assert identity.matches_cve("CVE-2021-44228 (High) detected in log4j-core",
+                                "CVE-2021-44228", "log4j-core") is True
+    assert identity.matches_cve("CVE-2021-44228 () detected in log4j-core",
+                                "CVE-2021-44228", "log4j-core") is True
+
+
+def test_a_non_cve_mend_identifier_still_parses():
+    assert identity.parse_cve_title("WS-2019-0379 (High) detected in lodash") == \
+        ("WS-2019-0379", "lodash")
+    assert identity.parse_cve_title("GHSA-jfh8-c2jp (High) detected in lodash") == \
+        ("GHSA-jfh8-c2jp", "lodash")
+
+
+def test_the_key_carries_both_the_cve_and_the_library():
+    """One CVE in two libraries is two work items, so it must be two keys."""
+    assert identity.cve_key("CVE-2021-44228", "log4j-core") != \
+        identity.cve_key("CVE-2021-44228", "log4j-api")
+    assert identity.cve_key("CVE-2021-44228", "log4j-core") == "CVE-2021-44228|log4j-core"
+
+
+def test_a_different_cve_or_library_does_not_match():
+    assert identity.matches_cve("CVE-2021-44228 (High) detected in log4j-core",
+                                "CVE-2021-45046", "log4j-core") is False
+    assert identity.matches_cve("CVE-2021-44228 (High) detected in log4j-core",
+                                "CVE-2021-44228", "log4j-api") is False
+
+
+def test_a_hand_written_title_is_not_a_per_cve_title():
+    """The regex must not widen into "anything with brackets": a person's own work item carrying
+    a Mend tag must never be adopted and closed."""
+    for title in ("Investigate flaky deploy (urgent) detected in prod",
+                  "Rotate the signing key",
+                  "CVE-2021-44228 detected in log4j-core",
+                  "CVE-2021-44228 (High) detected in ",
+                  "log4j-core: 3 vulnerabilities (highest severity is 9.8)",
+                  "License Policy Violation detected in log4j-core"):
+        assert identity.parse_cve_title(title) is None, title
+
+
+def test_per_cve_parsing_tolerates_none_and_empty():
+    assert identity.parse_cve_title(None) is None
+    assert identity.parse_cve_title("") is None
+    assert identity.matches_cve(None, "CVE-1-1", "lib") is False
+
+
 def test_deleted_helpers_are_gone():
     """Nothing may still depend on the title-composition helpers."""
     for gone in ("vulnerability_title", "cve_title",

@@ -13,8 +13,12 @@ at a glance. So the title stays, and the MATCH KEY drops the parts that move -- 
 vulnerability work item is identified by its library name alone, whatever numbers the title carries.
 
 Licenses keep exact-title matching: `License Policy Violation detected in {lib}` has no moving parts.
-Per-CVE mode (MEND_DEPENDENCY=false) also keeps exact-title matching, by explicit decision -- which
-means a rescore there still orphans the work item. That is a known, accepted defect, not an oversight.
+
+Per-CVE mode (MEND_DEPENDENCY=false) is matched the same way as dependency mode, for the same
+reason: its title `{CVE} ({Severity}) detected in {lib}` embeds a severity word that Mend moves on
+every rescore, so an exact match orphans the work item exactly as the count and score did. The key
+is the CVE and the library together -- CVE alone collides when one CVE hits two libraries in a
+project, and library alone is dependency mode.
 """
 
 import re
@@ -45,3 +49,49 @@ def matches_library(title: str, lib_name: str) -> bool:
 def license_title(lib_name: str) -> str:
     """Unchanged from the shipped format -- matched exactly, so it must stay byte-identical."""
     return f"License Policy Violation detected in {(lib_name or '').strip()}"
+
+
+# The per-CVE (MEND_DEPENDENCY=false) title is
+#     f"{vul_name} ({severity}) detected in {library}"
+# `severity` is a wildcard for the same reason the dependency-mode count and score are: Mend
+# rescores a CVE and the word changes, while the work item is still the same work item. It may be
+# empty ("()") when the finding carries no severity.
+#
+# The CVE group is deliberately NOT ".+": it must contain a hyphen and no whitespace or brackets,
+# which every Mend vulnerability identifier does (CVE-2021-44228, WS-2019-0379, GHSA-jfh8-c2jp).
+# Without that, a hand-written title like "Investigate deploy (urgent) detected in prod" would be
+# adopted by this tool and closed -- the one thing classify_title must never do.
+_CVE_TITLE = re.compile(
+    r"(?P<cve>[^\s()]+-[^\s()]+) \((?P<severity>[^()]*)\) detected in (?P<library>.+)")
+
+
+def parse_cve_title(title: str):
+    """A per-CVE title -> (cve, library), or None when it is not one.
+
+    `library` takes the whole remainder, so a library name that itself contains " detected in "
+    still resolves in full.
+    """
+    match = _CVE_TITLE.fullmatch((title or "").strip())
+    if not match:
+        return None
+    library = match.group("library").strip()
+    return (match.group("cve"), library) if library else None
+
+
+def cve_key(cve: str, lib_name: str) -> str:
+    """The per-CVE half of the identity key: "{cve}|{library}".
+
+    Both halves are present on purpose. Keying on the CVE alone collides whenever one CVE affects
+    two libraries in one project (common); keying on the library alone is dependency mode and would
+    collapse every CVE of a library onto one work item.
+    """
+    return f"{(cve or '').strip()}|{(lib_name or '').strip()}"
+
+
+def matches_cve(title: str, cve: str, lib_name: str) -> bool:
+    """True when `title` is the per-CVE work item title for this CVE in this library, whatever
+    severity word it was last written with. Both sides are compared literally, never as patterns."""
+    parsed = parse_cve_title(title)
+    if not parsed:
+        return False
+    return cve_key(*parsed) == cve_key(cve, lib_name)

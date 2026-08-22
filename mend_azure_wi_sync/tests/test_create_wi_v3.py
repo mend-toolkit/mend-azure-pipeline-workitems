@@ -1,9 +1,10 @@
 """create_wi_v3 -- the 3.0 creation path.
 
 The riskiest thing in this file is not the HTML: it is the TITLES. classify_title decodes a work
-item's title back into the (kind, library) key that closure acts on, so a title this path renders
+item's title back into the (kind, key) pair that closure acts on, so a title this path renders
 that classify_title cannot decode is a work item that either never closes or closes something
-else. Every dependency-mode title generated here is asserted to round-trip.
+else. Every title generated here -- dependency mode AND per-CVE mode -- is asserted to
+round-trip.
 """
 
 from unittest import mock
@@ -152,15 +153,73 @@ def test_per_cve_mode_titles_match_the_shipped_format():
     ]
 
 
-def test_per_cve_titles_are_not_classifiable_which_is_the_1_4_behaviour_too():
-    """DOCUMENTED LIMITATION, not a regression: classify_title only decodes the two
-    dependency-mode formats, so per-CVE mode (MEND_DEPENDENCY=false) has never supported
-    closure -- on 1.4 either. Asserted so a future change to classify_title has to come past
-    this test deliberately."""
+def test_per_cve_mode_titles_round_trip_through_classify_title():
+    """The per-CVE twin of the dependency-mode contract above, and the whole point of per-CVE
+    closure: EVERY title this mode renders must decode back to the key `desired` was built on,
+    ("vulnerability", "{cve}|{lib}"). One that does not strands its work item open forever."""
     conf = _conf(dependency="false")
+    desired = {
+        ("vulnerability", "CVE-2020-8203|lodash"): _vuln_entry(_finding()),
+        ("vulnerability", "CVE-2021-23337|lodash"): _vuln_entry(
+            _finding(cve="CVE-2021-23337", score=9.1, severity="critical")),
+        ("vulnerability", "CVE-2021-44228|log4j-core"): {
+            "library": "log4j-core", "kind": "vulnerability", "licenses": [],
+            "findings": [_finding(cve="CVE-2021-44228", score=10.0, lib="log4j-core")]},
+        # No severity at all, and a non-CVE Mend identifier -- both real, both must still decode.
+        ("vulnerability", "WS-2019-0379|lodash"): _vuln_entry(
+            _finding(cve="WS-2019-0379", severity="")),
+        ("license", "lodash"): _license_entry(),
+    }
     with mock.patch.object(core, "conf", conf):
-        items = core.render_entry_v3("vulnerability", "lodash", _vuln_entry(_finding()), False)
-    assert core.classify_title(items[0]["title"]) is None
+        for (kind, key), entry in desired.items():
+            for item in core.render_entry_v3(kind, entry["library"], entry, False):
+                assert core.classify_title(item["title"]) == (kind, key), item["title"]
+
+
+def test_a_rescored_cve_still_decodes_to_the_same_key():
+    """The severity word is a wildcard in the key for the same reason the dependency-mode count
+    and score are: Mend rescores, and a severity baked into the key orphans the work item."""
+    before = "CVE-2021-44228 (Critical) detected in log4j-core"
+    after = "CVE-2021-44228 (High) detected in log4j-core"
+    assert core.classify_title(before) == ("vulnerability", "CVE-2021-44228|log4j-core")
+    assert core.classify_title(after) == core.classify_title(before)
+
+
+def test_one_cve_in_two_libraries_gives_two_distinct_keys():
+    """Why the library is in the key: keying on the CVE alone would collapse these two work items
+    into one, and reconciliation would close whichever it saw second."""
+    a = core.classify_title("CVE-2021-44228 (Critical) detected in log4j-core")
+    b = core.classify_title("CVE-2021-44228 (Critical) detected in log4j-api")
+    assert a == ("vulnerability", "CVE-2021-44228|log4j-core")
+    assert b == ("vulnerability", "CVE-2021-44228|log4j-api")
+    assert a != b
+
+
+def test_one_cve_in_two_libraries_produces_two_work_items():
+    """The end-to-end half of the same guarantee: two entries, two POSTs, two titles."""
+    desired = {
+        ("vulnerability", "CVE-2021-44228|log4j-core"): {
+            "library": "log4j-core", "kind": "vulnerability", "licenses": [],
+            "findings": [_finding(cve="CVE-2021-44228", score=10.0, lib="log4j-core")]},
+        ("vulnerability", "CVE-2021-44228|log4j-api"): {
+            "library": "log4j-api", "kind": "vulnerability", "licenses": [],
+            "findings": [_finding(cve="CVE-2021-44228", score=10.0, lib="log4j-api")]},
+    }
+    (created, updated, failed), azure = _run(desired, conf=_conf(dependency="false"))
+    assert (created, updated, failed) == (2, 0, 0)
+    titles = sorted(_field(doc, "/fields/System.Title") for doc in _posted(azure))
+    assert titles == ["CVE-2021-44228 (High) detected in log4j-api",
+                      "CVE-2021-44228 (High) detected in log4j-core"]
+
+
+def test_a_hand_written_title_is_still_not_adopted_in_per_cve_mode():
+    """The per-CVE decoder must not widen classify_title into "anything with brackets". A
+    person's own work item carrying a Mend tag must never be adopted and closed."""
+    for title in ("Investigate flaky deploy (urgent) detected in prod",
+                  "Rotate the signing key",
+                  "detected in lodash",
+                  "CVE-2021-44228 detected in lodash"):
+        assert core.classify_title(title) is None, title
 
 
 # --- rendering -------------------------------------------------------------------------------

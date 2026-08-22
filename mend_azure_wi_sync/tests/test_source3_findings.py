@@ -171,3 +171,59 @@ def test_a_violation_with_no_origin_name_is_skipped():
 def test_garbage_violations_return_empty_rather_than_raising():
     assert source3.normalise_violations(None) == {}
     assert source3.normalise_violations(["nope"]) == {}
+
+
+# --- per-CVE grouping (MEND_DEPENDENCY=false) --------------------------------------------------
+
+def _sec(cve="CVE-2021-44228", lib="log4j-core", score=9.8, status="ACTIVE"):
+    return {"component": {"name": lib},
+            "vulnerability": {"name": cve, "score": score},
+            "findingInfo": {"status": status}}
+
+
+def test_per_cve_keys_by_cve_and_library():
+    """The key must be the WORK ITEM's identity, which in this mode is one CVE in one library --
+    otherwise reconciliation cannot find the item the title decodes to."""
+    entries, _ = source3.normalise_findings(
+        [_sec(), _sec(cve="CVE-2021-45046")], 7.0, per_cve=True)
+    assert sorted(entries) == ["CVE-2021-44228|log4j-core", "CVE-2021-45046|log4j-core"]
+    assert entries["CVE-2021-44228|log4j-core"]["library"] == "log4j-core"
+    assert len(entries["CVE-2021-44228|log4j-core"]["findings"]) == 1
+
+
+def test_one_cve_in_two_libraries_is_two_entries():
+    """Keying on the CVE alone collides here -- common, and it would close a live work item."""
+    entries, _ = source3.normalise_findings(
+        [_sec(), _sec(lib="log4j-api")], 7.0, per_cve=True)
+    assert sorted(entries) == ["CVE-2021-44228|log4j-api", "CVE-2021-44228|log4j-core"]
+
+
+def test_dependency_mode_grouping_is_untouched():
+    """The default mode keeps one entry per library holding every CVE."""
+    entries, _ = source3.normalise_findings([_sec(), _sec(cve="CVE-2021-45046")], 7.0)
+    assert list(entries) == ["log4j-core"]
+    assert len(entries["log4j-core"]["findings"]) == 2
+
+
+def test_the_default_is_dependency_mode():
+    entries_default, _ = source3.normalise_findings([_sec()], 7.0)
+    entries_explicit, _ = source3.normalise_findings([_sec()], 7.0, per_cve=False)
+    assert list(entries_default) == list(entries_explicit) == ["log4j-core"]
+
+
+def test_a_suppressed_cve_leaves_no_entry_which_is_what_closes_its_work_item():
+    entries, _ = source3.normalise_findings(
+        [_sec(status="IGNORED"), _sec(cve="CVE-2021-45046")], 7.0, per_cve=True)
+    assert list(entries) == ["CVE-2021-45046|log4j-core"]
+
+
+def test_a_finding_with_no_cve_name_is_dropped_in_per_cve_mode():
+    """It has no title to render, so an entry for it could never be satisfied -- reconciliation
+    would report a create every run and nothing would ever appear."""
+    nameless = _sec()
+    nameless["vulnerability"].pop("name")
+    entries, _ = source3.normalise_findings([nameless, _sec()], 7.0, per_cve=True)
+    assert list(entries) == ["CVE-2021-44228|log4j-core"]
+    # In dependency mode it still counts towards its library.
+    entries, _ = source3.normalise_findings([nameless], 7.0)
+    assert list(entries) == ["log4j-core"]
