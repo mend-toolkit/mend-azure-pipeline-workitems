@@ -43,8 +43,9 @@ def test_check_patterns_accepts_valid_reachability_values():
             assert not any("MEND_REACHABILITY" in el for el in core.check_patterns())
 
 
-def test_enrichment_no_longer_requires_mend_email():
-    """MEND_EMAIL existed for the 2.0/3.0 login. Config no longer carries an `email` field at
-    all, so this asserts on the surviving validation list rather than on a false value."""
+def test_a_valid_email_is_not_flagged_with_reachability_on():
+    """MEND_EMAIL IS required -- it authenticates the 2.0/3.0 login that reachability data comes
+    from (the rejection cases live in test_routing_config.py). This pins the other direction:
+    turning reachability on must not make a perfectly good email an error."""
     with mock.patch.object(core, "conf", _valid_conf(reachability="true")):
         assert not [el for el in core.check_patterns() if "MEND_EMAIL" in el]

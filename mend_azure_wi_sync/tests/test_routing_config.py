@@ -92,11 +92,3 @@ def test_check_patterns_rejects_a_whitespace_only_mend_email():
 def test_check_patterns_accepts_a_present_mend_email():
     with mock.patch.object(core, "conf", _valid_conf(email="user@example.com")):
         assert not any("MEND_EMAIL" in el for el in core.check_patterns())
-
-
-def test_routing_no_longer_requires_mend_email():
-    """MEND_EMAIL existed for the 2.0 login behind routing's /entities sweep. Routing tags
-    come from the 1.4 org tag sweep now, so requiring an email would block a valid config for
-    a login the tool never performs."""
-    with mock.patch.object(core, "conf", _valid_conf(routing="true", branches="main")):
-        assert not [el for el in core.check_patterns() if "MEND_EMAIL" in el]

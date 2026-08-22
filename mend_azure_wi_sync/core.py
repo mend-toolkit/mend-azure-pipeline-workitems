@@ -9,7 +9,8 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
-from identity import cve_key, license_title, matches_cve, matches_library, parse_cve_title
+from identity import (cve_key, license_title, matches_cve, matches_library,
+                      parse_cve_title, parse_dependency_title)
 from reconcile import CLOSE, CREATE, REOPEN, SKIP, UPDATE, plan_actions
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
@@ -618,12 +619,18 @@ def classify_title(title: str):
     if text.startswith(prefix):
         lib = text[len(prefix):].strip()
         return ("license", lib) if lib else None
+    # The dependency form is decoded FIRST, and by an anchored parse of the WHOLE title rather
+    # than by splitting on the first ":" and guessing the head: a library whose own name contains
+    # a colon (Maven's "{group}:{artifact}", e.g. org.apache:log4j) decoded to None under the
+    # guess, so those work items were created and updated but never closed. Trying it before the
+    # per-CVE form also settles a title that could parse as both -- the dependency tail is the
+    # more specific pattern, so it wins.
+    lib = parse_dependency_title(text)
+    if lib:
+        return ("vulnerability", lib)
     parsed = parse_cve_title(text)
     if parsed:
         return ("vulnerability", cve_key(*parsed))
-    head = text.split(":", 1)[0].strip()
-    if head and matches_library(text, head):
-        return ("vulnerability", head)
     return None
 
 

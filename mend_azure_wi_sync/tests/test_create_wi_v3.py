@@ -222,6 +222,65 @@ def test_a_hand_written_title_is_still_not_adopted_in_per_cve_mode():
         assert core.classify_title(title) is None, title
 
 
+# --- library names containing ":" (Maven coordinates) ----------------------------------------
+
+MAVEN_LIBS = ["org.apache:log4j",
+              "com.fasterxml.jackson.core:jackson-databind",
+              "weird|lib"]
+
+
+def test_a_library_name_containing_a_colon_decodes_in_dependency_mode():
+    """Maven coordinates are "{group}:{artifact}". Decoding by splitting on the FIRST colon and
+    guessing the head returned None for every one of them, so the work item was created and
+    updated but could never be closed -- silent, and the exact failure closure exists to fix.
+    "|" is the per-CVE key separator and must not confuse the dependency form either."""
+    for lib in MAVEN_LIBS:
+        title = f"{lib}: 3 vulnerabilities (highest severity is 9.8)"
+        assert core.classify_title(title) == ("vulnerability", lib), title
+
+
+def test_a_library_name_containing_a_colon_decodes_in_per_cve_mode():
+    for lib in MAVEN_LIBS:
+        title = f"CVE-2021-44228 (Critical) detected in {lib}"
+        assert core.classify_title(title) == ("vulnerability", f"CVE-2021-44228|{lib}"), title
+
+
+def test_colon_library_round_trips_from_desired_through_the_title_and_back_dependency_mode():
+    """The full loop for a Maven coordinate: the key source3 builds `desired` on -> the title
+    create_wi_v3 renders -> the key classify_title decodes. The first and last must be equal or
+    reconciliation reads the live work item as an orphan and closes it."""
+    conf = _conf()
+    finding = _finding(cve="CVE-2021-44228", score=10.0, lib="org.apache:log4j")
+    entries, _ = source3.normalise_findings([finding], 0.0, per_cve=False)
+    assert list(entries) == ["org.apache:log4j"]
+    with mock.patch.object(core, "conf", conf):
+        items = core.render_entry_v3("vulnerability", "org.apache:log4j",
+                                     entries["org.apache:log4j"], False)
+    assert items[0]["title"] == \
+        "org.apache:log4j: 1 vulnerabilities (highest severity is 10.0)"
+    assert core.classify_title(items[0]["title"]) == ("vulnerability", "org.apache:log4j")
+
+
+def test_colon_library_round_trips_from_desired_through_the_title_and_back_per_cve_mode():
+    conf = _conf(dependency="false")
+    finding = _finding(cve="CVE-2021-44228", score=10.0, lib="org.apache:log4j")
+    entries, _ = source3.normalise_findings([finding], 0.0, per_cve=True)
+    assert list(entries) == ["CVE-2021-44228|org.apache:log4j"]
+    with mock.patch.object(core, "conf", conf):
+        items = core.render_entry_v3("vulnerability", "org.apache:log4j",
+                                     entries["CVE-2021-44228|org.apache:log4j"], False)
+    assert items[0]["title"] == "CVE-2021-44228 (High) detected in org.apache:log4j"
+    assert core.classify_title(items[0]["title"]) == \
+        ("vulnerability", "CVE-2021-44228|org.apache:log4j")
+
+
+def test_the_dependency_form_is_decoded_before_the_per_cve_form():
+    """A title that could parse as both must resolve as the dependency form: its tail is the more
+    specific pattern, and decoding it as per-CVE invented a library that matches nothing."""
+    title = "a-b (c) detected in log4j: 2 vulnerabilities (highest severity is 9.8)"
+    assert core.classify_title(title) == ("vulnerability", "a-b (c) detected in log4j")
+
+
 # --- rendering -------------------------------------------------------------------------------
 
 def test_dependency_mode_renders_one_table_row_per_cve():

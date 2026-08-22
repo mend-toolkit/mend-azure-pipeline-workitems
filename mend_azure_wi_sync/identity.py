@@ -30,6 +30,14 @@ import re
 # anything, so the score group must tolerate empty.
 _TITLE_SUFFIX = re.compile(r": \d+ vulnerabilities \(highest severity is .*\)$")
 
+# The same format as one anchored whole-title pattern, used to DECODE a title whose library name
+# is not known in advance. The library group is greedy and may itself contain ":" -- Maven
+# coordinates are "{group}:{artifact}" (org.apache:log4j), so splitting on the first colon and
+# guessing the head decoded nothing for a large share of Java projects, and those work items
+# could be created and updated but never closed.
+_DEPENDENCY_TITLE = re.compile(
+    r"(?P<lib>.+): \d+ vulnerabilities \(highest severity is .*\)")
+
 
 def matches_library(title: str, lib_name: str) -> bool:
     """True when `title` is the dependency-mode vulnerability work item title for `lib_name`.
@@ -44,6 +52,21 @@ def matches_library(title: str, lib_name: str) -> bool:
     if not title.startswith(f"{lib}:"):
         return False
     return _TITLE_SUFFIX.fullmatch(title[len(lib):]) is not None
+
+
+def parse_dependency_title(title: str):
+    """A dependency-mode vulnerability title -> its library name, or None when it is not one.
+
+    The inverse of matches_library for the case where the library is unknown: the whole title is
+    matched against the anchored format rather than a prefix being guessed. A title that is not
+    exactly the generated format returns None, so a person's hand-written work item is never
+    adopted.
+    """
+    match = _DEPENDENCY_TITLE.fullmatch((title or "").strip())
+    if not match:
+        return None
+    lib = match.group("lib").strip()
+    return lib or None
 
 
 def license_title(lib_name: str) -> str:
