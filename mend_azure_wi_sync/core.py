@@ -838,17 +838,43 @@ def call_ws_api_v3(api: str, params: dict = None):
 MAX_V3_PAGES = 1000
 
 
+def _v3_total_items_ok(api: str, items: list, payload: dict) -> bool:
+    """Cross-check the collected item count against the server's `additionalData.totalItems`.
+
+    totalItems is the only server-side evidence available that a walk was complete, so a genuine,
+    parseable disagreement means the read was truncated (e.g. an empty page that still carried a
+    cursor, or an empty first page from a mis-scoped org/project UUID). totalItems may be a
+    string, may be missing, or may be malformed -- none of that is grounds to fail an otherwise
+    legitimate read, so absence or a parse failure always falls back to True.
+    """
+    raw_total = try_or_error(lambda: payload["additionalData"]["totalItems"], None)
+    if raw_total is None:
+        return True
+    try:
+        total = int(raw_total)
+    except (TypeError, ValueError):
+        return True
+    if total != len(items):
+        logger.error(f"[{fn()}] Mend 3.0 call to '{api}' collected {len(items)} item(s) but "
+                     f"totalItems reported {total}; treating the read as truncated and "
+                     f"skipping closures.")
+        return False
+    return True
+
+
 def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000):
     """Walk every cursor page of a 3.0 collection endpoint.
 
-    Returns (items, ok). `ok` is False if ANY page failed, was malformed, or the page cap was hit
-    -- and it is load-bearing: reconciliation closes work items that are absent from a fetch, so a
-    caller MUST treat ok=False as "I know nothing about this project" rather than as a shorter
-    list. Returning the partial items alongside ok=False is deliberate: they are useful for
-    creating and updating, which cannot do harm, while closure must be skipped entirely.
+    Returns (items, ok). `ok` is False if ANY page failed, was malformed, the page cap was hit, a
+    cursor repeated, or the collected count disagrees with the server's totalItems -- and it is
+    load-bearing: reconciliation closes work items that are absent from a fetch, so a caller MUST
+    treat ok=False as "I know nothing about this project" rather than as a shorter list. Returning
+    the partial items alongside ok=False is deliberate: they are useful for creating and updating,
+    which cannot do harm, while closure must be skipped entirely.
     """
     items = []
     cursor = None
+    seen_cursors = set()
     for _ in range(MAX_V3_PAGES):
         page_params = dict(params or {})
         page_params["limit"] = limit
@@ -863,11 +889,18 @@ def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000):
             return items, False
         items.extend(rows)
         if not rows:
-            # A cursor with no rows behind it is the end, however the server phrases it.
-            return items, True
+            # A cursor with no rows behind it is the end, however the server phrases it -- but an
+            # empty page (including an empty first page) is exactly what a truncated or
+            # mis-scoped read looks like, so it still needs the totalItems cross-check.
+            return items, _v3_total_items_ok(api, items, payload)
         cursor = try_or_error(lambda: payload["additionalData"]["cursor"], None)
         if cursor is None:
-            return items, True
+            return items, _v3_total_items_ok(api, items, payload)
+        if cursor in seen_cursors:
+            logger.error(f"[{fn()}] Mend 3.0 call to '{api}' returned a repeated cursor; "
+                         f"treating the read as failed rather than looping to the page cap.")
+            return items, False
+        seen_cursors.add(cursor)
     logger.error(f"[{fn()}] Mend 3.0 call to '{api}' exceeded {MAX_V3_PAGES} pages; "
                  f"treating the read as failed rather than trusting a truncated list.")
     return items, False

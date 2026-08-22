@@ -118,5 +118,7 @@ def test_the_2_0_and_3_0_transports_are_gone():
     """
     for gone in ("fetch_project_enrichment", "resolve_project_uuids",
                  "prepare_enrichment", "project_uuid_map", "enrichment_disabled",
-                 "ENRICHMENT_PAGE_LIMIT", "ENRICHMENT_MAX_PAGES"):
+                 "ENRICHMENT_PAGE_LIMIT", "ENRICHMENT_MAX_PAGES",
+                 "_fetch_entities_rows", "_resolve_project_names",
+                 "entities_rows", "resolved_project_names"):
         assert not hasattr(core, gone), f"{gone} should have been deleted"

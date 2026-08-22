@@ -3,9 +3,15 @@ from unittest import mock
 from mend_azure_wi_sync import core
 
 
-def _pages(*pages):
-    """Each page is (items, next_cursor_or_None); returns a call_ws_api_v3 stub."""
+def _pages(*pages, total=None):
+    """Each page is (items, next_cursor_or_None); returns a call_ws_api_v3 stub.
+
+    `total` is the totalItems reported on every page's additionalData; it defaults to the true
+    sum of items across all pages, so a caller only needs to override it to test a disagreement.
+    """
     calls = []
+    if total is None:
+        total = sum(len(items) for items, _ in pages)
 
     def fake(api, params=None):
         idx = len(calls)
@@ -13,7 +19,7 @@ def _pages(*pages):
         if idx >= len(pages):
             raise AssertionError(f"asked for page {idx}, only {len(pages)} defined")
         items, nxt = pages[idx]
-        extra = {"totalItems": "9"}
+        extra = {"totalItems": str(total)}
         if nxt is not None:
             extra["cursor"] = nxt
             extra["next"] = f"http://x?cursor={nxt}"
@@ -97,3 +103,75 @@ def test_a_runaway_cursor_is_bounded():
         items, ok = core.fetch_v3_pages("orgs/o-1/projects")
     assert ok is False, "hitting the page cap must report not-ok, never a clean partial"
     assert len(items) <= 1000 * core.MAX_V3_PAGES
+
+
+def test_a_repeated_cursor_stops_after_a_few_calls_not_the_page_cap():
+    """A repeated cursor must be caught immediately rather than spinning to MAX_V3_PAGES."""
+    calls = []
+
+    def fake(api, params=None):
+        calls.append((params or {}).get("cursor"))
+        return {"response": [{"uuid": "x"}], "additionalData": {"cursor": 7}}, 0
+
+    with mock.patch.object(core, "call_ws_api_v3", fake):
+        items, ok = core.fetch_v3_pages("orgs/o-1/projects")
+    assert ok is False
+    assert len(calls) <= 3, "a repeat must short-circuit long before the 1000-page cap"
+
+
+def test_total_items_agreeing_with_the_collected_count_stays_ok():
+    fake, _ = _pages(([{"uuid": "a"}], 1), ([{"uuid": "b"}], None))
+    with mock.patch.object(core, "call_ws_api_v3", fake):
+        items, ok = core.fetch_v3_pages("orgs/o-1/projects")
+    assert ok is True
+    assert [i["uuid"] for i in items] == ["a", "b"]
+
+
+def test_total_items_disagreeing_with_the_collected_count_reports_not_ok():
+    """The only server-side evidence a walk was complete is totalItems; a genuine mismatch means
+    the read was truncated, so closures must be skipped."""
+    fake, _ = _pages(([{"uuid": "a"}], None), total=5)
+    with mock.patch.object(core, "call_ws_api_v3", fake):
+        items, ok = core.fetch_v3_pages("orgs/o-1/projects")
+    assert ok is False
+    assert [i["uuid"] for i in items] == ["a"]
+
+
+def test_missing_total_items_does_not_affect_ok():
+    def fake(api, params=None):
+        return {"response": [{"uuid": "a"}], "additionalData": {}}, 0
+
+    with mock.patch.object(core, "call_ws_api_v3", fake):
+        items, ok = core.fetch_v3_pages("orgs/o-1/projects")
+    assert ok is True
+
+
+def test_unparseable_total_items_does_not_affect_ok():
+    def fake(api, params=None):
+        return {"response": [{"uuid": "a"}], "additionalData": {"totalItems": "many"}}, 0
+
+    with mock.patch.object(core, "call_ws_api_v3", fake):
+        items, ok = core.fetch_v3_pages("orgs/o-1/projects")
+    assert ok is True
+
+
+def test_total_items_as_a_matching_string_stays_ok():
+    def fake(api, params=None):
+        return {"response": [{"uuid": "a"}, {"uuid": "b"}], "additionalData": {"totalItems": "2"}}, 0
+
+    with mock.patch.object(core, "call_ws_api_v3", fake):
+        items, ok = core.fetch_v3_pages("orgs/o-1/projects")
+    assert ok is True
+    assert len(items) == 2
+
+
+def test_a_genuinely_empty_project_with_total_items_zero_stays_ok():
+    """Closures depend on an empty project reporting ok=True -- otherwise nothing ever gets
+    reconciled for a project with no live entities left."""
+    def fake(api, params=None):
+        return {"response": [], "additionalData": {"totalItems": "0"}}, 0
+
+    with mock.patch.object(core, "call_ws_api_v3", fake):
+        items, ok = core.fetch_v3_pages("orgs/o-1/projects")
+    assert ok is True
+    assert items == []

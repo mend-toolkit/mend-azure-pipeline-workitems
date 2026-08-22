@@ -72,6 +72,29 @@ def test_a_401_re_mints_the_token_once_and_retries():
     assert len(calls) == 2
 
 
+def test_login_posts_to_the_api_host_not_the_sca_host():
+    """_post_v2_login is the one request that carries userKey/orgToken. It must never be sent
+    to conf.ws_url (the 1.4 SCA app host) -- only to conf.api_url."""
+    _reset()
+    conf = mock.MagicMock(email="a@b.com", api_url="api-saas.mend.io",
+                          ws_url="saas.mend.io", ws_user_key="uk-1",
+                          ws_org_token="tok-abc", proxy={})
+    seen = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"retVal": {"jwtToken": "jwt-1"}}'
+
+    def fake_post(url, **kwargs):
+        seen["url"] = url
+        return FakeResponse()
+
+    with mock.patch.object(core, "conf", conf), \
+         mock.patch.object(core.requests, "post", fake_post):
+        core._post_v2_login()
+    assert seen["url"] == "https://api-saas.mend.io/api/v2.0/login"
+
+
 def test_a_persistent_failure_reports_errorcode_2():
     """Callers check for 2; a raw HTTP status leaking through would read as success."""
     _reset()
