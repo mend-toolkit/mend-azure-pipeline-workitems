@@ -130,3 +130,66 @@ def normalise_violations(violations):
         entry = entries.setdefault(lib, {"library": lib, "kind": "license", "findings": []})
         entry["findings"].append(violation)
     return entries
+
+
+def normalise_projects(rows):
+    """ProjectSummaryDTOV3 rows -> the project shape the rest of the tool uses.
+
+    `tags` becomes {key: [values]} -- the same shape the 1.4 getOrganizationProjectTags sweep
+    produced, which is why routing.py needs no change. Joshua confirmed live that 3.0 tags ARE
+    the 1.4 project tags, not a different object.
+
+    A repeated tag key keeps every value rather than collapsing to one: a multi-valued routing
+    tag is a real misconfiguration that routing.py already detects and reports, and silently
+    picking one here would hide it.
+    """
+    projects = []
+    for row in rows or []:
+        if not isinstance(row, dict) or not row.get("uuid"):
+            continue
+        tags = {}
+        for tag in row.get("tags") or []:
+            if not isinstance(tag, dict):
+                continue
+            key = tag.get("name")
+            if not key:
+                continue
+            tags.setdefault(key, []).append(tag.get("value"))
+        projects.append({
+            "uuid": row.get("uuid"),
+            "name": row.get("name") or "",
+            "application_uuid": row.get("applicationUuid") or "",
+            "application_name": row.get("applicationName") or "",
+            "last_scanned": row.get("lastScanned") or "",
+            "tags": tags,
+        })
+    return projects
+
+
+def select_projects(projects, include_uuids, exclude_uuids):
+    """Apply MEND_PRODUCTTOKEN / MEND_PROJECTTOKEN / MEND_EXCLUDETOKEN, all now 3.0 UUIDs.
+
+    Returns (selected, unresolved). `unresolved` is every configured UUID that matched no project
+    or application, and the caller MUST abort the run on a non-empty list. Selecting nothing
+    silently would read as "no work to do", and under reconciliation that closes every work item
+    in scope -- the single most destructive failure this tool has available.
+    """
+    include = [u for u in (include_uuids or []) if u]
+    exclude = [u for u in (exclude_uuids or []) if u]
+    known = set()
+    for project in projects:
+        known.add(project["uuid"])
+        if project["application_uuid"]:
+            known.add(project["application_uuid"])
+    unresolved = [u for u in include + exclude if u not in known]
+
+    include_set, exclude_set = set(include), set(exclude)
+    selected = []
+    for project in projects:
+        keys = {project["uuid"], project["application_uuid"]}
+        if include_set and not (keys & include_set):
+            continue
+        if keys & exclude_set:
+            continue
+        selected.append(project)
+    return selected, unresolved
