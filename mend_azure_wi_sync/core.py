@@ -13,8 +13,7 @@ from _version import __tool_name__, __version__
 from config import *
 from enrichment import (build_alert_index, decorate_policy_violations, format_epss,
                         format_exploit, format_reachability)
-from identity import (cve_title, is_legacy_cve_title, is_legacy_vulnerability_title,
-                      license_title, vulnerability_title)
+from identity import license_title, matches_library
 from routing import (parse_route, build_table, classify, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
 from syncstate import (TAG_FAILED, TAG_LASTRUN, TAG_PROJECT, TAG_REVSYNC, VERDICT_FAILED,
@@ -933,19 +932,6 @@ def check_wi_id(id: str, project_name: str):
     return check_wi_id_matching(lambda title: title == id, project_name)
 
 
-def resolve_wi_id(title: str, legacy_matches, project_name: str):
-    """Find the work item for `title`, falling back to the legacy title shape it replaces.
-
-    Both create_wi call sites need the same two-step, and both need the fallback to run only when
-    the exact match misses -- an already-migrated item must never be re-matched by the legacy
-    predicate. `legacy_matches` is None for licenses, whose title never changed.
-    """
-    found = check_wi_id(id=title, project_name=project_name)
-    if found == 0 and legacy_matches is not None:
-        found = check_wi_id_matching(legacy_matches, project_name)
-    return found
-
-
 def clamp_revsync(prj_token, state, todate, max_hours, reset_on):
     """window_start reads TAG_LASTRUN; the reverse direction needs TAG_REVSYNC.
 
@@ -1604,18 +1590,20 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                                            try_or_error(lambda: x["vulnerability"]["score"], 0))))
                         max_severity = try_or_error(lambda: max_severity_el["vulnerability"]["cvss3_score"],
                                                     try_or_error(lambda: max_severity_el["vulnerability"]["score"], ""))
-                vul_title = license_title(lib_name) if is_license \
-                    else vulnerability_title(lib_name)
+                vul_title = license_title(lib_name) if is_license else f"{lib_name}: " \
+                                        f"{len(relevant_vuls)} vulnerabilities (highest severity is {max_severity})"
                 hierarchy_libs = ""
                 vulnerability_data = ""
-                # Migration: an item created before titles became library-keyed still carries the
-                # count-and-severity form. resolve_wi_id matches it, and create_wi_content's PATCH
-                # body already includes System.Title, so the match renames it in place.
-                # The legacy predicate is deletable one release after every user has synced once.
-                exist_id = resolve_wi_id(
-                    vul_title,
-                    None if is_license else (lambda t: is_legacy_vulnerability_title(t, lib_name)),
-                    project_name=f"{prd_name}/{prj_name}")
+                # Vulnerabilities are matched on the library name alone: the count and the highest
+                # severity in the title both move when a vulnerability is suppressed, rescored or
+                # fixed, and matching on them missed the item, created a duplicate and stranded the
+                # original open. Licenses match exactly -- their title has no moving parts.
+                if is_license:
+                    exist_id = check_wi_id(id=vul_title, project_name=f"{prd_name}/{prj_name}")
+                else:
+                    exist_id = check_wi_id_matching(
+                        lambda t: matches_library(t, lib_name),
+                        project_name=f"{prd_name}/{prj_name}")
                 # Looking for ID by System.Title and Tag (Product/Project Name)
                 if exist_id > 0:
                     wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
@@ -1749,9 +1737,12 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                             try_or_error(lambda: policy_el["vulnerability"]["name"], "")
                         if "License Policy Violation" in vul_name or not is_ignored(cve=vul_name, ignored=ignore_alerts):
                             issue_id = policy_el["issueUuid"]
+                            vul_severity = try_or_error(lambda: policy_el["vulnerability"]["cvss3_severity"],
+                                                        try_or_error(lambda: policy_el["vulnerability"]["severity"], ""))
                             if not vul_name:
                                 break
-                            vul_title = cve_title(vul_name, lib_name)
+                            vul_title = f"{vul_name} detected in {lib_name}" if is_license else \
+                                f"{vul_name} ({str(vul_severity).capitalize()}) detected in {lib_name}"
 
                             vul_score = try_or_error(lambda: policy_el["vulnerability"]["cvss3_score"],
                                                      try_or_error(lambda: policy_el["vulnerability"]["score"], ""))
@@ -1764,12 +1755,7 @@ def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: 
                             vul_fix_type = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["type"], "")
                             vul_fix_release_date = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["date"], "")
 
-                            # Migration from the severity-bearing title. See Task 4.
-                            exist_id = resolve_wi_id(
-                                vul_title,
-                                None if is_license else (
-                                    lambda t: is_legacy_cve_title(t, vul_name, lib_name)),
-                                project_name=f"{prd_name}/{prj_name}")
+                            exist_id = check_wi_id(id=vul_title, project_name=f"{prd_name}/{prj_name}")
                             if exist_id > 0:
                                 wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
                                                                data={}, project=conf.azure_project)

@@ -76,12 +76,13 @@ def test_two_libraries_with_different_filenames_do_not_warn():
 
 def test_replace_updates_exist_wis_cache_with_the_new_title():
     """FINDING 2: a PATCH (rename) must refresh the exist_wis cache entry, not just leave the
-    stale title cached alongside the new one. Seeds exist_wis with a legacy-titled entry so
-    resolve_wi_id matches it and create_wi_content takes the PATCH/replace branch, then checks
-    that the cache holds exactly one entry for that id, keyed by the NEW title."""
+    stale title cached alongside the new one. Seeds exist_wis with a differently-counted-titled
+    entry so check_wi_id_matching/matches_library matches it on library name and
+    create_wi_content takes the PATCH/replace branch, then checks that the cache holds exactly
+    one entry for that id, keyed by the NEW title."""
     conf = _conf_dependency()
-    legacy_title = "shared-name.jar: 3 vulnerabilities (highest severity is 9.8)"
-    seeded_exist_wis = [{legacy_title: {42: "Prod/Proj; security vulnerability"}}]
+    stale_title = "shared-name.jar: 3 vulnerabilities (highest severity is 5.0)"
+    seeded_exist_wis = [{stale_title: {42: "Prod/Proj; security vulnerability"}}]
     with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "fetch_prj_policy",
                            return_value=["Prod", "Proj", _lib_el(1)]), \
@@ -103,4 +104,5 @@ def test_replace_updates_exist_wis_cache_with_the_new_title():
             for wi_id in entry:
                 ids_to_titles.setdefault(wi_id, []).append(title)
 
-    assert ids_to_titles.get(42) == ["shared-name.jar"]
+    assert ids_to_titles.get(42) == [
+        "shared-name.jar: 1 vulnerabilities (highest severity is 9.8)"]
