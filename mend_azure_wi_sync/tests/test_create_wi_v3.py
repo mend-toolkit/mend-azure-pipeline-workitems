@@ -12,7 +12,7 @@ from mend_azure_wi_sync import core, source3
 
 
 def _conf(**overrides):
-    values = dict(azure_type="Task", dependency="true", epss="false", reachability="false",
+    values = dict(azure_type="Task", dependency="true", reachability="false",
                   reponame="", routing="false", description="Description", priority="false",
                   azure_area="", azure_project="TestProj", ws_user_key="uk-1")
     values.update(overrides)
@@ -175,11 +175,11 @@ def test_dependency_mode_renders_one_table_row_per_cve():
     assert "CVE-2020-8203" in desc and "CVE-2021-23337" in desc
 
 
-def test_epss_and_exploit_render_even_though_mend_epss_is_false():
-    """The MEND_EPSS gate is gone on 3.0: both values arrive inline with the finding, so there
-    is nothing to spare an org by hiding them."""
+def test_epss_and_exploit_always_render():
+    """MEND_EPSS is gone: both values arrive inline with the 3.0 finding, so there is nothing
+    to spare an org by hiding them."""
     desired = {("vulnerability", "lodash"): _vuln_entry(_finding())}
-    (_, _, _), azure = _run(desired, conf=_conf(epss="false"))
+    (_, _, _), azure = _run(desired)
     desc = _field(_posted(azure)[0], "/fields/System.Description")
     assert "<b>EPSS</b>" in desc and "<b>Exploit</b>" in desc          # table headers
     assert "<b>EPSS:</b> 12.5%" in desc

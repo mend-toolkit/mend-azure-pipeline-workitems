@@ -45,11 +45,9 @@ class varenvs(Enum):  # Lit of Env.variables
     wsreponame = ("WS_REPONAME","MEND_REPONAME")
     azuredesc = ("WS_DESCRIPTION","MEND_DESCRIPTION")
     azurepriority = ("WS_CALCULATEPRIORITY", "MEND_CALCULATEPRIORITY")
-    wsalert = ("WS_ALERT", "MEND_ALERT")
     proxy = ("PROXY", "MEND_PROXY")
     wsrouting = ("WS_ROUTING", "MEND_ROUTING")
     wsbranches = ("WS_BRANCHES", "MEND_BRANCHES")
-    wsepss = ("WS_EPSS", "MEND_EPSS")
     wsreachability = ("WS_REACHABILITY", "MEND_REACHABILITY")
     wsemail = ("WS_EMAIL", "MEND_EMAIL")
     wsorguuid = ("WS_ORGUUID", "MEND_ORGUUID")
@@ -117,11 +115,9 @@ class Config:
     reponame: str
     description: str
     priority: str
-    wsalert: str
     proxy: str
     routing: str
     branches: str
-    epss: str
     reachability: str
     email: str
     org_uuid: str
@@ -148,11 +144,9 @@ class Config:
             "wsreponame" : self.reponame,
             "azuredesc" : self.description,
             "azurepriority" : self.priority,
-            "wsalert" : self.wsalert,
             "proxy" : self.proxy,
             "wsrouting": self.routing,
             "wsbranches": self.branches,
-            "wsepss": self.epss,
             "wsreachability": self.reachability,
             "wsemail": self.email,
             "wsorguuid": self.org_uuid,
@@ -181,8 +175,6 @@ class Config:
                 elif key == "description":
                     value = DescAzure.get_name_by_value(self.azure_type) if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "routing":
-                    value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
-                elif key == "epss":
                     value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "reachability":
                     value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]

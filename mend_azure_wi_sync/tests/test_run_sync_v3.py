@@ -19,7 +19,7 @@ PROJECTS = [_project("p-1", "api"),
 def _conf(**kw):
     base = dict(routing="false", wsproducttoken="", wsprojecttoken="", wsexcludetoken="",
                 severity="high", azure_project="Book", reponame="", azure_area="",
-                epss="false", reachability="false")
+                reachability="false")
     base.update(kw)
     return mock.MagicMock(**base)
 

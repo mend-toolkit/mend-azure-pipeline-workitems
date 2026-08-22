@@ -5,7 +5,7 @@ from mend_azure_wi_sync import core
 
 def _conf(routing="true", exclude="", product="", project=""):
     return mock.MagicMock(routing=routing, branches="main,master", azure_project="Bookkeeping",
-                          reponame="", azure_area="", severity="high", epss="false",
+                          reponame="", azure_area="", severity="high",
                           reachability="false", wsproducttoken=product, wsprojecttoken=project,
                           wsexcludetoken=exclude)
 

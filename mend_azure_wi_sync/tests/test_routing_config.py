@@ -37,8 +37,8 @@ def _valid_conf(**overrides):
                   azure_pat=VALID, utc_delta=0, wsproducttoken="",
                   wsprojecttoken="", wsexcludetoken="", azure_area="", azure_type="Task",
                   azure_custom="", dependency="true", reponame="", description="ReproSteps",
-                  priority="false", wsalert="true", proxy="", routing="false",
-                  branches="main,master", epss="false", reachability="false",
+                  priority="false", proxy="", routing="false",
+                  branches="main,master", reachability="false",
                   email="", org_uuid="", severity="high",
                   closed_state="Closed", reopen_state="New")
     fields.update(overrides)

@@ -133,8 +133,6 @@ def check_patterns():
         # so without this every project is skipped silently.
         res.append("MEND_BRANCHES must list at least one branch pattern when "
                    "MEND_ROUTING is enabled")
-    if conf.epss.lower() not in ("true", "false"):
-        res.append(f"MEND_EPSS must be 'true' or 'false', got '{conf.epss}'")
     if conf.reachability.lower() not in ("true", "false"):
         res.append(f"MEND_REACHABILITY must be 'true' or 'false', got '{conf.reachability}'")
     return res
@@ -183,18 +181,14 @@ def get_azure_prj_id(prj_name: str):
     return res
 
 
-def epss_enabled() -> bool:
-    return conf.epss.lower() == "true"
-
-
 def reachability_enabled() -> bool:
     return conf.reachability.lower() == "true"
 
 
-def epss_exploit_row_fields(policy_el: dict, epss_on: bool) -> dict:
-    """The EPSS/Exploit row keys, gated on MEND_EPSS alone -- independent of reachability,
-    since an org may not have reachability analysis enabled at all."""
-    return {"EPSS": format_epss(policy_el), "Exploit": format_exploit(policy_el)} if epss_on else {}
+def epss_exploit_row_fields(policy_el: dict) -> dict:
+    """The EPSS/Exploit row keys. Ungated: both values arrive inline with the Mend 3.0 finding,
+    so there is nothing to spare an org by hiding them, and both always carry a value."""
+    return {"EPSS": format_epss(policy_el), "Exploit": format_exploit(policy_el)}
 
 
 def reachability_row_field(policy_el: dict, reachability_on: bool) -> dict:
@@ -202,23 +196,22 @@ def reachability_row_field(policy_el: dict, reachability_on: bool) -> dict:
     return {"Reachability": format_reachability(policy_el)} if reachability_on else {}
 
 
-def build_enrich_html(policy_el: dict, epss_on: bool, reachability_on: bool) -> str:
-    """The enrichment lines spliced into a CVE's description, gated per flag so each of the
-    four flag combinations renders only its own lines. Used by both MEND_DEPENDENCY branches
-    -- they are the same feature in two code paths and must behave identically."""
+def build_enrich_html(policy_el: dict, reachability_on: bool) -> str:
+    """The enrichment lines spliced into a CVE's description. EPSS and Exploit Code Maturity
+    always render; Reachability is gated on MEND_REACHABILITY, because it is blank for an org
+    that has not enabled reachability analysis."""
     html = ""
     if reachability_on:
         html += f"<br><b>Reachability:</b> {format_reachability(policy_el)}"
-    if epss_on:
-        html += f"<br><b>EPSS:</b> {format_epss(policy_el)}" \
+    html += f"<br><b>EPSS:</b> {format_epss(policy_el)}" \
                 f"<br><b>Exploit Code Maturity:</b> {format_exploit(policy_el)}"
     return html
 
 
 def _post_v2_login():
     # Split out so tests can stub the transport without mocking requests itself.
-    # mend_api_url(), NOT conf.ws_url: 2.0 lives on api-saas.mend.io while 1.4 lives on the
-    # SCA app host. See the spec's servers block.
+    # mend_api_url(), NOT conf.ws_url: 2.0/3.0 live on api-saas.mend.io while conf.ws_url is
+    # the SCA app host. See the spec's servers block.
     url = f"{mend_api_url()}/api/v2.0/login"
     body = {"email": conf.email, "userKey": conf.ws_user_key, "orgToken": conf.ws_org_token}
     try:
@@ -1522,7 +1515,7 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     # Logged before routing returns: without it a pipeline log cannot answer "did enrichment
     # run?", and 'off' is reached silently by an unexpanded $(MEND_EPSS) /
     # $(MEND_REACHABILITY) as well as by an explicit false.
-    logger.info(f"Enrichment: EPSS {'on' if epss_enabled() else 'off'} (MEND_EPSS), "
+    logger.info(f"Enrichment: EPSS and Exploit Code Maturity always render; "
                 f"Reachability {'on' if reachability_enabled() else 'off'} (MEND_REACHABILITY)")
 
     projects, ok = fetch_v3_projects()
@@ -1762,11 +1755,9 @@ def startup():
         reponame=varenvs.get_env("wsreponame").strip(),
         description=varenvs.get_env("azuredesc").strip(),
         priority=varenvs.get_env("azurepriority").strip(),
-        wsalert=varenvs.get_env("wsalert").strip(),
         proxy=varenvs.get_env("proxy").strip(),
         routing=varenvs.get_env("wsrouting").strip(),
         branches=varenvs.get_env("wsbranches").strip(),
-        epss=varenvs.get_env("wsepss").strip(),
         reachability=varenvs.get_env("wsreachability").strip(),
         email=varenvs.get_env("wsemail").strip(),
         org_uuid=varenvs.get_env("wsorguuid").strip(),

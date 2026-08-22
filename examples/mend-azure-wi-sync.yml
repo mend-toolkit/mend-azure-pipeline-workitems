@@ -49,22 +49,18 @@ steps:
     MEND_REPONAME : $(MEND_REPONAME)
     MEND_DESCRIPTION : $(MEND_DESCRIPTION)
     MEND_CALCULATEPRIORITY : $(MEND_CALCULATEPRIORITY)
-    MEND_ALERT : $(MEND_ALERT)
     # Tag-based routing to multiple Azure projects (optional)
     # MEND_ROUTING: $(MEND_ROUTING)
     # MEND_BRANCHES: $(MEND_BRANCHES)
-    # EPSS score and exploit code maturity on every work item (optional)
-    # MEND_EPSS: $(MEND_EPSS)
-    # Reachability on every work item (optional) — independent of MEND_EPSS, so an org
-    # without reachability analysis enabled can leave this off
+    # EPSS score and exploit code maturity always render and have no variable.
+    # Reachability on every work item (optional) — an org without reachability analysis
+    # enabled can leave this off and avoid a column of "-"
     # MEND_REACHABILITY: $(MEND_REACHABILITY)
-    # Both read Mend API 1.4 with the same MEND_USERKEY as every other call — no extra
-    # variable and no extra Mend permission is needed to turn either one on, and turning on
-    # both still costs exactly one alerts call per project, the same as turning on either
-    # one alone.
-    # NOTE: uncomment a line only once the matching pipeline variable exists. Azure leaves
-    # an undefined variable as the literal string "$(MEND_EPSS)" / "$(MEND_REACHABILITY)",
-    # which normalizes to "false" — the feature then stays off with nothing logged as an error.
+    # Read from the same Mend 3.0 finding as the rest of the work item — no extra call, no
+    # extra variable and no extra Mend permission.
+    # NOTE: uncomment the line only once the matching pipeline variable exists. Azure leaves
+    # an undefined variable as the literal string "$(MEND_REACHABILITY)", which normalizes to
+    # "false" — the feature then stays off with nothing logged as an error.
     # Mend API 3.0 credentials — inert until a feature that uses 3.0 is enabled.
     # MEND_EMAIL: $(MEND_EMAIL)
     # MEND_ORGUUID defaults to MEND_APIKEY; set it only if they differ for your org.

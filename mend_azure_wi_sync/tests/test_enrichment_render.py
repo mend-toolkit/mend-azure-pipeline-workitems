@@ -2,21 +2,20 @@ from mend_azure_wi_sync import core
 from mend_azure_wi_sync import enrichment as en
 
 
-def test_no_enrichment_keys_are_added_when_both_flags_are_off():
-    # MEND_EPSS and MEND_REACHABILITY both default to false. Existing users must see a
-    # byte-identical work item -- not three columns of "-".
-    assert core.epss_exploit_row_fields({}, epss_on=False) == {}
+def test_reachability_stays_gated_when_its_flag_is_off():
+    # Reachability is blank for an org that has not enabled reachability analysis, so the
+    # toggle spares them a column of dashes in every row.
     assert core.reachability_row_field({}, reachability_on=False) == {}
 
 
-def test_epss_exploit_row_fields_only_gated_on_the_epss_flag():
-    """EPSS/Exploit must be independent of reachability -- an org may not have reachability
-    analysis enabled at all."""
+def test_epss_exploit_row_fields_are_no_longer_gated():
+    """Both values arrive inline with the 3.0 finding and always carry a value, so there is
+    nothing left for MEND_EPSS to gate."""
     fields = core.epss_exploit_row_fields(
         {"vulnerability": {"threatAssessment": {"epssPercentage": 5.0,
-                                                "exploitCodeMaturity": "HIGH"}}},
-        epss_on=True)
+                                                "exploitCodeMaturity": "HIGH"}}})
     assert set(fields) == {"EPSS", "Exploit"}
+    assert set(core.epss_exploit_row_fields({})) == {"EPSS", "Exploit"}
 
 
 def test_reachability_row_field_only_gated_on_the_reachability_flag():
@@ -25,28 +24,18 @@ def test_reachability_row_field_only_gated_on_the_reachability_flag():
     assert set(fields) == {"Reachability"}
 
 
-def test_build_enrich_html_covers_all_four_flag_combinations():
-    """Both MEND_DEPENDENCY branches splice `enrich_html` into vul_data via this one
-    function, so each of the four flag combinations must render only its own lines and
-    nothing else."""
+def test_build_enrich_html_renders_epss_always_and_reachability_on_its_flag():
+    """EPSS and Exploit Code Maturity are ungated; Reachability is the only switch left."""
     policy_el = {"vulnerability": {"threatAssessment": {"epssPercentage": 5.0,
                                                         "exploitCodeMaturity": "HIGH"}},
                 "reachabilityInfo": {"reachable": True, "analyzed": True}}
 
-    neither = core.build_enrich_html(policy_el, epss_on=False, reachability_on=False)
-    assert neither == ""
+    off = core.build_enrich_html(policy_el, reachability_on=False)
+    assert "<b>EPSS:</b>" in off
+    assert "<b>Exploit Code Maturity:</b>" in off
+    assert "<b>Reachability:</b>" not in off
 
-    epss_only = core.build_enrich_html(policy_el, epss_on=True, reachability_on=False)
-    assert "<b>EPSS:</b>" in epss_only
-    assert "<b>Exploit Code Maturity:</b>" in epss_only
-    assert "<b>Reachability:</b>" not in epss_only
-
-    reachability_only = core.build_enrich_html(policy_el, epss_on=False, reachability_on=True)
-    assert "<b>Reachability:</b>" in reachability_only
-    assert "<b>EPSS:</b>" not in reachability_only
-    assert "<b>Exploit Code Maturity:</b>" not in reachability_only
-
-    both = core.build_enrich_html(policy_el, epss_on=True, reachability_on=True)
+    both = core.build_enrich_html(policy_el, reachability_on=True)
     assert "<b>Reachability:</b>" in both
     assert "<b>EPSS:</b>" in both
     assert "<b>Exploit Code Maturity:</b>" in both
