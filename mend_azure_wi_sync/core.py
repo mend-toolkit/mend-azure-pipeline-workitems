@@ -2161,6 +2161,17 @@ def load_wi_json():
     return load_el, []
 
 
+def org_uuid() -> str:
+    """The org identifier for 3.0's org-scoped paths.
+
+    Defaults to MEND_APIKEY: the 1.4 org token and the 3.0 organization UUID are both the org's
+    identifier from Mend's Administration screen and are plausibly the same value (spec gate G7,
+    unverified against a live org). Defaulting means nobody sets MEND_ORGUUID unless they differ.
+    Every 3.0 caller goes through here -- never read conf.org_uuid directly.
+    """
+    return (conf.org_uuid or conf.ws_org_token or "").strip()
+
+
 def extract_url(url: str) -> str:
     url_ = url if url.startswith("https://") else f"https://{url}"
     url_ = url_.replace("http://", "")
@@ -2196,6 +2207,9 @@ def startup():
         epss=varenvs.get_env("wsepss").strip(),
         reachability=varenvs.get_env("wsreachability").strip(),
         maxlookback=varenvs.get_env("wsmaxlookback").strip(),
+        email=varenvs.get_env("wsemail").strip(),
+        api_url=varenvs.get_env("wsapiurl").strip(),
+        org_uuid=varenvs.get_env("wsorguuid").strip(),
     )
     try:
         return conf

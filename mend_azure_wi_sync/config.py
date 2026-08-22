@@ -53,6 +53,9 @@ class varenvs(Enum):  # Lit of Env.variables
     wsepss = ("WS_EPSS", "MEND_EPSS")
     wsreachability = ("WS_REACHABILITY", "MEND_REACHABILITY")
     wsmaxlookback = ("WS_MAXLOOKBACK", "MEND_MAXLOOKBACK")
+    wsemail = ("WS_EMAIL", "MEND_EMAIL")
+    wsapiurl = ("WS_APIURL", "MEND_APIURL")
+    wsorguuid = ("WS_ORGUUID", "MEND_ORGUUID")
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -122,6 +125,9 @@ class Config:
     epss: str
     reachability: str
     maxlookback: str
+    email: str
+    api_url: str
+    org_uuid: str
 
     def conf_json(self):
         return {
@@ -150,6 +156,9 @@ class Config:
             "wsepss": self.epss,
             "wsreachability": self.reachability,
             "wsmaxlookback": self.maxlookback,
+            "wsemail": self.email,
+            "wsapiurl": self.api_url,
+            "wsorguuid": self.org_uuid,
         }
 
     def get_values(self):
