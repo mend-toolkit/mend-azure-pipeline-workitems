@@ -1,9 +1,7 @@
-import datetime
 import inspect
 import json
 import logging
 import os
-import subprocess
 
 import requests
 import sys
@@ -20,10 +18,8 @@ from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
 from source3 import (library_url, license_policy_name, normalise_findings, normalise_licenses,
                      normalise_projects, normalise_violations, render_inputs, select_projects,
                      severity_floor)
-from syncstate import (TAG_FAILED, TAG_LASTRUN, VERDICT_FAILED,
-                       VERDICT_OK, build_selection, failed_stamp, is_stale,
-                       count_parseable_rows, field_for, parse_tag_map,
-                       parse_raw_tags, parse_tag_values, selection_floor, superseded, tag_ops,
+from syncstate import (VERDICT_FAILED, failed_stamp, is_stale, count_parseable_rows, field_for,
+                       parse_tag_map, parse_raw_tags, parse_tag_values, superseded, tag_ops,
                        window_start)
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
@@ -55,15 +51,13 @@ mend_v2_session = None
 API_VERSION = "1.4"
 AGENT_INFO = {"agent": f"{__tool_name__.replace('_', '-')}", "agentVersion": __version__}
 DEFAULT_PRIORITY = 2
-# Only these two policy match types are supported: every other type renders no usable work
-# item content, so creating one orphans it.
-SUPPORTED_POLICY_TYPES = ("LICENSE", "VULNERABILITY_SCORE")
 uuid_pattern = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 token_pattern = r"^[0-9a-zA-Z]{64}$"
 azurearea = r"^[0-9a-zA-Z\s\-_]+$"
 global_errors = 0
 exist_wis = []
-synced_projects = []   # [(prj_token, "Product/Project", azure_project)] appended by create_wi
+synced_projects = []   # [(project uuid, "Application/Project", azure_project)] appended by
+                       # sync_project_v3
 updated_wi = []
 # Tracks which library keyId first claimed each exist_id this run, so a second library that
 # happens to render the same title (see FINDING 1 in the strict-title review) can be detected
@@ -83,11 +77,6 @@ tag_sweep_ok = True           # False only when the getOrganizationProjectTags s
 TAG_WARNED = False            # WARNING_MSG-style guard so 400 projects log one error, not 400
 ALERTS_WARNED = False         # same guard for the enrichment alerts fetch: a user key that
                                # cannot read alerts fails for all ~107 projects identically
-product_token_expansion_cache = {}   # {producttoken string: [expanded project tokens]},
-                               # memoized so the routed and unrouted selection paths don't
-                               # each pay one Mend call per product token in the same run. Only a
-                               # SUCCESSFUL expansion is cached -- a failure must stay
-                               # failing, never papered over by a stale cache entry.
 
 
 def fn():
@@ -172,31 +161,6 @@ def check_patterns():
     return res
 
 
-def migration_seed() -> str:
-    """Best-effort read of the legacy Azure `Lastrun` property, for one purpose only.
-
-    On the first run after upgrading, no project carries tags yet, so the selection floor would
-    fall back to a full window. Seeding it from the old property keeps that upgrade cheap. This
-    is the ONLY remaining reference to Azure project properties: it never exits, never sets
-    run_failed, and returns "" on any failure. Removable once every deployment has run once.
-    """
-    # Must consult tag state itself: main() calls this BEFORE run_sync, so the module global is
-    # still None at this point and a bare truthiness check would never skip the Azure call.
-    # fetch_project_tag_state is memoised, so this is the same one sweep run_sync will reuse.
-    if fetch_project_tag_state():
-        return ""
-    azure_prj_id = try_or_error(lambda: get_azure_prj_id(conf.azure_project), "")
-    if not azure_prj_id:
-        return ""
-    r, errorcode = call_azure_api(api_type="GET", api=f"projects/{azure_prj_id}/properties",
-                                  data={}, version="7.0-preview",
-                                  cmd_type="?keys=Lastrun&", header="application/json")
-    if errorcode != 0:
-        logger.info("No legacy Lastrun property available to seed from; using MEND_MAXLOOKBACK.")
-        return ""
-    return try_or_error(lambda: r["value"][0]["value"], "")
-
-
 azure_project_page = 100
 
 
@@ -238,36 +202,6 @@ def get_azure_prj_id(prj_name: str):
     except Exception as err:
         pass
     return res
-
-
-def fetch_prj_policy(prj_token: str, sdate: str, edate: str):
-    global conf
-    if conf is None:
-        conf = startup()
-        conf.update_properties()
-    try:
-        data = json.dumps(
-            {"requestType": "fetchProjectPolicyIssues",
-             "userKey": conf.ws_user_key,
-             "orgToken": conf.ws_org_token,
-             "projectToken": prj_token,
-             "policyActionType": "CREATE_ISSUE",
-             "fromDateTime": sdate,
-             "toDateTime": edate,
-             })
-        rt = json.loads(call_ws_api(data=data))
-        rt_res = [rt['product']['productName'], rt['project']['projectName']]
-        for rt_el_val in rt['issues']:
-            if try_or_error(lambda: rt_el_val['policy']['enabled'], False):
-                rt_res.append(rt_el_val)
-    except Exception as err:
-        # None, not a short list: create_wi reads rt_res[2:] as findings, so a two-element error
-        # return is indistinguishable from a project with no findings — which would advance that
-        # project's watermark past a window that was never read.
-        logger.error(f"[{ex()}] Process getting Policy issues failed for {prj_token}: {err}")
-        return None
-
-    return rt_res
 
 
 def _warn_tag_state_once(detail: str):
@@ -392,9 +326,7 @@ def apply_tag_ops(prj_token: str, ops: list):
 def record_verdict(prj_token: str, verdict: str, todate: str, state: dict):
     """Persist one project's verdict and make a FAILED one visible in the run.
 
-    create_wi's message is deliberately byte-identical to the pre-change format, so a project
-    whose every work item write was rejected still returns a success-shaped "0 ... work items"
-    line. Without this the only trace of a wholly failed project is a tag in Mend: main() would
+    Without this the only trace of a wholly failed project is a tag in Mend: main() would
     print "Sync process completed successfully" and exit 0.
 
     run_failed is deliberately NOT set. One project's failure must not withhold every other
@@ -476,30 +408,6 @@ def fetch_project_tag_state() -> dict:
     return project_tag_state
 
 
-def get_prj_list_modified(fromdate: str, todate: str):
-    data = json.dumps(
-        {"requestType": "getOrganizationLastModifiedProjects",
-         "userKey": conf.ws_user_key,
-         "orgToken": conf.ws_org_token,
-         "fromDateTime": fromdate,
-         "toDateTime": todate,
-         "includeRequestToken": False
-         })
-    resp = call_ws_api(data=data, agent_info_login=True)
-    if "Error" in resp:
-        logger.error(f"[{fn()}] {resp}")
-        exit(-1)
-    else:
-        response_ = json.loads(resp)
-        try:
-            err_msg = response_["errorMessage"]
-            logger.error(f"[{fn()}] Getting modified projects failed: {err_msg}")
-            exit(-1)
-        except Exception as err:  # Getting list of modified projects
-            res = response_["lastModifiedProjects"]
-            return [r["apiToken"] for r in res]
-
-
 def fetch_project_tags(tokens: list) -> dict:
     """Map Mend 1.4 project token -> that project's tags, from the org sweep.
 
@@ -570,7 +478,7 @@ def enrich_project(prj_token: str) -> dict:
 def safe_decorate(sorted_libs: list, index: dict):
     """Decorate this project's issue objects, absorbing anything that goes wrong.
 
-    create_wi has one outer try whose error string both callers log at INFO, so an
+    The caller has one outer try whose error string is logged at INFO, so an
     exception raised here would silently drop every Work Item for the project while the run
     still reported success. Display-only data must never cost a Work Item. The whole body
     runs inside one try_or_error, not just the decorate_policy_violations call: an arity
@@ -683,11 +591,11 @@ def fetch_project_alerts(prj_token: str) -> dict:
     API 1.4 does not paginate.
 
     Returns {} on any failure rather than raising: this is display-only data and must never
-    cost a Work Item. orgToken is omitted to match get_ingnored_alerts, the alerts call this
+    cost a Work Item. orgToken is omitted to match the ignored-alerts call this
     tool has been making successfully since before this change.
 
     An unreadable response warns ONCE per run. Returning {} silently would be invisible:
-    create_wi only calls safe_decorate when the index is non-empty, and safe_decorate owns the
+    Callers only invoke safe_decorate when the index is non-empty, and safe_decorate owns the
     only other enrichment warning ("matched 0 of N candidate finding(s)"), so a WHOLESALE
     failure -- the exact case where the operator most needs to know -- would skip both and
     render "-" in every column with nothing in the log. This restores the single run-level
@@ -1228,12 +1136,9 @@ def reconcile_project(project, floor=None, desired=None, ok=None):
     """Reconcile ONE Mend project against Azure. Returns (created, updated, closed, reopened,
     skipped).
 
-    CREATE and UPDATE are counted and reported but deliberately NOT executed here. create_wi /
-    create_wi_content are built end to end around Mend 1.4 policy-issue objects -- the HTML
-    tables, the CVE sections, the custom-field resolution, the tags and the Hyperlink relation
-    to the library's Mend page. Feeding 3.0 entries through them is a rendering rewrite, not a
-    wiring change. Creation keeps working on the existing 1.4 forward-sync path;
-    this function adds only the closure half.
+    CREATE and UPDATE are counted and reported but deliberately NOT executed here: creation is
+    create_wi_v3's job, and sync_project_v3 runs the two halves in order off ONE 3.0 read at ONE
+    severity floor. This function is only the closure half.
 
     The closure interlock (spec 6.1): on ok=False from fetch_v3_desired NOTHING is closed. An
     incomplete read is indistinguishable from a project whose findings were all remediated, and
@@ -1314,7 +1219,7 @@ def reconcile_after_sync():
     """Close work items whose Mend findings are gone, for every project synced this run.
 
     Runs AFTER the forward sync, off `synced_projects` -- the (prj_token, "Product/Project",
-    azure_project) tuples create_wi appends. That third element is the join that makes this
+    azure_project) tuples sync_project_v3 appends. That third element is the join that makes this
     routing-safe: run_sync_routed re-points conf.azure_project per target, so the Azure project a
     Mend project was written to is the only one its work items may be closed in.
     """
@@ -1376,11 +1281,10 @@ def reconcile_after_sync():
         conf.azure_project = original_azure_project
 
 
-# The work item rendering helpers below were nested inside create_wi. They are lifted to
-# module level UNCHANGED so the 3.0 creation path (create_wi_v3) can reuse the exact same
+# The work item rendering helpers below were nested inside the deleted 1.4 create_wi. They were
+# lifted to module level UNCHANGED so the 3.0 creation path (create_wi_v3) reuses the exact same
 # renderers rather than reimplementing them -- two implementations of a shipped work item
-# description would drift. Anything that genuinely reads create_wi's closure (the 1.4
-# fetchers, create_wi_content, field_name_in_data, find_parent_chain) stays where it is.
+# description would drift.
 
 
 def set_priority(value: float):
@@ -1521,555 +1425,6 @@ def build_wi_tags(project_tag: str, policy_tag: str, routing: str, reponame: str
     if routing.lower() == "true" and reponame:
         tags.append(reponame)
     return tags
-
-
-def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: str):
-    def dep_hierarchy(key_uuid):
-        def get_dependencies(dependencies):
-            res = []
-            for dependency in dependencies:
-                res.append(dependency['fileName'])
-                if 'dependencies' in dependency:
-                    nested_dependencies = dependency['dependencies']
-                    get_dependencies(nested_dependencies)
-            return res
-
-        data = json.dumps({
-            "requestType": "getProjectLibraryDependencies",
-            "userKey": conf.ws_user_key,
-            "projectToken": prj_token,
-            "keyUuid": key_uuid
-        })
-        deps = json.loads(call_ws_api(data=data))
-        try:
-            errcode = deps["errorCode"]
-            return []
-        except:
-            return get_dependencies(dependencies=try_or_error(lambda: deps["dependencies"][0],
-                                                              try_or_error(lambda: deps["dependencies"], [])))
-
-    def get_prj_licenses():
-        data = json.dumps({
-            "requestType": "getProjectLicenses",
-            "userKey": conf.ws_user_key,
-            "projectToken": prj_token
-        })
-        return json.loads(call_ws_api(data=data))
-
-    def get_lib_locations():
-        data = json.dumps({
-            "requestType": "getProjectLibraryLocations",
-            "userKey": conf.ws_user_key,
-            "projectToken": prj_token
-        })
-        return json.loads(call_ws_api(data=data))
-
-    def get_lib_lic(key_uuid):
-        for lib_lic_ in prj_licenses['libraries']:
-            if lib_lic_['keyUuid'] == key_uuid:
-                lib_lic_licenses = try_or_error(lambda: lib_lic_['licenses'], [])
-                lib_lic_data = []
-                for lib_lic_licenses_ in lib_lic_licenses:
-                    lib_lic_data.append((try_or_error(lambda: lib_lic_licenses_['references'][0]['reference'], ""),
-                                         try_or_error(lambda: lib_lic_licenses_["name"], ""),
-                                         try_or_error(lambda: lib_lic_licenses_["url"], "")))
-                return try_or_error(lambda: lib_lic_['description'], ""), \
-                       try_or_error(lambda: lib_lic_['references']['url'], ""), \
-                       lib_lic_data, \
-                       try_or_error(lambda: "Direct" if lib_lic_['directDependency'] else "Transitive", "Direct")
-        return "", "", [("","","")], "Direct"
-
-    def get_pathes(keyuuid_):
-        for location_ in prj_lib_locations['libraryLocations']:
-            if location_['keyUuid'] == keyuuid_:
-                return try_or_error(lambda: location_['locations'][0]['dependencyFile'], ""), \
-                       try_or_error(lambda: location_['locations'][0]['path'], "")
-        return "", ""
-
-    def field_name_in_data(fld_name: str):  # Don't need to add existing element to data
-        res = False
-        for el_ in data:
-            if fld_name in el_["path"]:
-                res = True
-                break
-        return res
-
-    def find_parent_chain(key_uuid, libraries):
-        # Helper function to recursively find the parent chain
-        def find_parent_recursively(child_uuid, libraries, chain):
-            for library in libraries:
-                if 'dependencies' in library:
-                    for dependency in library['dependencies']:
-                        if dependency['keyUuid'] == child_uuid:
-                            chain.append(library)
-                            find_parent_recursively(library['keyUuid'], libraries, chain)
-                            break
-
-        parent_chain = []
-        find_parent_recursively(key_uuid, libraries, parent_chain)
-        return parent_chain
-
-    def get_prj_lib_hierarchy():
-        data = json.dumps({
-            "requestType": "getProjectHierarchy",
-            "userKey": conf.ws_user_key,
-            "projectToken": prj_token
-        })
-        return json.loads(call_ws_api(data=data))
-
-    def create_wi_content():
-        nonlocal item_failed
-        global data, count_item, global_errors
-        data = [
-            {
-                "op": azure_operation,
-                "path": "/fields/System.Title",
-                "value": vul_title
-            },
-            {
-                "op": azure_operation,
-                "path": "/fields/Microsoft.VSTS.Common.Priority",
-                "value": priority
-            },
-            {
-                "op": azure_operation,
-                "path": "/fields/System.Tags",
-                "value": ",".join(tags)
-            },
-        ]
-        if conf.description == "Description":
-            desc_field = "/fields/System.Description"
-        elif conf.description == "ReproSteps":
-            desc_field = "/fields/Microsoft.VSTS.TCM.ReproSteps"
-        elif conf.description:
-            desc_field = get_field_ref(conf.description, cstm_flds)
-        else:
-            desc_field = ""
-        if desc_field:
-            data.append({
-                "op": azure_operation,
-                "path": desc_field,
-                "value": desc
-            })
-
-        for custom_ in cstm_flds:
-            fld_name, fld_val = analyze_fields(custom_, prj_el)
-            if fld_val and not field_name_in_data(fld_name):
-                data.append({
-                    "op": "add",
-                    "path": f"/fields/{fld_name}",
-                    "value": fld_val
-                })
-            elif not fld_val and "Custom." in fld_name:
-                data.append({
-                    "op": "remove",
-                    "path": f"/fields/{fld_name}",
-                })
-
-
-        if conf.azure_area:
-            res = create_area(conf.azure_area)
-            data.append(
-                {
-                    "op": azure_operation,
-                    "path": "/fields/System.AreaPath",
-                    "value": f"{conf.azure_area}"
-                }
-            )
-        try:
-            if azure_operation == "add":
-                if lib_url:
-                    # Standalone value: the operator's one click from the work item to the
-                    # library in Mend. Deliberately NO attributes.comment -- that carried
-                    # "{projectToken},{issueUuid}" for the reverse sync, which no longer exists
-                    # and nothing reads.
-                    data.append(
-                        {
-                            "op": "add",
-                            "path": "/relations/-",
-                            "value": {
-                                "rel": "Hyperlink",
-                                "url": lib_url
-                            }
-                        }
-                    )
-                r, errcode = call_azure_api(api_type="POST", api=f"wit/workitems/${wi_type}", data=data,
-                                            project=conf.azure_project)
-                try:
-                    exist_wis.append({vul_title: {r["id"]: {
-                        "tags": ",".join(tags),
-                        "state": try_or_error(lambda: r["fields"]["System.State"], "")}}})
-                except Exception as err:
-                    pass
-                    #logger.warning(f"[{ex()}] Work item creation/update failed: {r}")
-
-                status_op = "created"
-            else:
-                r, errcode = call_azure_api(api_type="PATCH", api=f"wit/workitems/{exist_id}", data=data,
-                                            project=conf.azure_project)
-                status_op = "updated"
-                if errcode == 0:
-                    # FINDING 2: a PATCH here can rename the item (legacy-title migration, or any
-                    # other title change), and exist_wis is read again later this same run
-                    # (check_wi_id_matching). Replace the stale cache entry so it reflects the new
-                    # title instead of leaving the id cached under the old one too.
-                    try:
-                        for d in exist_wis:
-                            if exist_id in try_or_error(lambda d=d: list(d.values())[0], {}):
-                                exist_wis.remove(d)
-                                break
-                        exist_wis.append({vul_title: {exist_id: {
-                            "tags": ",".join(tags),
-                            "state": try_or_error(lambda: r["fields"]["System.State"], "")}}})
-                    except Exception as err:
-                        pass
-            try:
-                claimed_id = exist_id if exist_id > 0 else r["id"]
-                updated_wi.append(claimed_id)
-                # FINDING 1: record which library keyId claimed this work item id. exist_id is
-                # 0 for a brand-new item until the POST above returns its real id, so this must
-                # happen here (after the real id is known) rather than where exist_id was first
-                # resolved -- keying on exist_id there would key every new item under 0.
-                wi_claim_keyid[claimed_id] = (lib_key_id, lib_name)
-            except Exception as err:
-                pass
-
-            if errcode == 0:
-                count_item += 1
-                logger.info(f"{conf.azure_type} {r['id']} {status_op}")
-            elif errcode == 1:
-                item_failed = True
-                logger.warning(f"{conf.azure_type} creation/update failed: {r['message']}")
-            else:
-                item_failed = True
-                info_el = r.pop()
-                logger.error(f"[{fn()}] {info_el}")
-        except Exception as err:
-            item_failed = True
-            logger.error(f"[{ex()}] Work item creation/update failed: {err}")
-            global_errors += 1
-
-    def get_ingnored_alerts(project):
-        ign_alerts = json.dumps({
-            "requestType": "getProjectIgnoredAlerts",
-            "userKey": conf.ws_user_key,
-            "projectToken": project
-        })
-        res = []
-        try:
-            res_ = json.loads(call_ws_api(data=ign_alerts))["alerts"]
-            res.extend([x["vulnerability"]["name"] for x in res_])
-        except Exception as err:
-            pass
-        return res
-
-    def is_ignored(cve, ignored):
-        return cve in ignored
-
-    global conf, global_errors, exist_wis, updated_wi, wi_claim_keyid, count_item, synced_projects
-    try:
-        item_failed = False
-        ws_prj = fetch_prj_policy(prj_token, sdate, edate)
-        if ws_prj is None:
-            # Absence of findings is a real answer; a failed fetch is not. Verdicting OK here
-            # would close this project's window having never read it.
-            return VERDICT_FAILED, (f"Mend policy fetch failed for project {prj_token}; "
-                                    f"nothing synced and its window stays open")
-        ignore_alerts = get_ingnored_alerts(project=prj_token) if conf.wsalert.lower() == "false" else []
-        prj_lib_hierarchy = try_or_error(lambda: get_prj_lib_hierarchy()["libraries"], [])
-        prj_licenses = try_or_error(lambda: get_prj_licenses(), [])
-        prj_lib_locations = try_or_error(lambda: get_lib_locations(), [])
-        epss_on = epss_enabled()
-        reachability_on = reachability_enabled()
-        prd_name = ws_prj[0]
-        prj_name = ws_prj[1]
-        status_op = "created"
-        count_item = 0
-        skipped_types = {}
-        sorted_libs = sorted(ws_prj[2:], key=lambda x: (x["library"]["keyId"], -len(x["policyViolations"])))
-        enrichment_index = enrich_project(prj_token) if sorted_libs else {}
-        if enrichment_index:
-            safe_decorate(sorted_libs, enrichment_index)
-        for prj_el in sorted_libs:
-            policy_type = try_or_error(lambda: prj_el["policy"]["policyMatch"]["type"], "")
-            if policy_type not in SUPPORTED_POLICY_TYPES:
-                skipped_types[policy_type or "unknown"] = skipped_types.get(policy_type or "unknown", 0) + 1
-                continue
-            # The library's Mend page. It is the operator's click-through link out of the work
-            # item, written below as a Hyperlink relation. It used to double as the reverse
-            # sync's carrier (attributes.comment = "{token},{uuid}"); the reverse sync is gone,
-            # the link is not.
-            lib_url = try_or_error(lambda: prj_el["library"]["url"], "")
-            lib_name = prj_el["library"]["filename"]
-            lib_key_id = try_or_error(lambda: prj_el["library"]["keyId"], "")
-            policy_lic_name = try_or_error(
-                lambda: prj_el['policy']['name'][prj_el['policy']['name'].find("]") + 1:].strip(), "")
-            tags = build_wi_tags(f"{prd_name}/{prj_name}",
-                                 Tags.get_el_by_name(policy_type),
-                                 conf.routing, conf.reponame)
-            key_uuid = try_or_error(lambda: prj_el['library']['keyUuid'], "")
-            path_dep, path_lib = get_pathes(key_uuid)
-            list_dep_lib = dep_hierarchy(key_uuid=key_uuid)
-            lib_desc, lib_home_page, lic_data_arr, lib_dep = get_lib_lic(key_uuid)
-            is_license = prj_el["policy"]["policyMatch"]["type"] == "LICENSE"
-            lib_hierarchy = find_parent_chain(key_uuid=key_uuid,
-                                              libraries=prj_lib_hierarchy) if lib_dep == "Transitive" else []
-
-            if conf.dependency.lower() == "true":  # Different process creation WI (related dependency or CVE)
-                relevant_vuls = []
-                max_severity = ""
-                if not is_license:
-                    for vuln_ in prj_el["policyViolations"]:
-                        if not is_ignored(cve=vuln_["vulnerability"]["name"], ignored=ignore_alerts):
-                            relevant_vuls.append(vuln_)
-                    if relevant_vuls:
-                        max_severity_el = max(relevant_vuls, key=lambda x:
-                        float(try_or_error(lambda: x["vulnerability"]["cvss3_score"],
-                                           try_or_error(lambda: x["vulnerability"]["score"], 0))))
-                        max_severity = try_or_error(lambda: max_severity_el["vulnerability"]["cvss3_score"],
-                                                    try_or_error(lambda: max_severity_el["vulnerability"]["score"], ""))
-                vul_title = license_title(lib_name) if is_license else f"{lib_name}: " \
-                                        f"{len(relevant_vuls)} vulnerabilities (highest severity is {max_severity})"
-                hierarchy_libs = ""
-                vulnerability_data = ""
-                # Vulnerabilities are matched on the library name alone: the count and the highest
-                # severity in the title both move when a vulnerability is suppressed, rescored or
-                # fixed, and matching on them missed the item, created a duplicate and stranded the
-                # original open. Licenses match exactly -- their title has no moving parts.
-                if is_license:
-                    exist_id = check_wi_id(id=vul_title, project_name=f"{prd_name}/{prj_name}")
-                else:
-                    exist_id = check_wi_id_matching(
-                        lambda t: matches_library(t, lib_name),
-                        project_name=f"{prd_name}/{prj_name}")
-                # Looking for ID by System.Title and Tag (Product/Project Name)
-                if exist_id > 0:
-                    wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
-                                                   data={}, project=conf.azure_project)
-                wi_type_ = try_or_error(lambda: wi_data["fields"]["System.WorkItemType"], "")
-                if exist_id == 0:
-                    azure_operation = "add"
-                # err_ == 0 is required here: exist_id may be a work item created earlier in
-                # this same run, and wi_data/err_ are not reset when exist_id == 0, so a stale
-                # or transiently-failed (e.g. throttled) GET must not be read as "wrong type"
-                # and trigger a DELETE of the item we just created.
-                elif err_ == 0 and wi_type_.lower() != wi_type.lower():
-                    call_azure_api(api_type="DELETE", api=f"wit//workitems/{exist_id}",
-                                   data={}, project=conf.azure_project)
-                    azure_operation = "add"
-                else:
-                    azure_operation = "replace"
-                if exist_id not in updated_wi:
-                    if is_license:  # Different description creation for License and Vulnerability
-                        lic_data = ""
-                        for lic_data_ in lic_data_arr:
-                            lic_data = lic_data + f"<a href='{lic_data_[2]}'>{lic_data_[1]}</a>" + \
-                                       f"<br><b>License Reference File: </b><a href='{lic_data_[0]}'>{lic_data_[0]}</a><br>" \
-                                       f"<b>License Policy Violation - </b>{policy_lic_name}<br>"
-                        lic_data = generate_expandable_section("<b>License Details</b>",lic_data)
-                        desc = "<b>Library - </b>" + lib_name + \
-                               "<br>" + lib_desc + \
-                               "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
-                               "<br><b>Vulnerable Library: </b>" + lib_name + f"<br><b> Library home page: " \
-                                                                              f"</b><a href='{lib_home_page}'>{lib_home_page}</a>" + lic_data
-                    else:
-                        table_data = []
-                        for i, policy_el in enumerate(prj_el["policyViolations"]):
-                            vul_name = f"License Policy Violation" if is_license else \
-                                try_or_error(lambda: policy_el["vulnerability"]["name"], "")
-                            if "License Policy Violation" in vul_name or not is_ignored(cve=vul_name, ignored=ignore_alerts):
-                                vul_desc = try_or_error(lambda: policy_el["vulnerability"]["description"], "")
-                                vul_origin_url = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["url"], "")
-                                vul_publish_date = try_or_error(lambda: policy_el["vulnerability"]["publishDate"], "")
-                                vul_fix_release_date = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["date"],
-                                                                    "")
-                                vul_severity = try_or_error(lambda: policy_el["vulnerability"]["cvss3_severity"],
-                                                            try_or_error(lambda: policy_el["vulnerability"]["severity"],
-                                                                         ""))
-                                vul_score = try_or_error(lambda: policy_el["vulnerability"]["cvss3_score"],
-                                                         try_or_error(lambda: policy_el["vulnerability"]["score"], ""))
-                                vul_fix_resolution = try_or_error(lambda: policy_el["vulnerability"]["fixResolutionText"],
-                                                                  "")
-                                vul_fix_type = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["type"], "")
-                                vul_url = lib_home_page if is_license else try_or_error(
-                                    lambda: policy_el["vulnerability"]["url"], "")
-                                # MEND_EPSS and MEND_REACHABILITY both default to false, and
-                                # the README/design doc promise a byte-identical work item
-                                # when both are off, so these keys are gated per flag. URL
-                                # must stay the last key written in every combination:
-                                # create_html_table drops the final cell by position, so
-                                # anything after URL vanishes.
-                                row = {
-                                    "CVE": vul_name,
-                                    "Severity": vul_severity,
-                                    "CVSS": vul_score,
-                                }
-                                row.update(epss_exploit_row_fields(policy_el, epss_on))
-                                row["Dependency"] = lib_name
-                                row["Type"] = lib_dep
-                                row["Fixed in"] = vul_fix_resolution
-                                row.update(reachability_row_field(policy_el, reachability_on))
-                                row["URL"] = vul_url
-                                table_data.append(row)
-                                lic_data = "<br>"
-                                for lic_data_ in lic_data_arr:
-                                    lic_data = lic_data + f"<a href='{lic_data_[2]}'>{lic_data_[1]}</a>" + \
-                                               f"<br><b>License Reference File: </b><a href='{lic_data_[0]}'>{lic_data_[0]}</a><br>" \
-                                               f"<b>License Policy Violation - </b>{policy_lic_name}<br>"
-                                lic_data = generate_expandable_section("<b>License Details</b>", lic_data) if is_license else ""
-
-                                # MEND_EPSS and MEND_REACHABILITY both default to false, and
-                                # the README/design doc promise a byte-identical work item
-                                # when both are off.
-                                enrich_html = build_enrich_html(policy_el, epss_on, reachability_on)
-                                vul_data = "<b>Vulnerable Library:</b>" + lib_name + \
-                                    "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
-                                    "<br><b>Vulnerability Details:</b> " + vul_desc + "<br><b>Publish Date:</b> " + \
-                                    vul_publish_date + \
-                                    f"<br><b>URL:</b> <a href='{vul_url}'>{vul_name}</a>" + \
-                                    "<br><b>CVSS 3 Score Details </b>(" + str(vul_score) + ")" + \
-                                    enrich_html + \
-                                    "<br><b>Suggested Fix:</b> " + \
-                                    vul_fix_type + f"<br><b>Origin:</b> <a href='{vul_origin_url}'></a><br>" \
-                                                   f"<b>Release Date:</b> " + vul_fix_release_date + \
-                                    "<br><b>Fix Resolution:</b> " + vul_fix_resolution
-                                hierarchy_libs = generate_html_bulleted_list(items=[x["filename"] for x in lib_hierarchy] if lib_dep == "Transitive" else list_dep_lib)
-                                vulnerability_data += generate_expandable_section(vul_name, vul_data + lic_data)
-
-                        desc = create_html_table(data=table_data) if table_data else ""
-                        desc_add = "<b>Library - </b>" + lib_name + \
-                                   "<br>" + lib_desc + \
-                                   "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
-                                   "<br><b>Vulnerable Library: </b>" + lib_name + \
-                                   "<br><b>Dependency Hierarchy: </b><br>" + hierarchy_libs + \
-                                   f"<br><b> Library home page: " \
-                                   f"</b><a href='{lib_home_page}'>{lib_home_page}</a>"
-                        desc = generate_expandable_section(f"Vulnerable library - {lib_name}", desc_add) + "<br>" + \
-                               desc + "<b>Details:</b><br>" if vulnerability_data else ""
-                        desc += vulnerability_data
-
-                    priority = set_priority(try_or_error(lambda: float(max_severity), 6)) if conf.priority.lower() == "true" else DEFAULT_PRIORITY
-                    # Default priority is 2
-                    if desc:  # Creation WI just in case existing data
-                        create_wi_content()
-                else:
-                    # FINDING 1: two distinct libraries sharing a title (e.g. same filename,
-                    # different keyId -- a real Maven/npm case) resolve to the same exist_id.
-                    # The guard above already skips the second library's violations; make that
-                    # skip visible instead of silent.
-                    claimant_key, claimant_name = wi_claim_keyid.get(exist_id, (lib_key_id, lib_name))
-                    if claimant_key != lib_key_id:
-                        logger.warning(
-                            f"[{fn()}] Work item {exist_id} for title '{vul_title}' was already "
-                            f"claimed by library '{claimant_name}' (keyId={claimant_key}); "
-                            f"library '{lib_name}' (keyId={lib_key_id}) shares the same title and "
-                            f"its violations were skipped.")
-            else:
-                for i, policy_el in enumerate(prj_el["policyViolations"]):
-                    if (is_license and policy_el["violationType"] == "LICENSE") or (
-                            not is_license and policy_el["violationType"] == "VULNERABILITY"):
-                        lic_num_vuln = f" #{str(i+1)}" if is_license and i>0 else ""
-                        vul_name = f"License Policy Violation{lic_num_vuln}" if is_license else \
-                            try_or_error(lambda: policy_el["vulnerability"]["name"], "")
-                        if "License Policy Violation" in vul_name or not is_ignored(cve=vul_name, ignored=ignore_alerts):
-                            vul_severity = try_or_error(lambda: policy_el["vulnerability"]["cvss3_severity"],
-                                                        try_or_error(lambda: policy_el["vulnerability"]["severity"], ""))
-                            if not vul_name:
-                                break
-                            vul_title = f"{vul_name} detected in {lib_name}" if is_license else \
-                                f"{vul_name} ({str(vul_severity).capitalize()}) detected in {lib_name}"
-
-                            vul_score = try_or_error(lambda: policy_el["vulnerability"]["cvss3_score"],
-                                                     try_or_error(lambda: policy_el["vulnerability"]["score"], ""))
-                            vul_desc = try_or_error(lambda: policy_el["vulnerability"]["description"], "")
-                            vul_url = try_or_error(lambda: policy_el["vulnerability"]["url"], "")
-                            vul_origin_url = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["url"], "")
-                            vul_publish_date = try_or_error(lambda: policy_el["vulnerability"]["publishDate"], "")
-                            vul_fix_resolution = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["fixResolution"],
-                                                              "")
-                            vul_fix_type = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["type"], "")
-                            vul_fix_release_date = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["date"], "")
-
-                            exist_id = check_wi_id(id=vul_title, project_name=f"{prd_name}/{prj_name}")
-                            if exist_id > 0:
-                                wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
-                                                               data={}, project=conf.azure_project)
-                            wi_type_ = try_or_error(lambda: wi_data["fields"]["System.WorkItemType"], "")
-                            if exist_id == 0:
-                                azure_operation = "add"
-                            # err_ == 0 is required here: exist_id may be a work item created
-                            # earlier in this same run, and wi_data/err_ are not reset when
-                            # exist_id == 0, so a stale or transiently-failed (e.g. throttled)
-                            # GET must not be read as "wrong type" and trigger a DELETE of the
-                            # item we just created.
-                            elif err_ == 0 and wi_type_.lower() != wi_type.lower():
-                                call_azure_api(api_type="DELETE", api=f"wit//workitems/{exist_id}",
-                                               data={}, project=conf.azure_project)
-                                azure_operation = "add"
-                            else:
-                                azure_operation = "replace"
-                            if exist_id not in updated_wi:
-                                priority = set_priority(try_or_error(lambda: float(vul_score), 6)) if conf.priority.lower() == "true" else DEFAULT_PRIORITY
-                                # Default priority is 2
-                                lic_data = "<br>"
-                                for lic_data_ in lic_data_arr:
-                                    lic_data = lic_data + f"<a href='{lic_data_[2]}'>{lic_data_[1]}</a>" + \
-                                               f"<br><b>License Reference File: </b><a href='{lic_data_[0]}'>{lic_data_[0]}</a><br>" \
-                                               f"<b>License Policy Violation - </b>{policy_lic_name}<br>"
-                                lic_data = generate_expandable_section("<b>License Details</b>", lic_data) if is_license else ""
-                                # MEND_EPSS and MEND_REACHABILITY both default to false, and
-                                # the README/design doc promise a byte-identical work item
-                                # when both are off.
-                                enrich_html = build_enrich_html(policy_el, epss_on, reachability_on)
-                                vul_data = "" if is_license else \
-                                    "<br><b>Vulnerability Details:</b> " + vul_desc + \
-                                    "<br><b>Publish Date:</b> " + vul_publish_date + \
-                                    f"<br><b>URL:</b> <a href='{vul_url}'>{vul_name}</a>" + \
-                                    "<br><b>CVSS 3 Score Details </b>(" + str(vul_score) + ")" + \
-                                    enrich_html + \
-                                    "<br><b>Suggested Fix:</b> " + \
-                                    vul_fix_type + f"<br><b>Origin:</b> <a href='{vul_origin_url}'></a><br>" \
-                                                   f"<b>Release Date:</b> " + vul_fix_release_date + \
-                                    "<br><b>Fix Resolution:</b> " + vul_fix_resolution
-                                hierarchy_libs = generate_html_bulleted_list(items=[x["filename"] for x in lib_hierarchy] if lib_dep == "Transitive" else list_dep_lib)
-
-                                desc = "<b>Library - </b>" + lib_name + \
-                                       "<br>" + lib_desc + \
-                                       "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
-                                       "<br><b>Vulnerable Library: </b>" + lib_name + \
-                                       "<br><b>Dependency Hierarchy: </b><br>" + hierarchy_libs + \
-                                       f"<br><b> Library home page: " \
-                                       f"</b><a href='{lib_home_page}'>{lib_home_page}</a>" + vul_data + lic_data
-                                create_wi_content()
-                            else:
-                                # FINDING 1: same exposure as the dependency-mode branch above --
-                                # two distinct libraries (e.g. same filename, different keyId) can
-                                # render the same per-CVE title and silently collide on exist_id.
-                                claimant_key, claimant_name = wi_claim_keyid.get(exist_id, (lib_key_id, lib_name))
-                                if claimant_key != lib_key_id:
-                                    logger.warning(
-                                        f"[{fn()}] Work item {exist_id} for title '{vul_title}' was "
-                                        f"already claimed by library '{claimant_name}' "
-                                        f"(keyId={claimant_key}); library '{lib_name}' "
-                                        f"(keyId={lib_key_id}) shares the same title and its "
-                                        f"violations were skipped.")
-
-        if skipped_types:
-            detail = ", ".join(f"{name} x{count}" for name, count in sorted(skipped_types.items()))
-            logger.info(f"Skipped {sum(skipped_types.values())} violation(s) with unsupported "
-                        f"policy type(s) for Mend project '{prj_name}': {detail}. Only "
-                        f"{' and '.join(SUPPORTED_POLICY_TYPES)} produce work items.")
-
-        message = f"{count_item} {conf.azure_type} work items created/updated for Mend project " \
-                  f"'{prj_name}' (Product '{prd_name}')" if count_item > 0 else \
-            f"No {conf.azure_type} work items {status_op} for Mend project '{prj_name}' (Product '{prd_name}')"
-        # Written unconditionally, whatever the verdict: this is the run's record of which
-        # Mend projects resolved to which Azure project, keyed by the same (product, project)
-        # tag string create_wi writes onto the work items themselves.
-        synced_projects.append((prj_token, f"{prd_name}/{prj_name}", conf.azure_project))
-        return (VERDICT_FAILED if item_failed else VERDICT_OK), message
-    except Exception as err:
-        return VERDICT_FAILED, f"[{ex()}] Work item creation failed: {err}"
 
 
 
@@ -2238,7 +1593,7 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
     or "failed".
 
     Matching, the wrong-type DELETE-and-recreate, and the exist_wis cache refresh are all
-    identical to create_wi's -- the 1.4 and 3.0 paths must agree on which work item a title
+    identical to the deleted 1.4 path's -- both must agree on which work item a title
     identifies, or the changeover in Task 4 orphans every item the 1.4 path created.
     """
     global global_errors, exist_wis, updated_wi
@@ -2345,12 +1700,9 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
 def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
     """Create and update Azure work items from one project's 3.0 `desired` state.
 
-    Returns (created, updated, failed). The 3.0 twin of create_wi: it renders the SAME work
-    items from 3.0 findings instead of 1.4 policy issues, reusing the same renderers, the same
-    matching and the same tags, so a backlog created by the 1.4 path is picked up rather than
-    duplicated when Task 4 changes the wiring.
-
-    NO CALLERS until Task 4 -- this ships alongside create_wi, which is still the live path.
+    Returns (created, updated, failed). It renders the SAME work items the deleted 1.4 path
+    rendered -- same renderers, same title matching, same tags -- so a backlog created by that
+    path is picked up rather than duplicated.
     """
     global conf
     conf = startup() if not conf else conf
@@ -2412,36 +1764,6 @@ def error_count() -> int:
     # Mirrors sync_had_fatal_error(): azure_wi_sync.py must call this rather than import
     # global_errors by value, or its "completed successfully" check is frozen at 0 forever.
     return global_errors
-
-
-def expand_product_tokens(producttoken: str) -> list:
-    # Shared by the legacy and routed paths. Two deliberate behaviour changes from the
-    # inline block this replaces:
-    #   1. No exit(-1) on failure — under routing, one bad product token must not kill
-    #      every other target in the run.
-    #   2. json.loads(call_ws_api(...)) is now inside the try. In the original it sat
-    #      outside, so a non-200 from Mend returned "" and raised an uncaught
-    #      JSONDecodeError instead of the graceful failure this refactor exists to give.
-    global product_token_expansion_cache
-    if producttoken in product_token_expansion_cache:
-        return product_token_expansion_cache[producttoken]
-    res = []
-    for prd_ in producttoken.split(","):
-        data = json.dumps({"requestType": "getAllProjects",
-                           "userKey": conf.ws_user_key,
-                           "orgToken": conf.ws_org_token,
-                           "productToken": prd_})
-        try:
-            prj_lst_ = json.loads(call_ws_api(data=data))
-            for prj_ in prj_lst_['projects']:
-                res.append(prj_['projectToken'])
-        except Exception as err:
-            logger.error(f"Mend API call failed. Details:{err}")
-            # A failure must never be memoized -- caching it would paper over a transient
-            # Mend outage as a permanent empty scope.
-            return None
-    product_token_expansion_cache[producttoken] = res
-    return res
 
 
 def sync_project_v3(project, floor: float, custom_flds: list, wi_type: str) -> bool:

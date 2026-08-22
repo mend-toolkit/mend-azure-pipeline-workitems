@@ -245,11 +245,3 @@ def test_conf_azure_project_is_restored_even_when_a_target_raises():
         finally:
             mock.patch.stopall()
     assert conf.azure_project == "Bookkeeping"
-
-
-def test_expand_product_tokens_survives_a_non_json_response():
-    """Retained from the 1.4 selection path: expand_product_tokens is still exported and must
-    fail closed (None, not []) rather than raising JSONDecodeError."""
-    with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="k", ws_org_token="o")), \
-         mock.patch.object(core, "call_ws_api", return_value=""):
-        assert core.expand_product_tokens("prd-1") is None

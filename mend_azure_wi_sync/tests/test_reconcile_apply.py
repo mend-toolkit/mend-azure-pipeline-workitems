@@ -215,8 +215,8 @@ def test_an_already_closed_item_produces_no_api_call_at_all():
 
 
 def test_creates_and_updates_are_counted_but_never_executed():
-    """CREATE/UPDATE stay on the 1.4 create_wi path; this function must not call Azure for
-    them."""
+    """CREATE/UPDATE stay on the creation path (create_wi_v3); this function must not call
+    Azure for them."""
     calls = []
     desired = {("vulnerability", "log4j-core"): {}, ("license", "jackson"): {}}
     with _conf(), \
@@ -225,7 +225,7 @@ def test_creates_and_updates_are_counted_but_never_executed():
                            return_value={("vulnerability", "log4j-core"): {"id": 42,
                                                                            "state": "Active"}}), \
          mock.patch.object(core, "call_azure_api", lambda *a, **k: calls.append(a) or ({}, 0)), \
-         mock.patch.object(core, "create_wi", lambda *a, **k: calls.append(a)):
+         mock.patch.object(core, "create_wi_v3", lambda *a, **k: calls.append(a)):
         created, updated, closed, reopened, skipped = core.reconcile_project(PROJECT)
     assert calls == []
     assert (created, updated, closed, reopened, skipped) == (1, 1, 0, 0, 0)

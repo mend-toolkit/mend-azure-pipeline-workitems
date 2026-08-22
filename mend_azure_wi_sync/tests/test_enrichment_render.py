@@ -1,37 +1,7 @@
-import re
 from unittest import mock
 
 from mend_azure_wi_sync import core
 from mend_azure_wi_sync import enrichment as en
-
-
-def test_url_must_remain_the_last_row_key():
-    """create_html_table drops the final cell by position, assuming URL is last.
-
-    The enrichment columns are gated on MEND_EPSS / MEND_REACHABILITY independently, so the
-    row is built by mutating a `row` dict rather than a single dict literal. This parses the
-    ORDER OF ASSIGNMENTS made to `row`, not a literal's keys. This is a guard test, not a
-    feature test: if someone appends a column after URL, the column vanishes from every work
-    item silently. Failing loudly here is the point.
-    """
-    src = core.__file__
-    with open(src, encoding="utf-8") as fh:
-        body = fh.read()
-    start = body.index("row = {")
-    end = body.index("table_data.append(row)", start)
-    block = body[start:end]
-    keys = []
-    for line in block.splitlines():
-        m = re.search(r'"([A-Za-z ]+)":', line) or re.search(r'row\["([A-Za-z ]+)"\]\s*=', line)
-        if m:
-            keys.append(m.group(1))
-        elif "epss_exploit_row_fields" in line:
-            keys.extend(["EPSS", "Exploit"])
-        elif "reachability_row_field" in line:
-            keys.append("Reachability")
-    assert keys[-1] == "URL", f"URL must be the last key assigned to row, got {keys}"
-    assert keys[-2] == "Reachability", f"Reachability must be assigned immediately before URL, got {keys}"
-    assert "EPSS" in keys and "Exploit" in keys
 
 
 def test_no_enrichment_keys_are_added_when_both_flags_are_off():
@@ -84,20 +54,6 @@ def test_build_enrich_html_covers_all_four_flag_combinations():
     assert "<b>Exploit Code Maturity:</b>" in both
     # Reachability renders first, matching the row's column order.
     assert both.index("<b>Reachability:</b>") < both.index("<b>EPSS:</b>")
-
-
-def test_both_mend_dependency_branches_use_the_same_enrich_html_builder():
-    """The two vul_data sites (one per MEND_DEPENDENCY branch) are the same feature in two
-    code paths and must behave identically -- guarded against drift by sharing one function."""
-    src = core.__file__
-    with open(src, encoding="utf-8") as fh:
-        body = fh.read()
-    sites = re.findall(r'enrich_html = build_enrich_html\(policy_el, epss_on, reachability_on\)', body)
-    assert len(sites) == 2, f"expected exactly 2 call sites, got {len(sites)}"
-    spliced = body.count("enrich_html + \\")
-    assert spliced == 2, (
-        f"expected both vul_data sites to splice the guarded enrich_html variable, "
-        f"got {spliced}")
 
 
 def test_decoration_failure_cannot_cost_work_items():
