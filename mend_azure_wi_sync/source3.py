@@ -141,6 +141,39 @@ def normalise_violations(violations):
     return entries
 
 
+def normalise_licenses(rows) -> dict:
+    """3.0 due-diligence rows (GET .../dependencies/libraries/licenses) -> {library_name:
+    [{"name", "url", "reference_file"}, ...]}.
+
+    Schema, read from references/3.0 (2).json (do not re-derive from memory -- see Task 2
+    brief): the 200 response is DWRResponsePageableV3ListDueDiligenceDTOV3, whose "response"
+    array holds DueDiligenceDTOV3. Each row is ONE library/license pairing, not a library with
+    a licenses array, so grouping into a list happens here:
+      - DueDiligenceDTOV3.component.name  -- the library name (LibraryComponentDTOV3.name)
+      - DueDiligenceDTOV3.name            -- the license name (e.g. "MIT")
+      - DueDiligenceDTOV3.license         -- $ref LicenseReferenceDTO:
+          - license.textUrl            -- URL to the license text -> "url"
+          - license.liabilityReference -- URL/path to the artifact that evidenced the license
+                                           (e.g. a pom.xml) -> "reference_file"
+
+    A row missing a library name is skipped, as is anything that isn't a dict. `None`/garbage
+    input (not a list) returns {} rather than raising.
+    """
+    index = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        lib = _walk(row, "component", "name")
+        if not lib:
+            continue
+        index.setdefault(lib, []).append({
+            "name": row.get("name") or "",
+            "url": _walk(row, "license", "textUrl") or "",
+            "reference_file": _walk(row, "license", "liabilityReference") or "",
+        })
+    return index
+
+
 def normalise_projects(rows):
     """ProjectSummaryDTOV3 rows -> the project shape the rest of the tool uses.
 

@@ -17,8 +17,8 @@ from identity import license_title, matches_library
 from reconcile import CLOSE, CREATE, REOPEN, SKIP, UPDATE, plan_actions
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
-from source3 import (normalise_findings, normalise_projects, normalise_violations,
-                     select_projects, severity_floor)
+from source3 import (normalise_findings, normalise_licenses, normalise_projects,
+                     normalise_violations, select_projects, severity_floor)
 from syncstate import (TAG_FAILED, TAG_LASTRUN, VERDICT_FAILED,
                        VERDICT_OK, build_selection, failed_stamp, is_stale,
                        count_parseable_rows, field_for, parse_tag_map,
@@ -2385,21 +2385,40 @@ def fetch_v3_projects():
     return normalise_projects(rows), ok
 
 
+def fetch_v3_licenses(project_uuid: str):
+    """One project's due-diligence license rows -> ({library_name: [license, ...]}, ok).
+
+    GET /projects/{projectUuid}/dependencies/libraries/licenses, confirmed GET-only against
+    references/3.0 (2).json (the path declares only a "get" operation). See
+    source3.normalise_licenses for the schema this reads.
+    """
+    rows, ok = fetch_v3_pages(f"projects/{project_uuid}/dependencies/libraries/licenses")
+    if not ok:
+        logger.error(f"[{fn()}] Could not read library licenses for project {project_uuid}. "
+                     f"Callers must not treat the absence of license data here as \"this "
+                     f"library has no licenses\".")
+    return normalise_licenses(rows), ok
+
+
 def fetch_v3_desired(project_uuid: str, floor: float):
     """One project's desired end state: {(kind, library): entry}.
 
-    `ok` is the AND of both reads and is the closure interlock from spec 6.1 -- reconciliation
-    closes work items absent from `desired`, so a partial read must never be mistaken for a
-    shrunken one. A caller seeing ok=False may still create and update (which cannot destroy
-    anything) but must NOT close.
+    `ok` is the AND of all three reads and is the closure interlock from spec 6.1 --
+    reconciliation closes work items absent from `desired`, so a partial read must never be
+    mistaken for a shrunken one. A caller seeing ok=False may still create and update (which
+    cannot destroy anything) but must NOT close.
 
     Keyed by (kind, library) rather than library: one library can carry both a vulnerability and
     a license work item, and they are separate items with different titles.
+
+    Every entry carries "licenses" (a list, [] when the library has none) so downstream
+    rendering never has to guard for the key's absence.
     """
     findings, findings_ok = fetch_v3_pages(
         f"projects/{project_uuid}/dependencies/findings/security")
     violations, violations_ok = fetch_v3_pages(
         f"orgs/{org_uuid()}/projects/{project_uuid}/violations")
+    licenses, licenses_ok = fetch_v3_licenses(project_uuid)
 
     vuln_entries, unscored = normalise_findings(findings, floor)
     lic_entries = normalise_violations(violations)
@@ -2413,10 +2432,12 @@ def fetch_v3_desired(project_uuid: str, floor: float):
 
     desired = {}
     for lib, entry in vuln_entries.items():
+        entry["licenses"] = licenses.get(lib, [])
         desired[("vulnerability", lib)] = entry
     for lib, entry in lic_entries.items():
+        entry["licenses"] = licenses.get(lib, [])
         desired[("license", lib)] = entry
-    return desired, (findings_ok and violations_ok)
+    return desired, (findings_ok and violations_ok and licenses_ok)
 
 
 def extract_url(url: str) -> str:
