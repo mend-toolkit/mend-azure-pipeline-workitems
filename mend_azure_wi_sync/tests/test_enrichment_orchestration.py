@@ -1,20 +1,23 @@
 from unittest import mock
 
 from mend_azure_wi_sync import core
-from mend_azure_wi_sync import syncstate
 
 
 def _run_sync_conf(**kw):
     """run_sync needs the token-list branch, so routing must not read as 'true'."""
     return mock.MagicMock(routing="false", wsproducttoken="", wsprojecttoken="",
-                          wsexcludetoken="", **kw)
+                          wsexcludetoken="", severity="high", azure_project="Book", **kw)
+
+
+PROJECTS = [{"uuid": "p-1", "name": "api", "application_uuid": "a-1",
+             "application_name": "ProductX", "last_scanned": "", "tags": {}}]
 
 
 def _run_sync(caplog, conf):
     with mock.patch.object(core, "conf", conf), \
-         mock.patch.object(core, "get_prj_list_modified", return_value=["tok-1"]), \
+         mock.patch.object(core, "fetch_v3_projects", return_value=(PROJECTS, True)), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
+         mock.patch.object(core, "sync_project_v3", return_value=True), \
          caplog.at_level("INFO"):
         core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
     return [r.getMessage() for r in caplog.records]

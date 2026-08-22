@@ -1212,7 +1212,19 @@ def apply_reopen(work_item_id, state: str) -> bool:
     return _patch_state(work_item_id, state, "reopen")
 
 
-def reconcile_project(project):
+def run_severity_floor() -> float:
+    """The ONE severity floor for this run -- the shared accessor creation and closure both read.
+
+    MEND_SEVERITY now decides which findings earn a work item AND which findings hold one open.
+    Those two answers MUST come from the same number: if creation filters at 7.0 and closure at
+    0.0 (or the reverse) every work item between the two thresholds is created, immediately
+    closed, and re-created on the next run -- flapping forever. Never call severity_floor() on
+    conf directly from the run path; call this.
+    """
+    return severity_floor(getattr(conf, "severity", ""))
+
+
+def reconcile_project(project, floor=None, desired=None, ok=None):
     """Reconcile ONE Mend project against Azure. Returns (created, updated, closed, reopened,
     skipped).
 
@@ -1230,21 +1242,28 @@ def reconcile_project(project):
 
     SKIP makes no API call at all: see reconcile.plan_actions.
 
-    MEND_SEVERITY is INERT here and the floor passed to fetch_v3_desired is hard-coded 0.0. The
-    filter belongs to a future 3.0-driven CREATION path; creation today runs on 1.4, which applies
-    no severity filter at all. Filtering `desired` while creation is unfiltered would make every
-    work item 1.4 created for a below-floor finding absent from `desired`, hence CLOSED, hence
-    re-created by 1.4 on the next run -- an item flapping forever. conf.severity and
-    source3.severity_floor stay as they are; they just must not decide a closure.
+    MEND_SEVERITY is LIVE here. `floor` defaults to run_severity_floor() -- the same accessor
+    the creation path reads -- and sync_project_v3 passes the floor it created with, together
+    with the very `desired`/`ok` pair it created from, so creation and closure decide on one
+    snapshot filtered at one threshold. A floor here that differs from the creation floor makes
+    every work item between the two thresholds created, closed and re-created every run.
     """
     project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
     closed_state = normalise_state(getattr(conf, "closed_state", ""), "Closed")
     reopen_state = normalise_state(getattr(conf, "reopen_state", ""), "New")
+    if floor is None:
+        floor = run_severity_floor()
 
-    # Read Azure FIRST, before anything in this run has written to it: entries added to exist_wis
-    # after a POST/PATCH carry state "" and must never be mistaken for a real state.
+    # `actual` is read from the exist_wis cache. When sync_project_v3 calls this it has already
+    # written this project's work items, so entries it just created/updated are present with the
+    # state Azure returned on the write. That is safe in one direction only: everything written
+    # this run came FROM `desired`, so nothing written can be missing from `desired` and be
+    # closed. A write whose response carried no state caches "" -- read as "not closed", which
+    # can only miss a reopen, never cause a close.
     actual = actual_work_items(project_name)
-    desired, ok = fetch_v3_desired(project.get("uuid", ""), 0.0)
+    if desired is None or ok is None:
+        # Standalone call (no caller-supplied snapshot): read it here, at the SAME floor.
+        desired, ok = fetch_v3_desired(project.get("uuid", ""), floor)
 
     if not ok:
         logger.warning(f"[{fn()}] The Mend read for project {project_name} was incomplete. "
@@ -2425,213 +2444,213 @@ def expand_product_tokens(producttoken: str) -> list:
     return res
 
 
-def run_sync_routed(modified_projects: list, end_date: str, custom_flds: list,
-                    wi_type: str, retry_only=None):
+def sync_project_v3(project, floor: float, custom_flds: list, wi_type: str) -> bool:
+    """Create/update AND reconcile ONE Mend project, from ONE 3.0 read at ONE severity floor.
+
+    The whole point of doing both here: `desired` and `ok` are fetched once and handed to both
+    halves. Creation writes exactly the entries that pass `floor`; closure closes exactly the
+    work items those entries do not account for. Two reads at two floors is the flapping bug --
+    see run_severity_floor.
+
+    ok=False (a partial Mend read) still creates and updates -- neither can destroy anything --
+    and reconcile_project closes NOTHING. That interlock lives there, untouched.
+
+    A failure here is per project: it is logged, counted, and the run continues. Returns True
+    when the project was synced.
+    """
+    global global_errors, synced_projects
+    project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
+    try:
+        desired, ok = fetch_v3_desired(project.get("uuid", ""), floor)
+        create_wi_v3(project, desired, custom_flds, wi_type)
+        # Kept for continuity: (project id, "Application/Project", the Azure project it was
+        # written to). reconcile_after_sync -- no longer called by main(), since closure now
+        # runs inline here -- is its only remaining reader.
+        synced_projects.append((project.get("uuid", ""), project_name, conf.azure_project))
+        reconcile_project(project, floor=floor, desired=desired, ok=ok)
+        return True
+    except Exception as err:
+        global_errors += 1
+        logger.error(f"[{ex()}] Sync failed for Mend project {project_name}: {err}. "
+                     f"The remaining projects are still synced.")
+        return False
+
+
+def run_sync_routed(projects: list, custom_flds: list, wi_type: str, floor: float):
+    """Routed variant: each Mend project's Azure target comes from its own 3.0 tags.
+
+    `projects` are 3.0 project dicts that already survived select_projects, so MEND_*TOKEN
+    narrowing has happened and there are no scope-excluded / out-of-scope outcomes left to
+    preset -- routing.py only decides no-target / schema-fault / branch-filtered / unknown.
+    """
     global exist_wis, global_errors, run_failed
     # conf.azure_project, conf.reponame and conf.azure_area are all re-pointed per target
-    # below and must be restored: main() still uses conf.azure_project for bookkeeping, and
-    # create_area mutates azure_area cumulatively.
+    # below and must be restored: create_area mutates azure_area cumulatively, and a leaked
+    # azure_project would write -- or close -- work items in the wrong Azure project.
     original_azure_project = conf.azure_project
     original_reponame = conf.reponame
     original_azure_area = conf.azure_area
-
-    tags = fetch_project_tags(modified_projects)
-    if tags is None:
-        global_errors += 1
-        run_failed = True
-        return "Aborted: could not read Mend project tags."
-
-    known = list_azure_projects()
-    if known is None:
-        global_errors += 1
-        run_failed = True
-        return "Aborted: could not list Azure DevOps projects."
-    # Azure project names are matched case-insensitively for lookup, but classify()'s
-    # known_projects membership test is deliberately exact-string (routing.py stays dumb).
-    # Normalise here, the only place that sees both the real Azure names and the raw tag
-    # value, by rewriting each route's azure_project to the canonically-cased name before
-    # classify() ever runs — that keeps classify()'s exact-match contract intact.
-    known_by_casefold = {name.casefold(): name for name in known}
-
-    # Tokens stop selecting targets and become scope narrowing, so a pilot can be limited
-    # and MEND_EXCLUDETOKEN keeps working. Absent config narrows nothing.
-    narrowed = set(modified_projects)
-    scope = set()
-    if conf.wsproducttoken:
-        expanded = expand_product_tokens(conf.wsproducttoken)
-        if expanded is None:
-            # Failing to expand must never widen scope. An empty `scope` skips narrowing
-            # entirely, which would route all ~400 projects and evaporate the pilot limit.
+    try:
+        known = list_azure_projects()
+        if known is None:
             global_errors += 1
             run_failed = True
-            return "Aborted: could not expand MEND_PRODUCTTOKEN; refusing to widen scope."
-        scope.update(expanded)
-    if conf.wsprojecttoken:
-        scope.update(conf.wsprojecttoken.split(","))
-    if scope:
-        narrowed &= scope
-    excluded = set([t for t in conf.wsexcludetoken.split(",") if t]) & set(modified_projects)
-    narrowed -= excluded
+            return "Aborted: could not list Azure DevOps projects."
+        # Azure project names are matched case-insensitively for lookup, but classify()'s
+        # known_projects membership test is deliberately exact-string (routing.py stays dumb).
+        # Normalise here, the only place that sees both the real Azure names and the raw tag
+        # value, by rewriting each route's azure_project to the canonically-cased name before
+        # classify() ever runs.
+        known_by_casefold = {name.casefold(): name for name in known}
 
-    # Distinguish the two reasons a project is out of scope: an operator excluded it on
-    # purpose, versus it simply not being in the pilot's product/project scope.
-    preset = {t: SKIP_EXCLUDED for t in excluded}
-    preset.update({t: SKIP_OUT_OF_SCOPE
-                   for t in (set(modified_projects) - narrowed) - excluded})
+        routes, by_uuid = {}, {}
+        for project in projects or []:
+            uuid = project.get("uuid", "")
+            by_uuid[uuid] = project
+            route = parse_route(project.get("tags") or {})
+            if route.azure_project:
+                route.azure_project = known_by_casefold.get(route.azure_project.casefold(),
+                                                            route.azure_project)
+            routes[uuid] = route
 
-    # A token the tag map does not answer for is NOT the same thing as an untagged project.
-    # fetch_project_tags returns a dict for every token it is asked about, so this is
-    # defensive rather than reachable today (the old reachable cause -- an ambiguous
-    # (productName, projectName) join against 2.0 /entities -- is gone with that transport).
-    # It stays because a future caller passing a subset of tokens would otherwise get
-    # parse_route({}) and land in the QUIET no-target bucket, indistinguishable from a
-    # genuinely tagless project. Answer-less means loud: SKIP_UNKNOWN, in LOUD_OUTCOMES.
-    unanswered = set()
-    routes = {}
-    for token in modified_projects:
-        per_token_tags = tags.get(token)
-        if per_token_tags is None:
-            unanswered.add(token)
-            per_token_tags = []
-        route = parse_route(per_token_tags)
-        if route.azure_project:
-            route.azure_project = known_by_casefold.get(route.azure_project.casefold(),
-                                                         route.azure_project)
-        routes[token] = route
-    for token in unanswered:
-        preset.setdefault(token, SKIP_UNKNOWN)
-
-    targets, outcomes = build_table(routes, known, conf.branches, preset=preset)
-
-    report = coverage_report(outcomes)
-    routed = len([o for o in outcomes.values() if o == SKIP_OK])
-    # scope-excluded, out-of-scope and branch-filtered are deliberate outcomes — the last
-    # is "the normal state during rollout" per routing.py — so a run made up entirely of
-    # those must not be fatal. Only count outcomes that actually reached a routing decision.
-    considered = [t for t, o in outcomes.items()
-                  if o not in (SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_BRANCH)]
-    # A candidate that only got here because it carries azure-wi-failed is not fresh work.
-    # If its destination is later renamed, deleted or falls out of PAT visibility, a quiet
-    # window contains nothing else, it classifies SKIP_UNKNOWN, and the fatal below would
-    # exit 1 on every run forever — never re-verdicted, because it never reaches create_wi,
-    # so only a manual tag edit in Mend could clear it. Loud, yes; fatal, no.
-    fresh = [t for t in considered if t not in set(retry_only or [])]
-    if considered and not routed:
-        global_errors += 1
-        if fresh:
-            # Zero coverage among projects that reached a routing decision is never normal.
-            # This must also be FATAL: logging at ERROR alone still lets main() advance the
-            # global watermark and print "completed successfully" with exit 0, because
-            # global_errors is imported by value.
+        targets, outcomes = build_table(routes, known, conf.branches)
+        report = coverage_report(outcomes)
+        routed = len([o for o in outcomes.values() if o == SKIP_OK])
+        # branch-filtered is "the normal state during rollout" per routing.py, so a run made
+        # up entirely of deliberate skips must not be fatal. Only outcomes that actually
+        # reached a routing decision count.
+        considered = [t for t, o in outcomes.items()
+                      if o not in (SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_BRANCH)]
+        if considered and not routed:
+            # Zero coverage among projects that reached a routing decision is never normal,
+            # and must be FATAL: logging at ERROR alone still lets main() print "completed
+            # successfully" and exit 0.
+            global_errors += 1
             run_failed = True
-            logger.error(f"{report} — nothing routed. Check MEND_BRANCHES "
+            logger.error(f"{report} - nothing routed. Check MEND_BRANCHES "
                          f"('{conf.branches}') and the scan template's tag keys.")
+        elif outcomes and not routed:
+            logger.warning(f"{report} - nothing routed this window.")
         else:
-            logger.error(f"{report} — nothing routed, and every candidate this window came "
-                         f"from the retry queue ({TAG_FAILED}) rather than from a fresh scan. "
-                         f"Not failing the run: a retry entry whose destination no longer "
-                         f"exists would otherwise fail every run forever. Fix the routing "
-                         f"tags in Mend, or remove {TAG_FAILED} from the project(s) above.")
-    elif outcomes and not routed:
-        logger.warning(f"{report} — nothing routed this window.")
-    else:
-        logger.info(report)
-    for token, outcome in sorted(outcomes.items()):
-        if outcome in LOUD_OUTCOMES:
-            logger.error(f"Mend project {token}: {outcome} "
-                         f"(destination '{routes[token].azure_project}')")
-    unknown = len([o for o in outcomes.values() if o == SKIP_UNKNOWN])
-    if unknown and routed and unknown >= routed:
-        # Many unknown targets is more likely a PAT that cannot see those projects than
-        # that many bad tags. We cannot prove it — call_azure_api collapses 403 and 404.
-        logger.error(f"{unknown} destinations were not found in the organization. If they "
-                     f"exist, the PAT may lack visibility into them.")
+            logger.info(report)
+        for uuid, outcome in sorted(outcomes.items()):
+            if outcome in LOUD_OUTCOMES:
+                logger.error(f"Mend project {uuid}: {outcome} "
+                             f"(destination '{routes[uuid].azure_project}')")
+        unknown = len([o for o in outcomes.values() if o == SKIP_UNKNOWN])
+        if unknown and routed and unknown >= routed:
+            # Many unknown targets is more likely a PAT that cannot see those projects than
+            # that many bad tags. We cannot prove it - call_azure_api collapses 403 and 404.
+            logger.error(f"{unknown} destinations were not found in the organization. If they "
+                         f"exist, the PAT may lack visibility into them.")
 
-    synced = 0
-    state = fetch_project_tag_state()
-    reset_on = conf.reset.lower() == "true"
-    max_hours = try_or_error(lambda: int(conf.maxlookback), 720)
-    for azure_project in sorted(targets):
-        # Each Azure project is its own failure boundary: one bad target must not cost the
-        # other 106. Backlog #6 owns turning this into a real per-target result object.
-        conf.azure_project = azure_project
+        synced = 0
+        for azure_project in sorted(targets):
+            # Each Azure project is its own failure boundary: one bad target must not cost the
+            # other 106.
+            conf.azure_project = azure_project
+            conf.azure_area = original_azure_area
+            # exist_wis is per AZURE project and MUST be re-read whenever the target changes,
+            # or every title is matched against another project's work items - which both
+            # duplicates work items and, now that closure is live, closes the wrong ones.
+            exist_wis = get_exist_wi()
+            if exist_wis is None:
+                global_errors += 1
+                run_failed = True
+                exist_wis = []
+                logger.error(f"Skipping Azure project '{azure_project}': could not read "
+                             f"existing work items. Nothing is created or closed for the Mend "
+                             f"project(s) routed to it; the next run retries them.")
+                continue
+            for uuid, route in targets[azure_project]:
+                conf.reponame = route.repo
+                if sync_project_v3(by_uuid[uuid], floor, custom_flds, wi_type):
+                    synced += 1
+        return f"{report}; {synced} Mend project(s) synced"
+    finally:
+        conf.azure_project = original_azure_project
+        conf.reponame = original_reponame
         conf.azure_area = original_azure_area
-        exist_wis = get_exist_wi()
-        if exist_wis is None:
-            global_errors += 1
-            run_failed = True
-            exist_wis = []
-            logger.error(f"Skipping Azure project '{azure_project}': could not read "
-                         f"existing work items. Per-project sync state will not advance for it, "
-                         f"so this window will be retried on the next run.")
-            for token, _ in targets[azure_project]:
-                record_verdict(token, VERDICT_FAILED, end_date, state)
-            continue
-        for token, route in targets[azure_project]:
-            conf.reponame = route.repo
-            project_start = project_window(token, state, end_date, max_hours, reset_on)
-            verdict, message = create_wi(token, project_start, end_date, custom_flds, wi_type)
-            logger.info(message)
-            record_verdict(token, verdict, end_date, state)
-            synced += 1
 
-    conf.azure_project = original_azure_project
-    conf.reponame = original_reponame
-    conf.azure_area = original_azure_area
-    return f"{report}; {synced} Mend project(s) synced"
+
+def selection_tokens():
+    """The configured selection UUIDs -> (include, exclude, {value: the variable it came from}).
+
+    The variable map exists only so an unresolved value can be reported with the name of the
+    variable an operator has to go and fix.
+    """
+    include, exclude, source = [], [], {}
+    for raw, var, bucket in ((conf.wsproducttoken, "MEND_PRODUCTTOKEN", include),
+                             (conf.wsprojecttoken, "MEND_PROJECTTOKEN", include),
+                             (conf.wsexcludetoken, "MEND_EXCLUDETOKEN", exclude)):
+        for value in [v.strip() for v in str(raw or "").split(",") if v.strip()]:
+            bucket.append(value)
+            source.setdefault(value, var)
+    return include, exclude, source
 
 
 def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
+    """Drive the whole run from Mend 3.0: select projects, create/update, then close.
+
+    `st_date` and `end_date` are accepted for signature compatibility and are UNUSED. 3.0
+    reports a project's complete current state, so there are no windows, no watermarks and no
+    retry queue: a project that fails this run is simply read again in full on the next one.
+    """
     global exist_wis, global_errors, run_failed, synced_projects
     run_failed = False
     synced_projects = []
-    res = []
-    state = fetch_project_tag_state()
-    reset_on = conf.reset.lower() == "true"
-    max_hours = try_or_error(lambda: int(conf.maxlookback), 720)
-    floor = selection_floor(state, st_date, end_date, max_hours, reset_on, reset_back_time)
-    logger.info("Getting a modified project list")
-    modified_projects = get_prj_list_modified(floor, end_date)
-    candidates = build_selection(modified_projects, state)
-    logger.info(f"Selection mode: {'tag-based routing' if conf.routing.lower() == 'true' else 'token list'}")
-    # Logged on both branches, before routing returns: without it a pipeline log cannot
-    # answer "did enrichment run?", and 'off' is reached silently by an unexpanded
-    # $(MEND_EPSS) / $(MEND_REACHABILITY) as well as by an explicit false.
+    floor = run_severity_floor()
+    logger.info(f"Severity floor: MEND_SEVERITY '{conf.severity}' -> {floor}. The SAME floor "
+                f"decides which findings earn a work item and which findings hold one open.")
+    logger.info(f"Selection mode: "
+                f"{'tag-based routing' if conf.routing.lower() == 'true' else 'token list'}")
+    # Logged before routing returns: without it a pipeline log cannot answer "did enrichment
+    # run?", and 'off' is reached silently by an unexpanded $(MEND_EPSS) /
+    # $(MEND_REACHABILITY) as well as by an explicit false.
     logger.info(f"Enrichment: EPSS {'on' if epss_enabled() else 'off'} (MEND_EPSS), "
                 f"Reachability {'on' if reachability_enabled() else 'off'} (MEND_REACHABILITY)")
-    sync_state_desc = "Mend project tags" if tag_state_available \
-        else "unavailable — windows fall back to MEND_MAXLOOKBACK"
-    logger.info(f"Sync state: {sync_state_desc}; window floor {floor} -> {end_date}")
-    if conf.routing.lower() == "true":
-        return run_sync_routed(candidates, end_date, custom_flds, wi_type,
-                               retry_only=set(candidates) - set(modified_projects or []))
-    if conf.wsproducttoken:
-        expanded = expand_product_tokens(conf.wsproducttoken)
-        if expanded is None:
-            logger.error("Mend API call failed while expanding MEND_PRODUCTTOKEN.")
-            exit(-1)
-        res.extend(expanded)
 
-    if conf.wsprojecttoken:
-        res.extend(conf.wsprojecttoken.split(","))
-    res = set(candidates).intersection(res) if res else candidates
-    res = list(set(res) - set(conf.wsexcludetoken.split(",")))
-    #deleted_items = get_deleted_items()
+    projects, ok = fetch_v3_projects()
+    if not ok:
+        global_errors += 1
+        run_failed = True
+        return ("Aborted: could not read the Mend project list. Nothing is created and nothing "
+                "is closed - a partial list makes a project we failed to read look exactly "
+                "like one whose findings are all gone.")
+
+    include, exclude, source = selection_tokens()
+    selected, unresolved = select_projects(projects, include, exclude)
+    if unresolved:
+        # NEVER sync a partial selection. These variables now take 3.0 UUIDs, so a leftover 1.4
+        # token selects nothing, which reads as "no work to do" - and with closure live that
+        # reads as "everything was remediated".
+        global_errors += 1
+        run_failed = True
+        for value in unresolved:
+            variable = source.get(value, "MEND_PRODUCTTOKEN/MEND_PROJECTTOKEN/MEND_EXCLUDETOKEN")
+            logger.error(f"{variable} contains '{value}', which matches no Mend project or "
+                         f"application UUID. These variables take Mend 3.0 UUIDs now, not 1.4 "
+                         f"tokens.")
+        return (f"Aborted: {len(unresolved)} configured UUID(s) matched no Mend project or "
+                f"application: {', '.join(unresolved)}. Nothing is created and nothing is "
+                f"closed.")
+
+    if conf.routing.lower() == "true":
+        return run_sync_routed(selected, custom_flds, wi_type, floor)
+
     exist_wis = get_exist_wi()
     if exist_wis is None:
         global_errors += 1
         run_failed = True
         exist_wis = []
         return (f"Aborted: could not read existing work items in Azure project "
-                f"'{conf.azure_project}'. Skipping to avoid creating duplicates. "
-                f"Per-project sync state will not advance; this window will be retried.")
-    for prj_el in res:
-        project_start = project_window(prj_el, state, end_date, max_hours, reset_on)
-        verdict, message = create_wi(prj_el, project_start, end_date, custom_flds, wi_type)
-        logger.info(message)
-        record_verdict(prj_el, verdict, end_date, state)
-
-    return f"{len(res)} project(s) processed" if res else "Nothing to create/update"
+                f"'{conf.azure_project}'. Skipping to avoid creating duplicates and to avoid "
+                f"closing work items we cannot see.")
+    synced = 0
+    for project in selected:
+        if sync_project_v3(project, floor, custom_flds, wi_type):
+            synced += 1
+    return f"{synced} project(s) processed" if selected else "Nothing to create/update"
 
 
 def get_deleted_items():

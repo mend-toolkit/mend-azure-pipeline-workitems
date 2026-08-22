@@ -5,8 +5,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _version import __tool_name__, __version__, __description__
-from core import run_sync, startup, migration_seed, load_wi_json, AGENT_INFO, \
-    check_patterns, sync_had_fatal_error, error_count, reconcile_after_sync
+from core import run_sync, startup, load_wi_json, AGENT_INFO, \
+    check_patterns, sync_had_fatal_error, error_count
 
 logger = logging.getLogger(__tool_name__)
 logging.getLogger('urllib3').setLevel(logging.INFO)
@@ -50,17 +50,16 @@ def main():
 
     now = datetime.datetime.now() + datetime.timedelta(hours=conf.utc_delta)
     todate = now.strftime("%Y-%m-%d %H:%M:%S")
-    # No write probe and no exit: sync state lives in Mend project tags now, so a missing
-    # *Manage project properties* permission is no longer fatal — or needed.
-    logger.info(run_sync(migration_seed(), todate, wi_fields, wi_type))
-    # After the forward sync for EVERY project, so core.synced_projects is complete. Runs
-    # unconditionally -- there is no opt-in flag -- and is internally non-fatal: a failure here
-    # must not cost a sync that already succeeded.
-    reconcile_after_sync()
+    # No write probe and no exit: no Azure project property is read or written any more.
+    # run_sync now drives everything from Mend 3.0 and reconciles (closes/reopens) each project
+    # inline, right after creating that project's work items and from the same read at the same
+    # severity floor -- so there is no separate reconcile_after_sync() pass here to run at a
+    # different threshold. st_date is unused on the 3.0 path (no windows, no watermarks).
+    logger.info(run_sync("", todate, wi_fields, wi_type))
     if sync_had_fatal_error():
-        logger.error("The sync did not complete. Per-project sync state advanced only for the "
-                     "Mend projects that finished; the rest were left untouched and will be "
-                     "retried on the next run.")
+        logger.error("The sync did not complete. Mend 3.0 reports each project's full current "
+                     "state, so the projects that failed are simply read again in full on the "
+                     "next run.")
         logger.error("Sync process FAILED. Please look at the log.")
         exit(1)
     errors = error_count()

@@ -137,10 +137,15 @@ def test_the_summary_reports_the_totals(caplog):
     assert "1 project(s) reconciled, 1 unmatched" in summary[0]
 
 
-def test_it_is_wired_into_the_run_flow():
-    """A dormant function with no caller is the bug this change exists to fix."""
+def test_closure_is_wired_into_the_run_flow():
+    """A dormant closure path with no caller is the bug this change exists to fix. Closure is no
+    longer a separate end-of-run sweep (which would read Mend again, at its own floor): run_sync
+    reconciles each project inline through sync_project_v3, from the same read at the same floor
+    it created from."""
     import inspect
     from mend_azure_wi_sync import azure_wi_sync
-    source = inspect.getsource(azure_wi_sync.main)
-    assert "reconcile_after_sync()" in source
-    assert source.index("run_sync(") < source.index("reconcile_after_sync()")
+    main_source = inspect.getsource(azure_wi_sync.main)
+    assert "run_sync(" in main_source
+    sync_source = inspect.getsource(core.sync_project_v3)
+    assert "reconcile_project(" in sync_source
+    assert inspect.getsource(core.run_sync).count("sync_project_v3(") >= 1

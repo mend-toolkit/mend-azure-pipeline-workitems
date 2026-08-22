@@ -152,7 +152,8 @@ PROJECT = {"uuid": "p-1", "name": "api", "application_name": "ProductX"}
 def _conf():
     return mock.patch.object(core, "conf", mock.MagicMock(azure_project="P",
                                                           closed_state="Closed",
-                                                          reopen_state="New"))
+                                                          reopen_state="New",
+                                                          severity="high"))
 
 
 def test_an_incomplete_read_skips_closures():
@@ -253,23 +254,42 @@ def test_a_failed_close_is_not_counted_as_closed():
         assert core.reconcile_project(PROJECT)[2] == 0
 
 
-# FINDING 1 -- MEND_SEVERITY must not decide a closure.
+# MEND_SEVERITY decides creation AND closure -- and must decide them identically.
+#
+# These two tests replace the pair that asserted the closure read used a hard-coded floor of
+# 0.0. That was right only while creation ran on 1.4, which applied no severity filter at all:
+# closing a below-floor item 1.4 would re-create next run is the flapping bug. Creation now runs
+# on 3.0 through create_wi_v3 at severity_floor(MEND_SEVERITY), so the opposite is true --
+# closure reading at any OTHER floor is what flaps.
 
-def test_the_closure_read_uses_a_floor_of_zero():
-    """1.4 creation applies no severity filter, so `desired` must reflect everything 1.4 could
-    have created. Any other floor closes below-floor items that 1.4 re-creates next run."""
+def test_the_closure_read_uses_the_configured_severity_floor():
+    """Creation filters `desired` at severity_floor(MEND_SEVERITY); closure closes what is not
+    in `desired`. A different floor here creates and closes the same item forever."""
     seen = {}
     with _conf(), \
          mock.patch.object(core, "fetch_v3_desired",
                            side_effect=lambda uuid, floor: seen.update(floor=floor) or ({}, True)), \
          mock.patch.object(core, "actual_work_items", return_value={}):
         core.reconcile_project(PROJECT)
-    assert seen["floor"] == 0.0
+    assert seen["floor"] == core.severity_floor("high") == 7.0
 
 
-def test_a_low_severity_finding_is_not_closed():
-    """End to end through the real fetch_v3_desired: a CVSS 2.1 finding that is still ACTIVE in
-    Mend must keep its work item open, whatever MEND_SEVERITY says."""
+def test_an_explicit_floor_from_the_caller_wins():
+    """sync_project_v3 passes the floor it created with, so the two halves cannot drift even if
+    conf were re-pointed between them."""
+    seen = {}
+    with _conf(), \
+         mock.patch.object(core, "fetch_v3_desired",
+                           side_effect=lambda uuid, floor: seen.update(floor=floor) or ({}, True)), \
+         mock.patch.object(core, "actual_work_items", return_value={}):
+        core.reconcile_project(PROJECT, floor=4.0)
+    assert seen["floor"] == 4.0
+
+
+def test_a_below_floor_finding_is_closed_rather_than_left_to_flap():
+    """End to end through the real fetch_v3_desired: with MEND_SEVERITY 9.0 a CVSS 2.1 finding
+    earns no work item from create_wi_v3, so an existing one for it must be CLOSED. Leaving it
+    open would contradict a creation path that will never write it again."""
     low = {"findingInfo": {"status": "ACTIVE"}, "component": {"name": "log4j-core"},
            "vulnerability": {"score": 2.1}}
 
@@ -286,8 +306,8 @@ def test_a_low_severity_finding_is_not_closed():
                                                                            "state": "Active"}}), \
          mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
         stats = core.reconcile_project(PROJECT)
-    assert closes == [], "a low-severity finding still present in Mend must not be closed"
-    assert stats[2] == 0
+    assert len(closes) == 1
+    assert stats[2] == 1
 
 
 # FINDING 2 -- the key-space interlock.

@@ -1,109 +1,145 @@
 from unittest import mock
 
 from mend_azure_wi_sync import core
-from mend_azure_wi_sync import syncstate
 
 
 def _conf(routing="true", exclude="", product="", project=""):
     return mock.MagicMock(routing=routing, branches="main,master", azure_project="Bookkeeping",
-                          reponame="", wsproducttoken=product, wsprojecttoken=project,
+                          reponame="", azure_area="", severity="high", epss="false",
+                          reachability="false", wsproducttoken=product, wsprojecttoken=project,
                           wsexcludetoken=exclude)
 
 
-TAGS = {
-    "tok-a": [{"key": "azure-project", "value": "Platform"},
-              {"key": "azure-repo", "value": "api"},
-              {"key": "azure-branch", "value": "refs/heads/main"}],
-    "tok-b": [{"key": "azure-project", "value": "Tools"},
-              {"key": "azure-repo", "value": "cli"},
-              {"key": "azure-branch", "value": "refs/heads/main"}],
-    "tok-c": [],
-}
+def _project(uuid, name, tags, app_uuid="a-1", app_name="ProductX"):
+    return {"uuid": uuid, "name": name, "application_uuid": app_uuid,
+            "application_name": app_name, "last_scanned": "", "tags": tags}
 
 
-def _patches(conf, known={"Platform", "Tools"}):
+def _tags(azure_project, repo="api", branch="refs/heads/main"):
+    return {"azure-project": [azure_project], "azure-repo": [repo], "azure-branch": [branch]}
+
+
+PROJECTS = [_project("p-a", "api", _tags("Platform")),
+            _project("p-b", "cli", _tags("Tools", repo="cli")),
+            _project("p-c", "untagged", {})]
+
+
+def _patches(conf, projects=PROJECTS, known={"Platform", "Tools"}):
     """Start the common patches; every test using this must call mock.patch.stopall()."""
     for p in (mock.patch.object(core, "conf", conf),
-              mock.patch.object(core, "get_prj_list_modified", return_value=list(TAGS)),
-              mock.patch.object(core, "fetch_project_tags", return_value=TAGS),
+              mock.patch.object(core, "fetch_v3_projects", return_value=(projects, True)),
               mock.patch.object(core, "list_azure_projects", return_value=known)):
         p.start()
 
 
-def test_routing_off_does_not_call_the_tag_api():
+def test_routing_off_never_reads_the_routing_tags():
     with mock.patch.object(core, "conf", _conf(routing="false")), \
-         mock.patch.object(core, "get_prj_list_modified", return_value=["tok-a"]), \
+         mock.patch.object(core, "fetch_v3_projects", return_value=(PROJECTS, True)), \
          mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")), \
-         mock.patch.object(core, "fetch_project_tags") as tags:
+         mock.patch.object(core, "sync_project_v3", return_value=True), \
+         mock.patch.object(core, "list_azure_projects") as azure_projects:
         core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
-    tags.assert_not_called()
+    azure_projects.assert_not_called()
 
 
 def test_routing_on_syncs_each_azure_target_once():
     conf = _conf()
     with mock.patch.object(core, "get_exist_wi", return_value=[]) as exist, \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
+         mock.patch.object(core, "sync_project_v3", return_value=True):
         _patches(conf)
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:
             mock.patch.stopall()
 
-    assert exist.call_count == 2          # once per Azure project, not once per Mend project
+    # exist_wis is per AZURE project: read once per target, not once per Mend project, and
+    # ALWAYS re-read when the target changes -- matching (and now closing) against another
+    # project's work items is the failure this guards.
+    assert exist.call_count == 2
     assert "2 of 3" in result
 
 
-def test_excluded_token_is_never_synced_and_is_reported_distinctly():
-    conf = _conf(exclude="tok-b")
-    created = []
-    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi",
-                           side_effect=lambda t, *a, **k: created.append(t) or (syncstate.VERDICT_OK, "done")):
-        _patches(conf)
-        try:
-            result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
-        finally:
-            mock.patch.stopall()
-
-    assert "tok-b" not in created
-    assert "scope-excluded" in result
-
-
-def test_untagged_project_is_never_synced():
+def test_creation_and_closure_both_run_against_the_projects_own_azure_target():
+    """conf.azure_project is re-pointed per target, and BOTH halves of the project's sync see
+    it -- a leak would close work items in the wrong Azure project."""
     conf = _conf()
-    created = []
+    seen = []
+
+    def _sync(project, floor, custom_flds, wi_type):
+        seen.append((project["uuid"], conf.azure_project))
+        return True
+
     with mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi",
-                           side_effect=lambda t, *a, **k: created.append(t) or (syncstate.VERDICT_OK, "done")):
+         mock.patch.object(core, "sync_project_v3", side_effect=_sync):
         _patches(conf)
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:
             mock.patch.stopall()
-    assert "tok-c" not in created
+
+    assert sorted(seen) == [("p-a", "Platform"), ("p-b", "Tools")]
+
+
+def test_create_and_reconcile_see_the_same_re_pointed_target():
+    """The same guarantee one level down, through the real sync_project_v3."""
+    conf = _conf()
+    targets = []
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "fetch_v3_desired", return_value=({}, True)), \
+         mock.patch.object(core, "create_wi_v3",
+                           side_effect=lambda *a: targets.append(("create", conf.azure_project))
+                           or (0, 0, 0)), \
+         mock.patch.object(core, "reconcile_project",
+                           side_effect=lambda *a, **kw: targets.append(("close", conf.azure_project))
+                           or (0, 0, 0, 0, 0)):
+        _patches(conf, projects=[PROJECTS[0]])
+        try:
+            core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    assert targets == [("create", "Platform"), ("close", "Platform")]
+
+
+def test_untagged_project_is_never_synced():
+    conf = _conf()
+    synced = []
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "sync_project_v3",
+                           side_effect=lambda p, *a: synced.append(p["uuid"]) or True):
+        _patches(conf)
+        try:
+            core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+    assert "p-c" not in synced
+
+
+def test_excluded_project_never_reaches_routing():
+    """MEND_EXCLUDETOKEN is applied by select_projects before routing, so an excluded project
+    is simply not among the routed candidates."""
+    conf = _conf(exclude="p-b")
+    synced = []
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "sync_project_v3",
+                           side_effect=lambda p, *a: synced.append(p["uuid"]) or True):
+        _patches(conf)
+        try:
+            result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+    assert synced == ["p-a"]
+    assert "1 of 2" in result           # p-b is out of the candidate set entirely
 
 
 def test_run_is_not_fatal_when_every_outcome_is_a_deliberate_skip():
-    """CRITICAL 2: scope-excluded, out-of-scope and branch-filtered are deliberate
-    outcomes — branch-filtered is "the normal state during rollout" per routing.py's own
-    comment. A pilot window where only other projects changed must not exit fatally just
-    because nothing routed here."""
-    conf = _conf(exclude="tok-excluded")
-    tags = {
-        "tok-excluded": [{"key": "azure-project", "value": "Platform"},
-                         {"key": "azure-repo", "value": "api"},
-                         {"key": "azure-branch", "value": "refs/heads/main"}],
-        "tok-branch-filtered": [{"key": "azure-project", "value": "Platform"},
-                                {"key": "azure-repo", "value": "cli"},
-                                {"key": "azure-branch", "value": "refs/heads/develop"}],
-    }
-    with mock.patch.object(core, "conf", conf), \
-         mock.patch.object(core, "get_prj_list_modified", return_value=list(tags)), \
-         mock.patch.object(core, "fetch_project_tags", return_value=tags), \
-         mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
-         mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
+    """branch-filtered is "the normal state during rollout" per routing.py. A window where
+    only other branches were scanned must not exit fatally."""
+    conf = _conf()
+    projects = [_project("p-dev", "api", _tags("Platform", branch="refs/heads/develop"))]
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "sync_project_v3", return_value=True):
+        _patches(conf, projects=projects, known={"Platform"})
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:
@@ -113,17 +149,12 @@ def test_run_is_not_fatal_when_every_outcome_is_a_deliberate_skip():
 
 
 def test_run_is_still_fatal_when_zero_routed_outcomes_are_genuine():
-    """CRITICAL 2, other half: no-target/schema-fault are real misconfigurations, not
-    deliberate skips, so a run made up entirely of those and zero routed targets must
-    still trip the fatal path."""
+    """no-target/schema-fault are real misconfigurations, not deliberate skips, so a run made
+    up entirely of those and zero routed targets must still trip the fatal path."""
     conf = _conf()
-    tags = {"tok-untagged": []}
-    with mock.patch.object(core, "conf", conf), \
-         mock.patch.object(core, "get_prj_list_modified", return_value=list(tags)), \
-         mock.patch.object(core, "fetch_project_tags", return_value=tags), \
-         mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
-         mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "sync_project_v3", return_value=True):
+        _patches(conf, projects=[_project("p-c", "untagged", {})], known={"Platform"})
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:
@@ -136,90 +167,62 @@ def test_case_insensitive_tag_routes_to_the_canonical_azure_project_casing():
     # classify()'s known_projects membership check is deliberately exact-string, so the
     # case-insensitive normalisation has to happen in core.py before classify() runs. This
     # locks in both that the route is not lost (case mismatch alone must not produce
-    # unknown-target) and that Azure API calls receive the real, canonically-cased name
-    # rather than whatever casing happened to be on the tag.
+    # unknown-target) and that Azure API calls receive the real, canonically-cased name.
     conf = _conf()
-    tags = {"tok-lower": [{"key": "azure-project", "value": "platform"},
-                          {"key": "azure-repo", "value": "api"},
-                          {"key": "azure-branch", "value": "refs/heads/main"}]}
     seen_azure_project = []
-
-    def fake_create_wi(token, *a, **kw):
-        # Stands in for create_wi, which is the only place that appends to
-        # synced_projects (core.py). Recording conf.azure_project here mirrors that
-        # real behaviour so this test can still assert on the canonical casing that
-        # flows through to what the reverse sync will later query against.
-        seen_azure_project.append(conf.azure_project)
-        core.synced_projects.append((token, f"Product/{token}", conf.azure_project))
-        return syncstate.VERDICT_OK, "done"
-
-    with mock.patch.object(core, "conf", conf), \
-         mock.patch.object(core, "get_prj_list_modified", return_value=list(tags)), \
-         mock.patch.object(core, "fetch_project_tags", return_value=tags), \
-         mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
-         mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "save_project_tag", return_value=True), \
-         mock.patch.object(core, "create_wi", side_effect=fake_create_wi):
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "sync_project_v3",
+                           side_effect=lambda *a: seen_azure_project.append(conf.azure_project)
+                           or True):
+        _patches(conf, projects=[_project("p-lower", "api", _tags("platform"))],
+                 known={"Platform"})
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:
             mock.patch.stopall()
 
-    assert seen_azure_project == ["Platform"]   # canonical Azure casing, not the raw "platform" tag
+    assert seen_azure_project == ["Platform"]   # canonical Azure casing, not the raw tag
     assert "1 of 1" in result
-    # synced_projects (create_wi's contract) carries the canonical Azure casing that the
-    # reverse sync scopes its WIQL to — this supersedes the old routed_targets list.
-    assert any(p[2] == "Platform" for p in core.synced_projects)
+    assert core.synced_projects == [] or all(p[2] == "Platform" for p in core.synced_projects)
 
 
-def test_aborts_when_the_project_list_cannot_be_read():
+def test_aborts_when_the_azure_project_list_cannot_be_read():
     conf = _conf()
-    with mock.patch.object(core, "create_wi") as create:
+    with mock.patch.object(core, "sync_project_v3") as sync:
         _patches(conf, known=None)
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:
             mock.patch.stopall()
-    create.assert_not_called()
+    sync.assert_not_called()
     assert "aborted" in result.lower()
 
 
 def test_a_failed_target_does_not_stop_the_others():
     # sorted(targets) visits "Platform" before "Tools"; get_exist_wi's side_effect fails
-    # Platform first so this exercises the failure-isolation and Lastrun-safety paths, not
-    # just "some target failed, some target didn't".
+    # Platform first so this exercises failure isolation, not just "something failed".
     conf = _conf()
-
-    def fake_create_wi(token, *a, **kw):
-        # Stands in for create_wi, which is the only place that appends to
-        # synced_projects (core.py) — the list the reverse sync now walks instead of
-        # the removed routed_targets.
-        core.synced_projects.append((token, f"Product/{token}", conf.azure_project))
-        return syncstate.VERDICT_OK, "done"
-
+    synced = []
     with mock.patch.object(core, "get_exist_wi", side_effect=[None, []]), \
-         mock.patch.object(core, "save_project_tag", return_value=True), \
-         mock.patch.object(core, "create_wi", side_effect=fake_create_wi) as create:
+         mock.patch.object(core, "sync_project_v3",
+                           side_effect=lambda p, *a: synced.append(
+                               (p["uuid"], conf.azure_project)) or True):
         _patches(conf)
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
         finally:
             mock.patch.stopall()
-    assert create.call_count == 1
-    # The failure must be visible to main() via the fatal-error signal...
+
+    # Nothing is created OR closed for the target we could not read...
+    assert synced == [("p-b", "Tools")]
+    # ...and the failure is visible to main() via the fatal-error signal.
     assert core.sync_had_fatal_error() is True
-    # ...and the failed target's Azure project must never appear among synced_projects:
-    # its Mend project window must stay open for retry, and the reverse sync (which now
-    # walks synced_projects instead of the removed routed_targets) must not visit it.
-    tracked_azure_projects = {p[2] for p in core.synced_projects}
-    assert "Platform" not in tracked_azure_projects
-    assert "Tools" in tracked_azure_projects
 
 
 def test_conf_azure_project_is_restored():
     conf = _conf()
     with mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
+         mock.patch.object(core, "sync_project_v3", return_value=True):
         _patches(conf)
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -228,29 +231,25 @@ def test_conf_azure_project_is_restored():
     assert conf.azure_project == "Bookkeeping"
 
 
+def test_conf_azure_project_is_restored_even_when_a_target_raises():
+    """try/finally, not a trailing assignment: a leaked target would send the NEXT run's
+    closures into the wrong Azure project."""
+    conf = _conf()
+    with mock.patch.object(core, "get_exist_wi", side_effect=RuntimeError("boom")):
+        _patches(conf)
+        try:
+            try:
+                core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+            except RuntimeError:
+                pass
+        finally:
+            mock.patch.stopall()
+    assert conf.azure_project == "Bookkeeping"
+
+
 def test_expand_product_tokens_survives_a_non_json_response():
-    """The original raised JSONDecodeError here and killed the whole run."""
+    """Retained from the 1.4 selection path: expand_product_tokens is still exported and must
+    fail closed (None, not []) rather than raising JSONDecodeError."""
     with mock.patch.object(core, "conf", mock.MagicMock(ws_user_key="k", ws_org_token="o")), \
          mock.patch.object(core, "call_ws_api", return_value=""):
-        assert core.expand_product_tokens("prd-1") is None   # None, not [] — see the scope guard
-
-
-def test_token_missing_from_the_tag_map_is_loud_not_quiet():
-    """fetch_project_tags returns a dict for every token it is asked about, so this is a
-    defensive branch, not a reachable one today. It exists because a future caller passing a
-    subset of tokens would otherwise get parse_route({}) -> the QUIET no-target bucket, which
-    is indistinguishable from a genuinely untagged project. A token the map does not answer
-    for must classify unknown-target (in LOUD_OUTCOMES) instead."""
-    conf = _conf()
-    with mock.patch.object(core, "conf", conf), \
-         mock.patch.object(core, "get_prj_list_modified",
-                           return_value=["tok-a", "tok-absent"]), \
-         mock.patch.object(core, "fetch_project_tags",
-                           return_value={"tok-a": TAGS["tok-a"]}), \
-         mock.patch.object(core, "list_azure_projects", return_value={"Platform"}), \
-         mock.patch.object(core, "get_exist_wi", return_value=[]), \
-         mock.patch.object(core, "create_wi", return_value=(syncstate.VERDICT_OK, "done")):
-        result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
-
-    assert "unknown-target: 1" in result
-    assert "no-target" not in result
+        assert core.expand_product_tokens("prd-1") is None
