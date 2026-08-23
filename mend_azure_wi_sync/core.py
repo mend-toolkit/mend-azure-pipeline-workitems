@@ -20,8 +20,8 @@ from source3 import (library_url, license_policy_name, license_link_report,
                      merge_component_index,
                      merge_license_index, normalise_findings, normalise_libraries,
                      normalise_library_components, normalise_library_licenses, normalise_licenses,
-                     normalise_projects, normalise_violations, render_inputs, root_remediation,
-                     select_projects, severity_floor)
+                     normalise_projects, normalise_root_libraries, normalise_violations,
+                     render_inputs, root_remediation, select_projects, severity_floor)
 import warnings
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
@@ -2119,10 +2119,27 @@ def fetch_v3_libraries(project_uuid: str):
     return normalise_libraries(rows), normalise_library_licenses(rows), ok
 
 
+def fetch_v3_root_libraries(project_uuid: str):
+    """One project's root-library remediation index -> (index, ok).
+
+    GET /projects/{projectUuid}/dependencies/findings/security/groupBy/rootLibrary. Supplies
+    Recommended Fix and Recommended Major Version and NOTHING ELSE: the work item set comes from
+    surviving findings, because this endpoint's counts include suppressed findings and it knows
+    nothing about MEND_SEVERITY. See source3.normalise_root_libraries.
+    """
+    rows, ok = fetch_v3_pages(
+        f"projects/{project_uuid}/dependencies/findings/security/groupBy/rootLibrary")
+    if not ok:
+        logger.error(f"[{fn()}] Could not read root library remediation for project "
+                     f"{project_uuid}. Work items this run may omit Recommended Fix and "
+                     f"Recommended Major Version that Mend does in fact publish.")
+    return normalise_root_libraries(rows), ok
+
+
 def fetch_v3_desired(project_uuid: str, floor: float):
     """One project's desired end state: {(kind, library): entry}.
 
-    `ok` is the AND of all four reads and is the closure interlock from spec 6.1 --
+    `ok` is the AND of all five reads and is the closure interlock from spec 6.1 --
     reconciliation closes work items absent from `desired`, so a partial read must never be
     mistaken for a shrunken one. A caller seeing ok=False may still create and update (which
     cannot destroy anything) but must NOT close.
@@ -2137,6 +2154,8 @@ def fetch_v3_desired(project_uuid: str, floor: float):
     rendering never has to guard for the key's absence. A LICENSE entry also carries "component"
     ({} when the library has no due-diligence row), because ProjectViolationDTOV3 has no
     component of its own -- see normalise_library_components.
+    A VULNERABILITY entry also carries "root" ({} when the root has no remediation row), which is
+    what the Recommended Fix block renders from.
     """
     findings, findings_ok = fetch_v3_pages(
         f"projects/{project_uuid}/dependencies/findings/security")
@@ -2144,6 +2163,7 @@ def fetch_v3_desired(project_uuid: str, floor: float):
         f"orgs/{org_uuid()}/projects/{project_uuid}/violations")
     dd_licenses, dd_components, licenses_ok = fetch_v3_licenses(project_uuid)
     lib_components, lib_licenses, libraries_ok = fetch_v3_libraries(project_uuid)
+    roots, roots_ok = fetch_v3_root_libraries(project_uuid)
     # The libraries call is the 1.4-equivalent projection and wins; due diligence fills only the
     # fields it leaves blank. Neither is complete on its own -- see source3.merge_component_index.
     components = merge_component_index(lib_components, dd_components)
@@ -2177,6 +2197,10 @@ def fetch_v3_desired(project_uuid: str, floor: float):
         # authoritative and render_inputs only reaches for the index where the finding is blank.
         entry["licenses"] = licenses.get(entry["library"], [])
         entry["component"] = components.get(entry["library"], {})
+        # entry["library"] is the ROOT name in dependency mode, so this lookup hits directly. In
+        # per-CVE mode it is the vulnerable library and will usually miss -- {} then renders no
+        # remediation block, which is correct: a per-CVE item is not about a root.
+        entry["root"] = roots.get(entry["library"], {})
         desired[("vulnerability", key)] = entry
     for lib, entry in lic_entries.items():
         entry["licenses"] = licenses.get(lib, [])
@@ -2186,7 +2210,7 @@ def fetch_v3_desired(project_uuid: str, floor: float):
         # those lines rather than showing empty labels.
         entry["component"] = components.get(lib, {})
         desired[("license", lib)] = entry
-    return desired, (findings_ok and violations_ok and licenses_ok and libraries_ok)
+    return desired, (findings_ok and violations_ok and licenses_ok and libraries_ok and roots_ok)
 
 
 def extract_url(url: str) -> str:

@@ -95,9 +95,9 @@ def test_a_failed_violations_read_also_makes_it_not_ok():
 
 
 def test_desired_reads_stay_get_not_post():
-    """findings/security, violations and the licenses due-diligence read are all GET-only in
-    the spec; only /projects/summaries is POST. Guards against the POST fix leaking onto
-    these calls."""
+    """findings/security, violations, the licenses due-diligence read, the library list, and the
+    root-library remediation index are all GET-only in the spec; only /projects/summaries is
+    POST. Guards against the POST fix leaking onto these calls."""
     methods = []
 
     def fake_pages(api, params=None, limit=1000, method="GET"):
@@ -113,8 +113,9 @@ def test_desired_reads_stay_get_not_post():
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "fetch_v3_pages", fake_pages):
         core.fetch_v3_desired("p-1", 7.0)
-    # findings, violations, due-diligence licenses, and the library list.
-    assert methods == ["GET", "GET", "GET", "GET"]
+    # findings, violations, due-diligence licenses, the library list, and the root-library
+    # remediation index (Task 5) -- one more GET, folded into the same interlock as the rest.
+    assert methods == ["GET", "GET", "GET", "GET", "GET"]
 
 
 def _license_row(lib="log4j-core", name="MIT", url="https://opensource.org/licenses/MIT",
