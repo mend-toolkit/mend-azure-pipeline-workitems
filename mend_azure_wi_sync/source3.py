@@ -492,6 +492,48 @@ def license_link_report(licenses: dict, components: dict) -> dict:
     return report
 
 
+def normalise_root_libraries(rows) -> dict:
+    """3.0 root-library findings -> {root_name: {version, recommended_fix, major_fix, fix_failed,
+    severity, total}}.
+
+    Schema (references/3.0 (2).json): RootLibrarySecurityFindingDTOV3, from
+    GET /projects/{uuid}/dependencies/findings/security/groupBy/rootLibrary.
+
+    REMEDIATION ONLY. This index never decides which work items exist: `total` INCLUDES suppressed
+    findings (body-parser reports 5 live while 2 of its findings are IGNORED) and the endpoint knows
+    nothing about MEND_SEVERITY. The item set comes from surviving findings -- see normalise_findings
+    -- and `total` is kept for logging alone.
+
+    `recommended_fix` frequently EQUALS `version`, which means "no fix inside the current major";
+    interpreting that pair is root_remediation's job, not this function's.
+    """
+    index = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("rootLibraryName")
+        if not name:
+            continue
+        index[name] = {
+            "version": row.get("rootLibraryVersion") or "",
+            "recommended_fix": row.get("recommendedFix") or "",
+            "major_fix": row.get("fixForMajorVersion") or "",
+            "fix_failed": bool(row.get("suggestedFixFailed")),
+            "severity": row.get("severity") or "",
+            "total": try_or_error_int(row.get("total")),
+        }
+    return index
+
+
+def try_or_error_int(value) -> int:
+    """An integer or 0. Local to this module because source3 is pure and cannot import core's
+    try_or_error."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def normalise_projects(rows):
     """ProjectSummaryDTOV3 rows -> the project shape the rest of the tool uses.
 
