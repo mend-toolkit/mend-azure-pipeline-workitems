@@ -107,11 +107,18 @@ def _conf(**overrides):
     return mock.MagicMock(**values)
 
 
-def _finding(cve="CVE-2022-24999", lib="qs-6.5.2.tgz", score=7.5, root="express-4.16.4.tgz"):
+def _finding(cve="CVE-2022-24999", lib="qs-6.5.2.tgz", score=7.5, root="express-4.16.4.tgz",
+             meta=None):
+    """One 3.0 security finding. `meta` overrides component fields that must DIFFER between the
+    findings of one root work item -- description, paths, home page. See
+    test_the_description_is_deterministic_across_reshuffled_findings for why that matters."""
+    component = {"name": lib, "version": "6.5.2", "dependencyType": "Transitive",
+                 "dependencyFile": "/s/package.json", "references": {}}
+    if meta:
+        component.update(meta)
     return {
         "findingInfo": {"status": "ACTIVE"},
-        "component": {"name": lib, "version": "6.5.2", "dependencyType": "Transitive",
-                      "dependencyFile": "/s/package.json", "references": {}},
+        "component": component,
         "vulnerability": {"name": cve, "score": score, "severity": "HIGH",
                           "description": "A querystring DoS.",
                           "references": [{"url": f"https://nvd.nist.gov/{cve}", "advisory": True}]},
@@ -128,9 +135,29 @@ def _root_entry(**overrides):
     return values
 
 
-def _render(findings, root_entry):
+def _meta(tag):
+    return {"description": f"{tag} does things.",
+            "dependencyFile": f"/s/{tag}/package.json",
+            "localPath": f"/s/node_modules/{tag}",
+            "references": {"homePage": f"https://{tag}.example/"}}
+
+
+def _render(findings, root_entry, component=None):
     entry = {"library": "express-4.16.4.tgz", "kind": "vulnerability", "findings": findings,
-             "licenses": [], "component": {}, "root": root_entry}
+             "licenses": [], "component": component or {}, "root": root_entry}
+    with mock.patch.object(core, "conf", _conf()):
+        return core.render_entry_v3("vulnerability", "express-4.16.4.tgz", entry, False)[0]
+
+
+def _render_grouped(findings, root_entry, component=None):
+    """Same, but grouped by source3.normalise_findings rather than hand-assembled.
+
+    Order inside an entry is settled there, and no production path skips it -- so a determinism
+    test that hand-builds the entry is testing an arrangement that never happens.
+    """
+    entries, _ = source3.normalise_findings(findings, 0.0)
+    entry = entries["express-4.16.4.tgz"]
+    entry.update({"licenses": [], "component": component or {}, "root": root_entry})
     with mock.patch.object(core, "conf", _conf()):
         return core.render_entry_v3("vulnerability", "express-4.16.4.tgz", entry, False)[0]
 
@@ -177,9 +204,7 @@ def test_remediation_values_are_escaped():
 
 def test_the_block_appears_before_the_cve_table_in_the_description():
     desc = _render([_finding()], _root_entry())["desc"]
-    assert desc.index("Recommended Fix") < desc.index("<table")  \
-        if desc.count("<table") == 1 else True
-    # The remediation block is itself a table, so compare against the CVE header instead.
+    # The remediation block is itself a table, so compare against the CVE table's header cell.
     assert desc.index("Recommended Fix") < desc.index(">CVE<")
 
 
@@ -226,6 +251,61 @@ def test_a_root_with_no_index_entry_renders_no_remediation_lines():
 
 
 def test_the_description_is_deterministic_across_reshuffled_findings():
-    a = _finding(cve="CVE-A", lib="qs-6.5.2.tgz")
-    b = _finding(cve="CVE-B", lib="cookie-0.3.1.tgz")
-    assert _render([a, b], _root_entry())["desc"] == _render([b, a], _root_entry())["desc"]
+    """The two findings carry DIFFERENT component descriptions, paths and home pages -- which is
+    what gives this test teeth. While every finding of a root item carried identical component
+    metadata, the header rendered the same bytes whichever finding it read, so render_inputs
+    taking findings[0] (an arbitrary transitive library, in Mend's response order) went unnoticed.
+    Reshuffled, that header changed, wi_content_diff saw a change and the item was PATCHed every
+    run -- 5c53f8a's bug, back again.
+
+    Grouped through normalise_findings, where the order of an entry's findings is settled.
+    """
+    a = _finding(cve="CVE-A", lib="qs-6.5.2.tgz", meta=_meta("qs"))
+    b = _finding(cve="CVE-B", lib="cookie-0.3.1.tgz", meta=_meta("cookie"))
+    assert _render_grouped([a, b], _root_entry())["desc"] == \
+        _render_grouped([b, a], _root_entry())["desc"]
+
+
+def test_the_header_describes_the_root_not_an_arbitrary_transitive_library():
+    """A root work item's header is about the ROOT -- the thing an operator upgrades. Its
+    description, paths and home page come from the root-keyed component index, never from
+    whichever vulnerable library Mend happened to list first."""
+    root_component = {"version": "4.16.4", "description": "express is a web framework.",
+                      "dependency_type": "Direct", "dependency_file": "/s/package.json",
+                      "library_path": "/s/node_modules/express",
+                      "home_page": "https://expressjs.com/"}
+    desc = _render_grouped([_finding(lib="qs-6.5.2.tgz", meta=_meta("qs")),
+                            _finding(cve="CVE-2024-47764", lib="cookie-0.3.1.tgz",
+                                     meta=_meta("cookie"))],
+                           _root_entry(), component=root_component)["desc"]
+    header = desc[:desc.index("<table")]
+    assert "Root Library - </b>express-4.16.4.tgz" in header
+    assert "express is a web framework." in header
+    assert "/s/node_modules/express" in header
+    assert "https://expressjs.com/" in header
+    # No transitive library's metadata anywhere in the header.
+    for wrong in ("qs does things.", "cookie does things.", "/s/node_modules/qs",
+                  "/s/node_modules/cookie", "https://qs.example/", "https://cookie.example/"):
+        assert wrong not in header, wrong
+
+
+def test_the_root_header_does_not_repeat_the_name_as_the_vulnerable_library():
+    """"Root Library - express" immediately followed by "Vulnerable Library: express" was both
+    redundant and false: the root is what you upgrade, not what is vulnerable. Per-CVE mode keeps
+    the 1.4 line, where it is true."""
+    desc = _render_grouped([_finding()], _root_entry())["desc"]
+    header = desc[:desc.index("<table")]
+    assert "Vulnerable Library" not in header
+
+
+def test_each_cve_section_names_its_own_vulnerable_library_and_paths():
+    """One root item covers several libraries; a section that named the root told an operator the
+    wrong file to open."""
+    desc = _render_grouped([_finding(lib="qs-6.5.2.tgz", meta=_meta("qs")),
+                            _finding(cve="CVE-2024-47764", lib="cookie-0.3.1.tgz",
+                                     meta=_meta("cookie"))], _root_entry())["desc"]
+    sections = desc[desc.index("<b>Details:</b>"):]
+    assert "Vulnerable Library:</b>qs-6.5.2.tgz" in sections
+    assert "Vulnerable Library:</b>cookie-0.3.1.tgz" in sections
+    assert "/s/node_modules/qs" in sections
+    assert "/s/node_modules/cookie" in sections

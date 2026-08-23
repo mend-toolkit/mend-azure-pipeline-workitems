@@ -168,14 +168,34 @@ def test_a_root_with_no_index_row_gets_an_empty_dict_not_a_missing_key():
     assert desired[("vulnerability", "express-4.16.4.tgz")]["root"] == {}
 
 
-def test_a_failed_root_read_clears_the_closure_interlock():
-    """Same rule as every other read: a partial read must never be mistaken for a shrunken
-    desired, or reconciliation closes live work items."""
-    with mock.patch.object(core, "conf", _conf()), \
+def test_a_failed_root_read_leaves_the_closure_interlock_intact_and_warns(caplog):
+    """DELIBERATELY THE OPPOSITE of the other four reads -- do not "restore" the old assertion.
+
+    The closure interlock exists because a partial read can make `desired` SMALLER than the
+    truth, and reconciliation closes whatever is absent from `desired`. The findings and
+    violations reads BUILD `desired`; the due-diligence and library reads can drop a library's
+    licenses, which is indistinguishable from a resolved one. All four must block closure.
+
+    This read cannot. The root index contributes two decorative lines (Recommended Fix,
+    Recommended Major Version) to work items that already exist; it can never remove a key from
+    `desired`, so its failure can never produce a false closure. And .../groupBy/rootLibrary is a
+    new endpoint whose per-org availability is unproven (its OpenAPI spec is known to be
+    incomplete), so gating on it meant one 404 stopped closure for EVERY project and failed the
+    run -- the precise defect closure was built to fix. So: ok stays True, and the operator is
+    told in a WARNING both what is missing and that closure is not blocked by it.
+    """
+    import logging
+    with caplog.at_level(logging.WARNING), \
+         mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "org_uuid", return_value="org-1"), \
          mock.patch.object(core, "fetch_v3_pages", _pages([], roots_ok=False)):
-        _, ok = core.fetch_v3_desired("p-1", 7.0)
-    assert ok is False
+        desired, ok = core.fetch_v3_desired("p-1", 7.0)
+    assert ok is True
+    # The work items still exist -- only the remediation lines are missing.
+    assert ("vulnerability", "express-4.16.4.tgz") in desired
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("Recommended Fix" in m for m in warnings), warnings
+    assert any("NOT being blocked" in m for m in warnings), warnings
 
 
 def test_a_license_entry_does_not_gain_a_root_key():

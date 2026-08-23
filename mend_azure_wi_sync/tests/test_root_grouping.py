@@ -73,6 +73,33 @@ def test_malformed_contexts_fall_back_rather_than_raising():
         assert source3.root_names(finding) == ["qs-6.5.2.tgz"], broken
 
 
+def test_a_padded_root_name_is_stripped_because_the_key_is_the_closure_contract():
+    """The root name becomes the `desired` key AND the work item title. identity.classify_title
+    strips what it decodes, so a padded name never matches the item it just created: the item is
+    created fresh every run AND closed every run. A name that is only whitespace is no name at
+    all and must not become a work item."""
+    finding = _finding(roots=(("  express-4.16.4.tgz  ", "4.16.4"),))
+    assert source3.root_names(finding) == ["express-4.16.4.tgz"]
+
+    finding = _finding(roots=(("   ", "4.16.4"),))
+    assert source3.root_names(finding) == ["qs-6.5.2.tgz"]
+
+    finding = _finding()
+    finding["component"]["name"] = "  qs-6.5.2.tgz  "
+    finding.pop("dependencyContexts")
+    assert source3.root_names(finding) == ["qs-6.5.2.tgz"]
+
+
+def test_a_non_string_root_name_is_coerced_rather_than_raising():
+    """sorted() over a mixed str/int set raises TypeError, and sync_project_v3 catches that as a
+    WHOLE-PROJECT failure -- every other normaliser in this module skips a malformed row."""
+    finding = _finding(roots=((1234, "4.16.4"), ("express-4.16.4.tgz", "4.16.4")))
+    assert source3.root_names(finding) == ["1234", "express-4.16.4.tgz"]
+
+    finding = _finding(roots=(({"name": "x"}, "4.16.4"),))
+    assert source3.root_names(finding) == ["qs-6.5.2.tgz"]
+
+
 def test_a_finding_with_no_component_name_and_no_roots_yields_nothing():
     finding = {"findingInfo": {"status": "ACTIVE"}, "vulnerability": {"name": "CVE-1", "score": 9}}
     assert source3.root_names(finding) == []

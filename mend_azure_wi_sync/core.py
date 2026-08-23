@@ -1188,7 +1188,11 @@ def remediation_block_v3(remediation: dict) -> str:
         html += f"<tr><td style='{cell}'><b>{label}</b></td>" \
                 f"<td style='{cell}'>{esc(value)}</td></tr>\n"
     if remediation.get("note"):
-        html += f"<tr><td style='{cell}' colspan='2'>{esc(remediation['note'])}</td></tr>\n"
+        # No colspan: the attribute is outside the whitelist proven to survive Azure DevOps's
+        # HTML sanitiser (style and href only), and a stripped attribute would leave a one-cell
+        # row that renders ragged. Two cells, the label empty.
+        html += f"<tr><td style='{cell}'></td>" \
+                f"<td style='{cell}'>{esc(remediation['note'])}</td></tr>\n"
     return html + "</table><br>"
 
 
@@ -1253,10 +1257,20 @@ def labelled_line(label: str, value: str) -> str:
 
 
 def vuln_section_v3(row: dict, inputs: dict, reachability_on: bool) -> str:
-    """One CVE's <details> body, mirroring the 1.4 per-CVE section field for field."""
-    return "<b>Vulnerable Library:</b>" + esc(inputs["library"]) + \
-        labelled_line("Path to dependency file: ", esc(inputs["dependency_file"])) + \
-        labelled_line("Path to library:", esc(inputs["library_path"])) + \
+    """One CVE's <details> body, mirroring the 1.4 per-CVE section field for field.
+
+    The library and paths come from the ROW -- the actually vulnerable library and ITS OWN paths
+    -- and fall back to `inputs` (the work item header) only where the row carries none. Under
+    root grouping the header describes the ROOT, so reading it here made every section on an
+    eight-library root item claim "Vulnerable Library: express-4.16.4.tgz" and show one path.
+    In per-CVE mode the row's library IS the header's, so nothing changes there.
+    """
+    library = row.get("library") or inputs["library"]
+    dependency_file = row.get("dependency_file") or inputs["dependency_file"]
+    library_path = row.get("library_path") or inputs["library_path"]
+    return "<b>Vulnerable Library:</b>" + esc(library) + \
+        labelled_line("Path to dependency file: ", esc(dependency_file)) + \
+        labelled_line("Path to library:", esc(library_path)) + \
         "<br><b>Vulnerability Details:</b> " + esc(row.get("description", "")) + \
         "<br><b>Publish Date:</b> " + esc(row.get("publish_date", "")) + \
         f"<br><b>URL:</b> <a href='{esc(row.get('url', ''))}'>{esc(row.get('name', ''))}</a>" + \
@@ -1280,8 +1294,12 @@ def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False) -> 
     block = ("<b>Root Library - </b>" if root else "<b>Library - </b>") + esc(inputs["library"]) + \
         "<br>" + esc(inputs["description"]) + \
         labelled_line("Path to dependency file: ", esc(inputs["dependency_file"])) + \
-        labelled_line("Path to library:", esc(inputs["library_path"])) + \
-        "<br><b>Vulnerable Library: </b>" + esc(inputs["library"])
+        labelled_line("Path to library:", esc(inputs["library_path"]))
+    # The 1.4 shape repeated the name as "Vulnerable Library". Under root grouping that is both
+    # redundant (it is the line above) and FALSE: the root is the library to upgrade, not the
+    # vulnerable one. Kept verbatim everywhere else so those descriptions do not churn.
+    if not root:
+        block += "<br><b>Vulnerable Library: </b>" + esc(inputs["library"])
     if with_hierarchy:
         block += "<br><b>Dependency Hierarchy: </b><br>" + \
                  generate_html_bulleted_list(items=inputs["parents"])
@@ -2130,19 +2148,37 @@ def fetch_v3_root_libraries(project_uuid: str):
     rows, ok = fetch_v3_pages(
         f"projects/{project_uuid}/dependencies/findings/security/groupBy/rootLibrary")
     if not ok:
-        logger.error(f"[{fn()}] Could not read root library remediation for project "
-                     f"{project_uuid}. Work items this run may omit Recommended Fix and "
-                     f"Recommended Major Version that Mend does in fact publish.")
+        # WARNING, not ERROR, and deliberately NOT part of fetch_v3_desired's closure interlock
+        # -- see that function's docstring. This read cannot shrink `desired`, so a failure here
+        # cannot turn a real closure into a false one; blocking closure on it would mean one
+        # unavailable endpoint stops every project in the org from ever closing anything.
+        logger.warning(f"[{fn()}] Could not read root library remediation for project "
+                       f"{project_uuid}. Work items this run may omit Recommended Fix and "
+                       f"Recommended Major Version that Mend does in fact publish. Closure is "
+                       f"NOT being blocked by this: the root index supplies description lines "
+                       f"only and cannot make a work item look resolved.")
     return normalise_root_libraries(rows), ok
 
 
 def fetch_v3_desired(project_uuid: str, floor: float):
     """One project's desired end state: {(kind, library): entry}.
 
-    `ok` is the AND of all five reads and is the closure interlock from spec 6.1 --
-    reconciliation closes work items absent from `desired`, so a partial read must never be
-    mistaken for a shrunken one. A caller seeing ok=False may still create and update (which
-    cannot destroy anything) but must NOT close.
+    `ok` is the closure interlock from spec 6.1 -- reconciliation closes work items absent from
+    `desired`, so a partial read must never be mistaken for a shrunken one. A caller seeing
+    ok=False may still create and update (which cannot destroy anything) but must NOT close.
+
+    FOUR of the five reads gate it, and they are exactly the reads that can make `desired`
+    SMALLER than the truth: the security findings and the violations BUILD `desired`, and the
+    due-diligence and library reads can drop a library's licenses -- a missing license entry is
+    indistinguishable from a resolved one, so it could close a live work item.
+
+    The fifth read, fetch_v3_root_libraries, does NOT gate it and must not be added back. It
+    contributes two decorative lines (Recommended Fix, Recommended Major Version) to items that
+    already exist; it can never remove a key from `desired`, so its failure cannot produce a
+    false closure. .../groupBy/rootLibrary is also a new endpoint whose availability per org is
+    unproven and whose OpenAPI spec is known to be incomplete -- folding it in meant one 404
+    stopped closure for EVERY project and failed the run, which is the precise defect closure
+    was built to fix. A failed root read logs a warning saying so instead.
 
     Keyed by (kind, identity-key) rather than by library: one library can carry both a
     vulnerability and a license work item, and they are separate items with different titles.
@@ -2210,7 +2246,10 @@ def fetch_v3_desired(project_uuid: str, floor: float):
         # those lines rather than showing empty labels.
         entry["component"] = components.get(lib, {})
         desired[("license", lib)] = entry
-    return desired, (findings_ok and violations_ok and licenses_ok and libraries_ok and roots_ok)
+    # roots_ok is deliberately absent from this chain -- see the docstring. It cannot shrink
+    # `desired`, so it cannot cause a false closure, and gating on it would stop closure org-wide
+    # if the rootLibrary endpoint is unavailable.
+    return desired, (findings_ok and violations_ok and licenses_ok and libraries_ok)
 
 
 def extract_url(url: str) -> str:

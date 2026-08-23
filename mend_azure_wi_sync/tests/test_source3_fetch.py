@@ -50,8 +50,18 @@ def _violation(lib="log4j-core"):
     return {"findingType": "LEGAL", "originName": lib, "name": "GPL-3.0"}
 
 
+# The root-library index lives at .../dependencies/findings/security/groupBy/rootLibrary, which
+# CONTAINS "findings/security". Every stub below therefore has to match it FIRST, or the root call
+# is served the findings payload -- and a stub asserting "the findings read failed" was silently
+# failing the root read too.
+def _is_root_path(api):
+    return api.endswith("groupBy/rootLibrary")
+
+
 def test_vulnerabilities_and_licenses_merge_into_one_desired_map():
     def fake_pages(api, params=None, limit=1000):
+        if _is_root_path(api):
+            return [], True
         return ([_finding()], True) if "findings/security" in api else ([_violation()], True)
 
     with mock.patch.object(core, "conf", _conf()), \
@@ -65,6 +75,8 @@ def test_vulnerabilities_and_licenses_merge_into_one_desired_map():
 def test_a_library_with_both_kinds_produces_two_separate_entries():
     """They are two work items with different titles; keying on library alone would lose one."""
     def fake_pages(api, params=None, limit=1000):
+        if _is_root_path(api):
+            return [], True
         return ([_finding()], True) if "findings/security" in api else ([_violation()], True)
 
     with mock.patch.object(core, "conf", _conf()), \
@@ -76,6 +88,8 @@ def test_a_library_with_both_kinds_produces_two_separate_entries():
 def test_a_failed_findings_read_makes_the_whole_project_not_ok():
     """Closure safety: a partial read must never look like a shrunken one."""
     def fake_pages(api, params=None, limit=1000):
+        if _is_root_path(api):
+            return [], True
         return ([], False) if "findings/security" in api else ([_violation()], True)
 
     with mock.patch.object(core, "conf", _conf()), \
@@ -86,6 +100,8 @@ def test_a_failed_findings_read_makes_the_whole_project_not_ok():
 
 def test_a_failed_violations_read_also_makes_it_not_ok():
     def fake_pages(api, params=None, limit=1000):
+        if _is_root_path(api):
+            return [], True
         return ([_finding()], True) if "findings/security" in api else ([], False)
 
     with mock.patch.object(core, "conf", _conf()), \
@@ -102,6 +118,8 @@ def test_desired_reads_stay_get_not_post():
 
     def fake_pages(api, params=None, limit=1000, method="GET"):
         methods.append(method)
+        if _is_root_path(api):
+            return [], True
         if "findings/security" in api:
             return [_finding()], True
         if "libraries/licenses" in api:
@@ -126,6 +144,8 @@ def _license_row(lib="log4j-core", name="MIT", url="https://opensource.org/licen
 
 def _fake_pages_with_licenses(license_rows, license_ok=True):
     def fake_pages(api, params=None, limit=1000, method="GET"):
+        if _is_root_path(api):
+            return [], True
         if "findings/security" in api:
             return [_finding()], True
         if "libraries/licenses" in api:

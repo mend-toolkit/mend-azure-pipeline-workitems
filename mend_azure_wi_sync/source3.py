@@ -83,6 +83,28 @@ def _walk(obj, *path):
     return obj
 
 
+def _clean_root_name(value) -> str:
+    """A rootLibraryName as it can safely be used as a grouping key, or "".
+
+    STRIPPED, because this name becomes the `desired` key AND the work item title, and
+    identity.classify_title strips what it decodes: 'express-4.16.4.tgz ' never matches the item
+    it just created, so the item is created fresh every run AND closed every run. '  ' is no name
+    at all and must not become a work item.
+
+    COERCED, because Mend gives no schema guarantee here and sorted() over a mixed str/int set
+    raises TypeError -- which sync_project_v3 catches as a WHOLE-PROJECT failure. Every other
+    normaliser in this module skips a malformed row instead, and so does this one: a number is
+    coerced (it is still a usable identity), anything else is dropped.
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    return ""
+
+
 def root_names(finding: dict) -> list:
     """Every distinct root library a finding is reachable from, sorted.
 
@@ -114,12 +136,45 @@ def root_names(finding: dict) -> list:
                 if not isinstance(roots, list):
                     continue
                 for root in roots:
-                    if isinstance(root, dict) and root.get("rootLibraryName"):
-                        names.add(root["rootLibraryName"])
+                    if isinstance(root, dict):
+                        name = _clean_root_name(root.get("rootLibraryName"))
+                        if name:
+                            names.add(name)
     if names:
         return sorted(names)
-    own = _walk(finding, "component", "name") if isinstance(finding, dict) else None
+    own = _clean_root_name(_walk(finding, "component", "name")) if isinstance(finding, dict) else ""
     return [own] if own else []
+
+
+def _finding_sort_key(finding):
+    """A total, meaningful order over an entry's findings: (library name, CVE name).
+
+    Mend returns findings in response order, which is NOT stable between runs. Under root
+    grouping an entry holds findings for MANY libraries, and three separate consumers read that
+    order: render_inputs (the header's component), library_url (the Hyperlink relation) and
+    core.mend_val (MEND:findings.* custom fields, which resolve against the LAST finding).
+    A reshuffle therefore changed the rendered description, wi_content_diff saw a change, and the
+    item was PATCHed on every run -- dragging operator-set states back to New. That is the
+    spurious-rewrite bug 5c53f8a fixed, reintroduced by grouping.
+
+    Missing or non-string keys sort as "" rather than raising: nothing on this path may fail on
+    malformed Mend data.
+    """
+    library = _walk(finding, "component", "name") if isinstance(finding, dict) else None
+    cve = _walk(finding, "vulnerability", "name") if isinstance(finding, dict) else None
+    return (library if isinstance(library, str) else "",
+            cve if isinstance(cve, str) else "")
+
+
+def _with_sorted_findings(entries: dict) -> dict:
+    """Put every entry's findings in _finding_sort_key order, in place, and return the entries.
+
+    Applied in BOTH grouping modes. In per-CVE mode an entry's findings all share one library and
+    one CVE, so the sort is a stable no-op there.
+    """
+    for entry in entries.values():
+        entry["findings"].sort(key=_finding_sort_key)
+    return entries
 
 
 def normalise_findings(findings, floor: float, per_cve: bool = False):
@@ -179,7 +234,7 @@ def normalise_findings(findings, floor: float, per_cve: bool = False):
             entry = entries.setdefault(root, {"library": root, "kind": "vulnerability",
                                               "findings": []})
             entry["findings"].append(finding)
-    return entries, unscored
+    return _with_sorted_findings(entries), unscored
 
 
 # Licenses are policy-driven: a license is a VIOLATION because a policy says so, which is why
@@ -735,6 +790,7 @@ def _vulnerability_row(finding: dict) -> dict:
     }
 
     raw_score = vuln.get("score")
+    fields = _component_fields(finding)
     return {
         "name": vuln.get("name") or "",
         "score": raw_score if raw_score is not None and raw_score != "" else "",
@@ -750,9 +806,14 @@ def _vulnerability_row(finding: dict) -> dict:
         "fix_url": top_fix.get("url") or "",
         "publish_date": vuln.get("publishDate") or "",
         "library": _walk(finding, "component", "name") or "",
-        "dependency_type": _dependency_type(
-            _walk(finding, "component") if isinstance(_walk(finding, "component"), dict) else {},
-            finding),
+        # The vulnerable library's OWN metadata, per row. Under root grouping the work item
+        # header describes the ROOT, so without these every per-CVE <details> section claimed
+        # the root was the vulnerable library and showed the root's single path -- eight
+        # sections on an eight-library root item all saying the same wrong thing.
+        # core.vuln_section_v3 prefers these and falls back to the header's values.
+        "dependency_type": fields["dependency_type"],
+        "dependency_file": fields["dependency_file"],
+        "library_path": fields["library_path"],
     }
 
 
@@ -791,6 +852,57 @@ def _vulnerabilities(findings: list) -> list:
     return rows
 
 
+def _component_fields(finding: dict) -> dict:
+    """One finding's component -> the six header fields, all strings, never None.
+
+    Shared by render_inputs (the work item header) and _vulnerability_row (the per-CVE section's
+    own paths), so the two cannot drift. Keys match normalise_library_components' output exactly,
+    which is what lets render_inputs choose between a finding and the index field by field.
+    """
+    component = _walk(finding, "component") if isinstance(finding, dict) else None
+    component = component if isinstance(component, dict) else {}
+    references = component.get("references")
+    references = references if isinstance(references, dict) else {}
+    locations = component.get("libraryLocations")
+    first_location = locations[0] if isinstance(locations, list) and locations \
+        and isinstance(locations[0], dict) else {}
+    return {
+        "version": component.get("version") or "",
+        "description": component.get("description") or "",
+        "home_page": references.get("homePage") or "",
+        "dependency_type": _dependency_type(component,
+                                            finding if isinstance(finding, dict) else {}),
+        "dependency_file": component.get("dependencyFile")
+        or first_location.get("dependencyFile") or "",
+        "library_path": component.get("localPath") or component.get("path")
+        or first_location.get("localPath") or "",
+    }
+
+
+def _header_finding(findings: list, library: str):
+    """The finding whose component metadata belongs in the work item HEADER.
+
+    The header describes the work item's OWN library -- the root in dependency mode, the
+    vulnerable library in per-CVE mode -- so the finding whose component.name equals that
+    library is the only correct source. Under root grouping findings[0] is whichever transitive
+    library Mend returned first, which is both wrong (a root titled express captioned with qs's
+    description and paths) and unstable.
+
+    Returns (finding, matched). `matched` tells render_inputs which source has PRIORITY: when a
+    finding really is about the entry's own library its project-specific component wins, exactly
+    as it did before grouping; when none is (the normal case for a root, which is usually not
+    itself vulnerable) entry["component"] -- the root-keyed due-diligence row -- wins instead,
+    and the unmatched findings[0] is only a last resort for fields the index leaves blank.
+
+    In per-CVE mode the match always succeeds, because the entry's library IS its findings'
+    component, so behaviour in that mode is unchanged.
+    """
+    for finding in findings:
+        if (_walk(finding, "component", "name") or "") == (library or ""):
+            return finding, True
+    return (findings[0] if findings else None), False
+
+
 def render_inputs(entry: dict) -> dict:
     """One `desired` entry ({"library", "kind", "findings"}) -> the flat inputs the HTML
     description builders consume.
@@ -808,6 +920,12 @@ def render_inputs(entry: dict) -> dict:
     to entry["component"] only for a field the finding leaves blank. 1.4 rendered these lines
     from a library-keyed location index for every work item, license or CVE, never consulting the
     violation, so a finding with no path of its own must still show the project's.
+
+    WHICH finding supplies that header matters under root grouping, where one entry holds
+    findings for MANY libraries: findings[0] captioned a root work item with an arbitrary
+    TRANSITIVE library's description and paths, and reshuffled Mend output changed the rendered
+    description and rewrote the item on every run. The finding whose component IS the entry's
+    library wins; see _header_finding.
     """
     library = entry.get("library") if isinstance(entry, dict) else ""
     result = {
@@ -838,30 +956,27 @@ def render_inputs(entry: dict) -> dict:
     if not findings:
         return result
 
-    component = _walk(findings[0], "component")
-    component = component if isinstance(component, dict) else {}
-    references = component.get("references")
-    references = references if isinstance(references, dict) else {}
-    locations = component.get("libraryLocations")
-    first_location = locations[0] if isinstance(locations, list) and locations and isinstance(locations[0], dict) \
-        else {}
-
-    result["version"] = component.get("version") or ""
-    result["description"] = component.get("description") or ""
-    result["home_page"] = references.get("homePage") or ""
-    result["dependency_type"] = _dependency_type(component, findings[0])
-    result["dependency_file"] = component.get("dependencyFile") or first_location.get("dependencyFile") or ""
-    result["library_path"] = component.get("localPath") or component.get("path") or first_location.get(
-        "localPath") or ""
-    result["parents"] = _parents(findings)
-    result["vulnerabilities"] = _vulnerabilities(findings)
+    source, matched = _header_finding(findings, library)
+    source = source if isinstance(source, dict) else {}
+    from_finding = _component_fields(source)
 
     component_index = entry.get("component")
-    if isinstance(component_index, dict):
-        for key in ("version", "description", "dependency_type", "dependency_file",
-                    "library_path", "home_page"):
-            if not result[key]:
-                result[key] = component_index.get(key) or ""
+    from_index = component_index if isinstance(component_index, dict) else {}
+
+    # Priority order. A finding that IS about this library beats the project-wide index (its
+    # BaseLocationComponentDTOV3 is richer and project-specific); a finding that is NOT loses to
+    # it, because the index row is keyed by the work item's own library and the finding is not.
+    sources = (from_finding, from_index) if matched else (from_index, from_finding)
+    for key in ("version", "description", "dependency_type", "dependency_file",
+                "library_path", "home_page"):
+        for candidate in sources:
+            value = candidate.get(key) or ""
+            if value:
+                result[key] = value
+                break
+
+    result["parents"] = _parents(findings)
+    result["vulnerabilities"] = _vulnerabilities(findings)
     return result
 
 
@@ -871,26 +986,43 @@ def library_url(entry: dict) -> str:
     ComponentReferencesDTO.url is the library page; homePage is the upstream project's own site.
     The first is what an operator wants one click away, so homePage is only a fallback.
 
-    A finding's own component wins. A LICENSE entry has no component at all -- its violations are
-    ProjectViolationDTOV3 -- so it falls back to entry["component"]["mend_url"], the same
-    due-diligence index the description reads. Without that fallback a license work item was
-    created with NO Hyperlink relation, which 1.4 always had (prj_el["library"]["url"] was in
-    scope for a license violation exactly as for a CVE).
+    The work item is about ITS OWN library, so the finding whose component is that library wins
+    -- not the first finding that happens to carry a URL. Under root grouping an entry holds
+    findings for many libraries, and taking the first one pointed a root work item's one-click
+    link at an arbitrary transitive library. Next comes entry["component"]["mend_url"], the
+    index row keyed by that same library; only then any finding with a URL at all.
 
-    Returns "" when neither source has one, and the caller then writes no relation at all rather
+    A LICENSE entry has no component at all -- its violations are ProjectViolationDTOV3 -- so it
+    reaches the index fallback, the same due-diligence index the description reads. Without that
+    fallback a license work item was created with NO Hyperlink relation, which 1.4 always had
+    (prj_el["library"]["url"] was in scope for a license violation exactly as for a CVE).
+
+    Returns "" when no source has one, and the caller then writes no relation at all rather
     than an empty one.
     """
     if not isinstance(entry, dict):
         return ""
-    for finding in entry.get("findings") or []:
+    library = entry.get("library") or ""
+
+    def url_of(finding):
         references = _walk(finding, "component", "references")
         if isinstance(references, dict):
-            url = references.get("url") or references.get("homePage")
+            return references.get("url") or references.get("homePage") or ""
+        return ""
+
+    findings = [f for f in (entry.get("findings") or []) if isinstance(f, dict)]
+    for finding in findings:
+        if (_walk(finding, "component", "name") or "") == library:
+            url = url_of(finding)
             if url:
                 return url
     component = entry.get("component")
-    if isinstance(component, dict):
-        return component.get("mend_url") or ""
+    if isinstance(component, dict) and component.get("mend_url"):
+        return component["mend_url"]
+    for finding in findings:
+        url = url_of(finding)
+        if url:
+            return url
     return ""
 
 

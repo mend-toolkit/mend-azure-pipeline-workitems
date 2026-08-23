@@ -49,11 +49,29 @@ def test_an_anchor_holding_only_whitespace_counts_as_empty():
 
 # ------------------------------------------------------------------------- deterministic order
 
-def _finding(cve, score, lib="lodash", parents=()):
-    return {"component": {"name": lib},
+def _finding(cve, score, lib="lodash", parents=(), meta=None):
+    """One 3.0 security finding.
+
+    `meta` fills in component metadata that DIFFERS between findings -- description, paths,
+    home page. It has to differ for a determinism test to mean anything: when every finding
+    carries identical component metadata, a renderer that reads an arbitrary finding's component
+    produces the same bytes either way and the test passes with the bug present.
+    """
+    component = {"name": lib}
+    if meta:
+        component.update(meta)
+    return {"findingInfo": {"status": source3.OPEN_STATUS},
+            "component": component,
             "dependencyContexts": [{"directRoots": [
                 {"rootLibraryName": p, "rootLibraryVersion": "1.0.0"} for p in parents]}],
             "vulnerability": {"name": cve, "score": score}}
+
+
+def _meta(tag):
+    return {"description": f"{tag} does things.",
+            "dependencyFile": f"/s/{tag}/package.json",
+            "localPath": f"/s/node_modules/{tag}",
+            "references": {"homePage": f"https://{tag}.example/"}}
 
 
 def test_equal_scores_are_ordered_by_cve_name_not_by_api_order():
@@ -106,17 +124,28 @@ def test_licenses_are_ordered_by_name_after_a_merge():
 
 def test_two_runs_over_reshuffled_api_output_render_an_identical_description():
     """The end-to-end guarantee: same facts in a different order from Mend, same description --
-    so the unchanged-check has something stable to compare."""
+    so the unchanged-check has something stable to compare.
+
+    Runs through normalise_findings, not around it, because that is where the order of an entry's
+    findings is settled and there is no production path that skips it. The two findings carry
+    DIFFERENT component descriptions, paths and home pages, which is what makes this test able to
+    fail: with identical metadata the header renders the same bytes whichever finding it reads,
+    and render_inputs' findings[0] header could reshuffle unnoticed.
+    """
     from unittest import mock
-    findings = [_finding("CVE-2021-0002", 7.5, parents=("zeta",)),
-                _finding("CVE-2021-0001", 7.5, parents=("alpha",))]
+    findings = [_finding("CVE-2021-0002", 7.5, lib="qs-6.5.2.tgz", parents=("zeta", "alpha"),
+                         meta=_meta("qs")),
+                _finding("CVE-2021-0001", 7.5, lib="cookie-0.3.1.tgz", parents=("alpha", "zeta"),
+                         meta=_meta("cookie"))]
     conf = mock.MagicMock(dependency="true")
     descs = []
     for ordering in (findings, list(reversed(findings))):
-        entry = {"library": "lodash", "kind": "vulnerability", "findings": ordering,
-                 "licenses": [], "component": {}}
+        entries, _ = source3.normalise_findings(ordering, 0.0)
+        entry = entries["alpha"]
+        entry["licenses"] = []
+        entry["component"] = {}
         with mock.patch.object(core, "conf", conf):
-            descs.append(core.render_entry_v3("vulnerability", "lodash", entry, False)[0]["desc"])
+            descs.append(core.render_entry_v3("vulnerability", "alpha", entry, False)[0]["desc"])
     assert descs[0] == descs[1]
 
 

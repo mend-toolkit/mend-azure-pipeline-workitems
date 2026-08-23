@@ -50,8 +50,13 @@ def _finding(desc=ANGLED, lib="fastify"):
 
 
 def _entry(finding=None):
+    # "root" is POPULATED, and with angled data. Without it remediation_block_v3 returns "" and
+    # the whole-description raw-"<" scanner below never looks at the remediation block at all --
+    # a block that interpolates two Mend-supplied version strings and a note.
     return {"library": "fastify", "kind": "vulnerability",
-            "findings": [finding or _finding()], "licenses": [], "component": {}}
+            "findings": [finding or _finding()], "licenses": [], "component": {},
+            "root": {"version": "1.0.0", "recommended_fix": "<2.0.1", "major_fix": "3.0.0 <4",
+                     "fix_failed": True, "severity": "HIGH", "total": 3}}
 
 
 def _render(entry, conf=None):
@@ -129,6 +134,9 @@ def test_no_unescaped_data_angle_bracket_remains_anywhere_in_the_description():
     """Belt and braces: every "<" left in the output must open a real tag."""
     import re
     desc = _render(_entry())
+    # Proof the scan actually covers the remediation block: an empty "root" renders nothing, and
+    # this assertion is what stops that regressing back into an unscanned blind spot.
+    assert "Recommended Fix" in desc and "Mend could not compute" in desc
     for match in re.finditer(r"<(?!/?[a-zA-Z])", desc):
         raise AssertionError(f"raw '<' from data at {match.start()}: {desc[match.start():][:60]!r}")
 
