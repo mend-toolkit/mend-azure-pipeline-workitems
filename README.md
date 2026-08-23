@@ -267,7 +267,7 @@ The `MEND_CUSTOMFIELDS` variable accepts a string that is a semi-colon separated
 <br />
 
 ### Available `MEND:` Paths
-A `MEND:` path is walked into the **entry** the Work Item was built from. An entry is one vulnerable library (in the default `MEND_DEPENDENCY: true` mode) or one CVE (in `MEND_DEPENDENCY: false`), and it has this shape:
+A `MEND:` path is walked into one of the **entries** the Work Item was built from. An entry is one root library (in the default `MEND_DEPENDENCY: true` mode) or one CVE (in `MEND_DEPENDENCY: false`), and it has this shape:
 
 ```
 {
