@@ -23,6 +23,7 @@ from source3 import (library_url, license_policy_name, license_link_report,
                      normalise_projects, normalise_violations, render_inputs, select_projects,
                      severity_floor)
 import warnings
+import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 
 log_fmt_debug = "[%(asctime)s] [%(levelname)s] [%(funcName)s:%(lineno)d] %(message)s"
@@ -47,6 +48,11 @@ conf = None
 max_wi = 100
 max_wiql_page = 5000  # WIQL rows per page; Azure DevOps hard-caps a single result set at 20000
 WARNING_MSG = False
+# Set once, the first time verify_setting() reports verification is OFF. The previous code caught
+# and logged InsecureRequestWarning inside three of the four transports and missed the 2.0 login,
+# which is why one raw connectionpool.py:1099 line still reached the pipeline's stderr on every
+# run. Silencing at source covers every call site, present and future.
+TLS_WARNINGS_SILENCED = False
 mend_v2_session = None
 AGENT_INFO = {"agent": f"{__tool_name__.replace('_', '-')}", "agentVersion": __version__}
 DEFAULT_PRIORITY = 2
@@ -193,6 +199,61 @@ def reachability_enabled() -> bool:
     return conf.reachability.lower() == "true"
 
 
+def _silence_tls_warnings():
+    """Suppress urllib3's InsecureRequestWarning, once, when verification is deliberately off.
+
+    Only ever called from verify_setting's false branch: while verification is ON, a TLS warning
+    would mean something real and must not be hidden. The one-shot logger.warning in the transports
+    still fires, so the run says once that it is not verifying -- what goes away is urllib3
+    repeating it per connection.
+    """
+    global TLS_WARNINGS_SILENCED
+    if not TLS_WARNINGS_SILENCED:
+        urllib3.disable_warnings(InsecureRequestWarning)
+        TLS_WARNINGS_SILENCED = True
+
+
+def verify_setting(raw=None):
+    """MEND_SSLVERIFY -> what requests should use for `verify`.
+
+    Returns True (validate against the certifi bundle requests ships), False (do not validate), or
+    a path to a CA bundle. `raw` defaults to reading conf, so call sites need no argument.
+
+    NOTHING has to be installed for the default: api-saas.mend.io and dev.azure.com serve publicly
+    trusted certificates and an Azure DevOps hosted agent validates them out of the box. The
+    variable exists for what this tool cannot see -- a self-hosted runner behind a TLS-inspecting
+    proxy, where the presented certificate is the proxy's.
+
+    Anything unrecognised verifies. A typo must never be the thing that silently disables TLS
+    validation, so only an explicit false/no/0 turns it off, and an unexpanded Azure placeholder
+    ("$(MEND_SSLVERIFY)") is not mistaken for a bundle path.
+    """
+    if raw is None:
+        raw = getattr(conf, "ssl_verify", "") if conf else ""
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw or "").strip()
+    if not text or re.match(r"^\$\(.+\)$", text):
+        return True
+    lowered = text.lower()
+    if lowered in ("false", "no", "0"):
+        _silence_tls_warnings()
+        return False
+    if lowered in ("true", "yes", "1"):
+        return True
+    # A path is the only remaining meaning; anything else is a typo and verifies.
+    return text if ("/" in text or "\\" in text or "." in text) else True
+
+
+def ssl_error_hint(host_desc: str, err) -> str:
+    """The message for a certificate failure -- the one way turning verification on can break a
+    run. It has to name the variable that restores the old behaviour, or an operator is left
+    reading a stack trace about handshakes."""
+    return (f"TLS certificate verification failed for {host_desc}: {err}. If this runs behind a "
+            f"TLS-inspecting proxy, set MEND_SSLVERIFY to the proxy's CA bundle path, or to "
+            f"'false' to skip verification as previous versions did.")
+
+
 def _post_v2_login():
     # Split out so tests can stub the transport without mocking requests itself.
     # mend_api_url(), NOT conf.ws_url: 2.0/3.0 live on api-saas.mend.io while conf.ws_url is
@@ -200,10 +261,13 @@ def _post_v2_login():
     url = f"{mend_api_url()}/api/v2.0/login"
     body = {"email": conf.email, "userKey": conf.ws_user_key, "orgToken": conf.ws_org_token}
     try:
-        res_ = requests.post(url, json=body, verify=False, proxies=conf.proxy,
+        res_ = requests.post(url, json=body, verify=verify_setting(), proxies=conf.proxy,
                              headers={"Content-Type": "application/json"})
         return (json.loads(res_.text), 0) if res_.status_code == 200 \
             else (try_or_error(lambda: json.loads(res_.text), {}), 2)
+    except requests.exceptions.SSLError as err:
+        logger.error(f"[{ex()}] {ssl_error_hint('the Mend API host', err)}")
+        return {f"[{ex()}] Mend 2.0 login failed": f"{err}"}, 2
     except Exception as err:
         return {f"[{ex()}] Mend 2.0 login failed": f"{err}"}, 2
 
@@ -230,7 +294,8 @@ def _get_v2(url: str, token: str, params: dict):
     try:
         with warnings.catch_warnings(record=True) as warning_list:
             warnings.simplefilter("always", InsecureRequestWarning)
-            res_ = requests.get(url, params=params or {}, verify=False, proxies=conf.proxy,
+            res_ = requests.get(url, params=params or {}, verify=verify_setting(),
+                                proxies=conf.proxy,
                                 headers={"Authorization": f"Bearer {token}",
                                          "Content-Type": "application/json"})
         if not WARNING_MSG:
@@ -242,6 +307,9 @@ def _get_v2(url: str, token: str, params: dict):
         if res_.status_code == 200:
             return json.loads(res_.text), 0
         return try_or_error(lambda: json.loads(res_.text), {}), res_.status_code
+    except requests.exceptions.SSLError as err:
+        logger.error(f"[{ex()}] {ssl_error_hint('the Mend API host', err)}")
+        return {f"[{ex()}] Mend 2.0 call failed": f"{err}"}, 2
     except Exception as err:
         return {f"[{ex()}] Mend 2.0 call failed": f"{err}"}, 2
 
@@ -256,7 +324,8 @@ def _post_v3(url: str, token: str, body: dict, params: dict):
     try:
         with warnings.catch_warnings(record=True) as warning_list:
             warnings.simplefilter("always", InsecureRequestWarning)
-            res_ = requests.post(url, params=params or {}, json=body or {}, verify=False,
+            res_ = requests.post(url, params=params or {}, json=body or {},
+                                 verify=verify_setting(),
                                  proxies=conf.proxy,
                                  headers={"Authorization": f"Bearer {token}",
                                           "Content-Type": "application/json"})
@@ -269,6 +338,9 @@ def _post_v3(url: str, token: str, body: dict, params: dict):
         if res_.status_code == 200:
             return json.loads(res_.text), 0
         return try_or_error(lambda: json.loads(res_.text), {}), res_.status_code
+    except requests.exceptions.SSLError as err:
+        logger.error(f"[{ex()}] {ssl_error_hint('the Mend API host', err)}")
+        return {f"[{ex()}] Mend 3.0 call failed": f"{err}"}, 2
     except Exception as err:
         return {f"[{ex()}] Mend 3.0 call failed": f"{err}"}, 2
 
@@ -413,7 +485,7 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
             res_ = requests.request(api_type, url, json=data,
                                     headers={'Content-Type': f'{header}'},
                                     proxies=conf.proxy,
-                                    verify=False,
+                                    verify=verify_setting(),
                                     auth=('', conf.azure_pat))
         if not WARNING_MSG:
             for warning in warning_list:
@@ -432,7 +504,7 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                         res_ = requests.request(api_type, url, json=data,
                                                 headers={'Content-Type': f'{header}'},
                                                 proxies={"http": temp_http_proxy},
-                                                verify=False,
+                                                verify=verify_setting(),
                                                 auth=('', conf.azure_pat))
                     if not WARNING_MSG:
                         for warning in warning_list:
@@ -470,6 +542,10 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                        f"Check it according to READ.ME file."}
             else:
                 res = {f"[{fn()}] Azure API call failed": "No message text was returned."}
+    except requests.exceptions.SSLError as err:
+        errorcode = 2
+        logger.error(f"[{ex()}] {ssl_error_hint('the Azure DevOps host', err)}")
+        res = {f"[{ex()}] Azure API call failed": f"{err}"}
     except Exception as err:
         errorcode = 2
         res = {f"[{ex()}] Azure API call failed": f"{err}"}
@@ -2133,6 +2209,7 @@ def startup():
         severity=varenvs.get_env("wsseverity").strip(),
         closed_state=varenvs.get_env("wsclosedstate").strip(),
         reopen_state=varenvs.get_env("wsreopenstate").strip(),
+        ssl_verify=varenvs.get_env("wssslverify").strip(),
     )
     try:
         return conf

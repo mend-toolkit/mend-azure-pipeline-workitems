@@ -54,6 +54,7 @@ class varenvs(Enum):  # Lit of Env.variables
     wsseverity = ("WS_SEVERITY", "MEND_SEVERITY")
     wsclosedstate = ("WS_CLOSEDSTATE", "MEND_CLOSEDSTATE")
     wsreopenstate = ("WS_REOPENSTATE", "MEND_REOPENSTATE")
+    wssslverify = ("WS_SSLVERIFY", "MEND_SSLVERIFY")
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -124,6 +125,10 @@ class Config:
     severity: str
     closed_state: str
     reopen_state: str
+    # Defaulted, unlike every field above it: "" means verify (see core.verify_setting), so an
+    # existing Config(...) call that predates this variable keeps working AND gets the secure
+    # behaviour rather than having to opt in.
+    ssl_verify: str = ""
 
     def conf_json(self):
         return {
@@ -153,6 +158,7 @@ class Config:
             "wsseverity": self.severity,
             "wsclosedstate": self.closed_state,
             "wsreopenstate": self.reopen_state,
+            "wssslverify": self.ssl_verify,
         }
 
     def get_values(self):
