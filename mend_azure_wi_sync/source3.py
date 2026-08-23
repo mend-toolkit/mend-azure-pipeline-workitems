@@ -197,6 +197,254 @@ def normalise_licenses(rows) -> dict:
     return index
 
 
+# The library metadata a license work item needs, and the due-diligence field each one comes
+# from. ProjectViolationDTOV3 -- what a license entry's findings are -- carries NO component at
+# all, so a license work item has no other source for these: without this index its rendered
+# description shows an empty "Path to dependency file", "Path to library" and "Library home
+# page". The rows are the SAME ones normalise_licenses reads, so this costs no extra API call.
+def normalise_library_components(rows) -> dict:
+    """3.0 due-diligence rows -> {library_name: {version, description, dependency_type,
+    dependency_file, library_path, home_page}}.
+
+    Schema (references/3.0 (2).json): DueDiligenceDTOV3.component is a LibraryComponentDTOV3,
+    which carries version, description, dependencyType, dependencyFile, localPath and path, plus
+    references.homePage via ComponentReferencesDTO. DueDiligenceDTOV3.extraData.homepage
+    (ResourceExtraDataDTO) is a second home-page source and is accepted as a fallback.
+
+    One library appears once PER LICENSE it carries, so the same component arrives repeatedly.
+    First non-empty value wins per field: a sparse row must not blank out what a fuller row for
+    the same library already supplied.
+
+    Missing library name, missing/malformed component, non-dict row, `None` input -- all yield
+    nothing rather than raising. Every value is a string, never None, so the renderer can test it
+    for emptiness directly.
+    """
+    index = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        component = row.get("component")
+        component = component if isinstance(component, dict) else {}
+        lib = component.get("name")
+        if not lib:
+            continue
+        references = component.get("references")
+        references = references if isinstance(references, dict) else {}
+        found = {
+            "version": component.get("version") or "",
+            "description": component.get("description") or "",
+            "dependency_type": component.get("dependencyType") or "",
+            "dependency_file": component.get("dependencyFile") or "",
+            "library_path": component.get("localPath") or component.get("path") or "",
+            "home_page": references.get("homePage") or _walk(row, "extraData", "homepage") or "",
+            # The library's page in Mend. Two jobs: the work item's Hyperlink relation (which a
+            # license entry otherwise has no source for -- see library_url) and the License
+            # Details link when Mend publishes no license text URL.
+            "mend_url": references.get("url") or references.get("homePage") or "",
+        }
+        current = index.setdefault(lib, dict.fromkeys(found, ""))
+        for key, value in found.items():
+            if value and not current[key]:
+                current[key] = value
+    return index
+
+
+# The 1.4-EQUIVALENT source for the same six fields, and the primary one.
+#
+# 1.4 read these from a dedicated per-project call, getProjectLibraryLocations, keyed by library
+# keyUuid and consulted for EVERY work item -- license or CVE -- because the index was keyed by
+# library and never looked at the violation (core.get_pathes, deleted in 9957482):
+#
+#     locations[0]['dependencyFile'], locations[0]['path']
+#
+# GET /projects/{uuid}/dependencies/libraries -> LibraryDTOV3 is that call's 3.0 counterpart and
+# carries the same shapes: locations[] (LibraryLocationDTO: localPath + dependencyFile) and
+# licenses[].licenseReferences[] (a LIST, exactly as 1.4's licenses[].references[] was). Due
+# diligence projects each of those down to a single nullable scalar, which is why it is the
+# fallback here and not the primary.
+def normalise_libraries(rows) -> dict:
+    """3.0 project libraries -> {library_name: {version, description, dependency_type,
+    dependency_file, library_path, home_page}} -- the same shape
+    normalise_library_components returns, so the two are mergeable.
+
+    Paths come from the FIRST location that carries each value, not from locations[0]
+    positionally as 1.4 did: a leading location with neither field is a hole, and reading it
+    positionally renders as a blank line when the project does know the path.
+
+    home_page is extraInformation.homePage (LibraryExtraInfoDTO) -- the counterpart of the
+    references.url that 1.4 read off getProjectLicenses.
+    """
+    index = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        lib = row.get("name")
+        if not lib:
+            continue
+        dependency_file, library_path = "", ""
+        for location in row.get("locations") or []:
+            if not isinstance(location, dict):
+                continue
+            dependency_file = dependency_file or (location.get("dependencyFile") or "")
+            library_path = library_path or (location.get("localPath") or "")
+        extra = row.get("extraInformation")
+        extra = extra if isinstance(extra, dict) else {}
+        found = {
+            "version": row.get("version") or "",
+            "description": row.get("description") or "",
+            "dependency_type": row.get("dependencyType") or _direct_flag(row),
+            "dependency_file": dependency_file,
+            "library_path": library_path,
+            "home_page": extra.get("homePage") or "",
+            # LibraryDTOV3 has no ComponentReferencesDTO, so it cannot supply the Mend library
+            # page -- the key is present and empty so the due-diligence index can fill it.
+            "mend_url": "",
+        }
+        current = index.setdefault(lib, dict.fromkeys(found, ""))
+        for key, value in found.items():
+            if value and not current[key]:
+                current[key] = value
+    return index
+
+
+def _direct_flag(row: dict) -> str:
+    """LibraryDTOV3.directDependency -> the word the description renders. "" when absent, which
+    the caller shows as unknown rather than guessing "Direct"."""
+    is_direct = row.get("directDependency")
+    if is_direct is True:
+        return "Direct"
+    if is_direct is False:
+        return "Transitive"
+    return ""
+
+
+def normalise_library_licenses(rows) -> dict:
+    """3.0 project libraries -> {library_name: [{"name", "url", "reference_file"}, ...]}, the
+    same shape normalise_licenses returns off the due-diligence rows.
+
+    LibraryDTOV3.licenses[] is a LibraryLicenseDTOV3, whose licenseReferences[] is a LIST of
+    LicenseReferenceDTO -- the same shape 1.4's licenses[].references[] had, which is what
+    populated "License Reference File" before. The first reference carrying each value wins, so
+    a leading reference with no liabilityReference does not blank the line.
+
+    extraInformation.licenseUrl (LibraryExtraInfoDTO) is the closest reachable analogue of 1.4's
+    licenses[].url and fills `url` when a license publishes no textUrl of its own. It is
+    per-LIBRARY, not per-license, so it is attributed ONLY when the library carries exactly one
+    license: handing one URL to two different licenses asserts something Mend never said. A
+    multi-license library falls through to the library's Mend page instead -- see
+    core.build_license_html_v3.
+    """
+    index = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        lib = row.get("name")
+        if not lib:
+            continue
+        licences = [lic for lic in (row.get("licenses") or [])
+                    if isinstance(lic, dict) and lic.get("name")]
+        extra = row.get("extraInformation")
+        extra = extra if isinstance(extra, dict) else {}
+        library_wide_url = (extra.get("licenseUrl") or "") if len(licences) == 1 else ""
+        for licence in licences:
+            url, reference = "", ""
+            for ref in licence.get("licenseReferences") or []:
+                if not isinstance(ref, dict):
+                    continue
+                url = url or (ref.get("textUrl") or "")
+                reference = reference or (ref.get("liabilityReference") or "")
+            index.setdefault(lib, []).append({
+                "name": licence["name"],
+                "url": url or library_wide_url,
+                "reference_file": reference,
+            })
+    return index
+
+
+def merge_component_index(primary: dict, fallback: dict) -> dict:
+    """Union two component indexes field by field: primary wins wherever it has a value, the
+    fallback fills only its blanks, and a library only the fallback knows about is kept.
+
+    Neither source is complete on its own -- the libraries call is the 1.4-equivalent shape, due
+    diligence sometimes carries a field it leaves empty -- and dropping a library the fallback
+    alone knows about would put back the empty lines this exists to fix.
+    """
+    merged = {lib: dict(fields) for lib, fields in (primary or {}).items()
+              if isinstance(fields, dict)}
+    for lib, fields in (fallback or {}).items():
+        if not isinstance(fields, dict):
+            continue
+        if lib not in merged:
+            merged[lib] = dict(fields)
+            continue
+        for key, value in fields.items():
+            if value and not merged[lib].get(key):
+                merged[lib][key] = value
+    return merged
+
+
+def merge_license_index(primary: dict, fallback: dict) -> dict:
+    """Union two license indexes BY LICENSE NAME: primary wins per field, the fallback fills
+    blanks, and a license only the fallback lists is appended after the primary's.
+
+    Keyed by name rather than by position because the two sources need not order or even agree on
+    the set of licenses a library carries, and a license work item's License Details block must
+    list every one of them.
+    """
+    merged = {}
+    for lib in set(primary or {}) | set(fallback or {}):
+        by_name = {}
+        order = []
+        for source in ((primary or {}).get(lib) or [], (fallback or {}).get(lib) or []):
+            for licence in source:
+                if not isinstance(licence, dict):
+                    continue
+                name = licence.get("name") or ""
+                if name not in by_name:
+                    by_name[name] = dict(licence)
+                    order.append(name)
+                    continue
+                for key, value in licence.items():
+                    if value and not by_name[name].get(key):
+                        by_name[name][key] = value
+        if order:
+            # Sorted, not source order: the two sources' orders both come from the API and are
+            # not guaranteed stable, and the License Details block is rendered from this list.
+            merged[lib] = [by_name[name] for name in sorted(order)]
+    return merged
+
+
+def license_link_report(licenses: dict, components: dict) -> dict:
+    """Which source the License Details link would come from, per "{library}/{license}".
+
+    {"license_url": [...], "library_page": [...], "no_link": [...]} -- the same precedence
+    core.build_license_html_v3 applies: the license's own URL (LicenseReferenceDTO.textUrl, or
+    LibraryExtraInfoDTO.licenseUrl for a single-license library), then the library's Mend page
+    (ComponentReferencesDTO.url), then nothing.
+
+    This exists because every one of those fields is optional in 3.0 and which ones an org
+    populates cannot be read off the spec -- it took a round of guessing to learn that. A run
+    reports it instead.
+    """
+    report = {"license_url": [], "library_page": [], "no_link": []}
+    for lib, entries in (licenses or {}).items():
+        if not isinstance(entries, list):
+            continue
+        component = (components or {}).get(lib)
+        mend_url = component.get("mend_url") if isinstance(component, dict) else ""
+        for licence in entries:
+            if not isinstance(licence, dict):
+                continue
+            label = f"{lib}/{licence.get('name') or '?'}"
+            if licence.get("url"):
+                report["license_url"].append(label)
+            elif mend_url:
+                report["library_page"].append(label)
+            else:
+                report["no_link"].append(label)
+    return report
+
+
 def normalise_projects(rows):
     """ProjectSummaryDTOV3 rows -> the project shape the rest of the tool uses.
 
@@ -281,7 +529,12 @@ def _dependency_type(component: dict, finding: dict) -> str:
 
 def _parents(findings: list) -> list:
     """Every dependencyContexts[].directRoots[] entry across all findings for this library,
-    rendered as "name@version" and deduped in first-seen order."""
+    rendered as "name@version", deduped and SORTED.
+
+    Sorted rather than first-seen: first-seen is Mend's API order, which is not guaranteed stable
+    between runs, and an unstable list rewrites the work item every time it reshuffles. There is
+    no meaningful hierarchy order to preserve here -- these are siblings, all direct roots of the
+    same library."""
     parents = []
     seen = set()
     for finding in findings:
@@ -301,7 +554,7 @@ def _parents(findings: list) -> list:
                 if label not in seen:
                     seen.add(label)
                     parents.append(label)
-    return parents
+    return sorted(parents)
 
 
 def _reference_url(vuln: dict) -> str:
@@ -371,13 +624,17 @@ def _vulnerabilities(findings: list) -> list:
     rows = [_vulnerability_row(f) for f in findings]
 
     def sort_key(row):
+        # The CVE name is the tiebreaker, and it is what makes this deterministic. Without it,
+        # two findings with equal scores keep whatever order the Mend API returned them in, and a
+        # reshuffle between runs rewrites every work item in the project for no reason.
+        name = row["name"]
         score = row["score"]
         if score == "":
-            return (1, 0.0)
+            return (1, 0.0, name)
         try:
-            return (0, -float(score))
+            return (0, -float(score), name)
         except (TypeError, ValueError):
-            return (1, 0.0)
+            return (1, 0.0, name)
 
     rows.sort(key=sort_key)
     return rows
@@ -387,10 +644,19 @@ def render_inputs(entry: dict) -> dict:
     """One `desired` entry ({"library", "kind", "findings"}) -> the flat inputs the HTML
     description builders consume.
 
-    Never raises: every missing or malformed key yields "" or [], not None. A `kind ==
-    "license"` entry carries violation objects, not findings -- those have no
-    component/vulnerability to read, so it returns just the library name with everything
-    else empty. Task 2 attaches license data separately.
+    Never raises: every missing or malformed key yields "" or [], not None.
+
+    A `kind == "license"` entry carries ProjectViolationDTOV3 objects, not findings, and that DTO
+    has no component -- so its library metadata comes from entry["component"], the index
+    normalise_library_components builds from the due-diligence rows and core.fetch_v3_desired
+    attaches. `vulnerabilities` and `parents` stay empty for a license entry either way: there is
+    no finding to read a CVE or a dependency hierarchy from.
+
+    A VULNERABILITY entry reads its own finding FIRST -- BaseLocationComponentDTOV3 with
+    libraryLocations is richer and project-specific, so it stays authoritative -- and falls back
+    to entry["component"] only for a field the finding leaves blank. 1.4 rendered these lines
+    from a library-keyed location index for every work item, license or CVE, never consulting the
+    violation, so a finding with no path of its own must still show the project's.
     """
     library = entry.get("library") if isinstance(entry, dict) else ""
     result = {
@@ -404,7 +670,17 @@ def render_inputs(entry: dict) -> dict:
         "parents": [],
         "vulnerabilities": [],
     }
-    if not isinstance(entry, dict) or entry.get("kind") != "vulnerability":
+    if not isinstance(entry, dict):
+        return result
+
+    if entry.get("kind") != "vulnerability":
+        component = entry.get("component")
+        if isinstance(component, dict):
+            for key in ("version", "description", "dependency_type", "dependency_file",
+                        "library_path", "home_page"):
+                result[key] = component.get(key) or ""
+            # mend_url is deliberately NOT copied: it is the Hyperlink relation's value (see
+            # library_url), not a line in the description.
         return result
 
     findings = [f for f in (entry.get("findings") or []) if isinstance(f, dict)]
@@ -428,6 +704,13 @@ def render_inputs(entry: dict) -> dict:
         "localPath") or ""
     result["parents"] = _parents(findings)
     result["vulnerabilities"] = _vulnerabilities(findings)
+
+    component_index = entry.get("component")
+    if isinstance(component_index, dict):
+        for key in ("version", "description", "dependency_type", "dependency_file",
+                    "library_path", "home_page"):
+            if not result[key]:
+                result[key] = component_index.get(key) or ""
     return result
 
 
@@ -435,9 +718,16 @@ def library_url(entry: dict) -> str:
     """The library's page in Mend, written onto the work item as its Hyperlink relation.
 
     ComponentReferencesDTO.url is the library page; homePage is the upstream project's own site.
-    The first is what an operator wants one click away, so homePage is only a fallback. Returns
-    "" for a license entry (violations carry no component) or anything malformed -- the caller
-    writes no relation at all rather than an empty one.
+    The first is what an operator wants one click away, so homePage is only a fallback.
+
+    A finding's own component wins. A LICENSE entry has no component at all -- its violations are
+    ProjectViolationDTOV3 -- so it falls back to entry["component"]["mend_url"], the same
+    due-diligence index the description reads. Without that fallback a license work item was
+    created with NO Hyperlink relation, which 1.4 always had (prj_el["library"]["url"] was in
+    scope for a license violation exactly as for a CVE).
+
+    Returns "" when neither source has one, and the caller then writes no relation at all rather
+    than an empty one.
     """
     if not isinstance(entry, dict):
         return ""
@@ -447,6 +737,9 @@ def library_url(entry: dict) -> str:
             url = references.get("url") or references.get("homePage")
             if url:
                 return url
+    component = entry.get("component")
+    if isinstance(component, dict):
+        return component.get("mend_url") or ""
     return ""
 
 

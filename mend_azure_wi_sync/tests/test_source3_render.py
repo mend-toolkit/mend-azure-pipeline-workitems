@@ -178,7 +178,11 @@ def test_entry_with_no_findings_returns_empty_vulnerabilities():
     assert result["dependency_type"] == ""
 
 
-def test_license_entry_returns_library_name_and_empty_everything_else():
+def test_license_entry_with_no_component_attached_returns_only_the_library_name():
+    """A license entry's violations carry no component, so with nothing attached every metadata
+    field is blank. The metadata comes from entry["component"] instead -- see
+    test_license_metadata.py. `vulnerabilities` and `parents` stay empty either way: a violation
+    is not a finding."""
     entry = {
         "library": "some-lib",
         "kind": "license",

@@ -2,6 +2,8 @@ import inspect
 import json
 import logging
 import os
+# The FUNCTION, not the html module: build_enrich_html_v3 binds a local `html` and would shadow it.
+from html import escape, unescape
 
 import requests
 import sys
@@ -14,7 +16,10 @@ from identity import (cve_key, license_title, matches_cve, matches_library,
 from reconcile import CLOSE, CREATE, REOPEN, SKIP, UPDATE, plan_actions
 from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
                      SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
-from source3 import (library_url, license_policy_name, normalise_findings, normalise_licenses,
+from source3 import (library_url, license_policy_name, license_link_report,
+                     merge_component_index,
+                     merge_license_index, normalise_findings, normalise_libraries,
+                     normalise_library_components, normalise_library_licenses, normalise_licenses,
                      normalise_projects, normalise_violations, render_inputs, select_projects,
                      severity_floor)
 import warnings
@@ -973,6 +978,24 @@ def create_area(area):
     return res
 
 
+def esc(value) -> str:
+    """A Mend-supplied value, made safe to drop into a description.
+
+    NOT cosmetic. A CVE description reading "<2.0.1, >=3.0.0 <4.0.1. A type confusion ..." was
+    confirmed live to come back from Azure DevOps with that whole sentence DELETED: its parser
+    read "<2.0.1, >" as a tag, dropped it, then ate from "<4.0.1" to the next ">". Version ranges
+    and enrichment.EPSS_BELOW_ONE ("<1%") make that common, so operators were reading truncated
+    vulnerability descriptions.
+
+    quote=True because every attribute this tool writes is single-quoted: an apostrophe in a URL
+    or a license name would otherwise close the attribute early and hand Azure broken markup.
+
+    Only DATA is escaped, never the markup built around it -- see generate_expandable_section,
+    whose summary is markup at one call site and data at another.
+    """
+    return escape(str(value if value is not None else ""), quote=True)
+
+
 def create_html_table(data):
     table_html = "<table style='border-collapse: collapse; table-layout: auto'>\n"  # Start of the table HTML with styles
 
@@ -980,7 +1003,7 @@ def create_html_table(data):
     table_html += "<tr>"
     for header in data[0].keys():
         if header != "URL":
-            table_html += f"<th style='border: 1px solid black; padding: 5px;'><b>{header}</b></th>"
+            table_html += f"<th style='border: 1px solid black; padding: 5px;'><b>{esc(header)}</b></th>"
     table_html += "</tr>\n"
 
     # Create the table data rows
@@ -988,10 +1011,10 @@ def create_html_table(data):
         table_html += "<tr>"
         for j, value in enumerate(row.values()):
             if j == 0:
-                url_ = row["URL"]
-                table_html += f"<td style='border: 1px solid black; padding: 5px;'><a href='{url_}'>{value}</a></td>"
+                url_ = esc(row["URL"])
+                table_html += f"<td style='border: 1px solid black; padding: 5px;'><a href='{url_}'>{esc(value)}</a></td>"
             elif j < len(row.values()) - 1:
-                table_html += f"<td style='border: 1px solid black; padding: 5px;'>{value}</td>"
+                table_html += f"<td style='border: 1px solid black; padding: 5px;'>{esc(value)}</td>"
 
         table_html += "</tr>\n"
 
@@ -1009,9 +1032,10 @@ def generate_expandable_section(summary, detail):
 
 
 def generate_html_bulleted_list(items):
+    # Items are always data (the dependency hierarchy), so escaping belongs here.
     html = "<ul>\n"
     for item in items:
-        html += f"  <li>{item}</li>\n"
+        html += f"  <li>{esc(item)}</li>\n"
     html += "</ul>"
     return html
 
@@ -1047,25 +1071,41 @@ def build_enrich_html_v3(row: dict, reachability_on: bool) -> str:
     """
     html = ""
     if reachability_on:
-        html += f"<br><b>Reachability:</b> {row.get('reachability', '')}"
-    html += f"<br><b>EPSS:</b> {row.get('epss', '')}" \
-            f"<br><b>Exploit Code Maturity:</b> {row.get('maturity', '')}"
+        html += f"<br><b>Reachability:</b> {esc(row.get('reachability', ''))}"
+    # EPSS_BELOW_ONE is the literal "<1%", so this one is not hypothetical.
+    html += f"<br><b>EPSS:</b> {esc(row.get('epss', ''))}" \
+            f"<br><b>Exploit Code Maturity:</b> {esc(row.get('maturity', ''))}"
     return html
 
 
-def build_license_html_v3(licenses: list, policy_name: str) -> str:
+def build_license_html_v3(licenses: list, policy_name: str, library_url: str = "") -> str:
     """The <details> License Details block, same shape the 1.4 path renders it in.
 
-    `licenses` is the list Task 2 attaches to every entry ({"name", "url", "reference_file"}).
+    `licenses` is the list source3.normalise_licenses builds and fetch_v3_desired attaches to
+    every entry ({"name", "url", "reference_file"}).
+
+    License Reference File comes from LicenseReferenceDTO.liabilityReference, which is the ONLY
+    field 3.0 offers for it -- there is no second source to fall back to. So when Mend reports
+    none, the line is omitted rather than rendered as an empty link.
+
+    THE LICENSE NAME IS A LINK, as it was in 1.4, and `library_url` is why it still can be. 1.4
+    linked it to getProjectLicenses -> licenses[].url, an opensource.org-style license page. In
+    3.0 that value survives only as LicenseDTO.profile.links[], and LicenseDTO is referenced by
+    SourceFileLibraryDTO alone -- which no path in references/3.0 (2).json returns, so it is
+    unreachable. The reachable license URL is LicenseReferenceDTO.textUrl, and it is preferred.
+    When Mend publishes none, the name links to the LIBRARY's Mend page instead: a section whose
+    only content is dead text tells an operator nothing, and that page is where Mend shows this
+    license and the file that evidenced it. Plain text is the last resort, not the default.
     """
     lic_data = ""
     for lic_ in licenses or []:
-        ref_ = lic_.get("reference_file", "") if isinstance(lic_, dict) else ""
-        name_ = lic_.get("name", "") if isinstance(lic_, dict) else ""
-        url_ = lic_.get("url", "") if isinstance(lic_, dict) else ""
-        lic_data = lic_data + f"<a href='{url_}'>{name_}</a>" + \
-            f"<br><b>License Reference File: </b><a href='{ref_}'>{ref_}</a><br>" \
-            f"<b>License Policy Violation - </b>{policy_name}<br>"
+        ref_ = esc(lic_.get("reference_file", "")) if isinstance(lic_, dict) else ""
+        name_ = esc(lic_.get("name", "")) if isinstance(lic_, dict) else ""
+        url_ = esc(lic_.get("url", "")) if isinstance(lic_, dict) else ""
+        link_ = url_ or esc(library_url)
+        lic_data = lic_data + (f"<a href='{link_}'>{name_}</a>" if link_ else name_) + \
+            (f"<br><b>License Reference File: </b><a href='{ref_}'>{ref_}</a>" if ref_ else "") + \
+            f"<br><b>License Policy Violation - </b>{esc(policy_name)}<br>"
     return generate_expandable_section("<b>License Details</b>", lic_data)
 
 
@@ -1087,34 +1127,52 @@ def max_score_v3(rows: list) -> str:
     return best
 
 
+def labelled_line(label: str, value: str) -> str:
+    """A "<br><b>Label</b>value" line, or "" when there is no value.
+
+    Mend can identify a library by filename alone, in which case it reports no path at all -- and
+    a bold label followed by nothing reads to an operator as a broken integration rather than as
+    "Mend does not know". Omitting the whole line is the house rule for every optional field in a
+    description.
+    """
+    return f"<br><b>{label}</b>{value}" if value else ""
+
+
 def vuln_section_v3(row: dict, inputs: dict, reachability_on: bool) -> str:
     """One CVE's <details> body, mirroring the 1.4 per-CVE section field for field."""
-    return "<b>Vulnerable Library:</b>" + inputs["library"] + \
-        "<br><b>Path to dependency file: </b>" + inputs["dependency_file"] + \
-        "<br><b>Path to library:</b>" + inputs["library_path"] + \
-        "<br><b>Vulnerability Details:</b> " + row.get("description", "") + \
-        "<br><b>Publish Date:</b> " + row.get("publish_date", "") + \
-        f"<br><b>URL:</b> <a href='{row.get('url', '')}'>{row.get('name', '')}</a>" + \
-        "<br><b>CVSS 3 Score Details </b>(" + str(row.get("score", "")) + ")" + \
+    return "<b>Vulnerable Library:</b>" + esc(inputs["library"]) + \
+        labelled_line("Path to dependency file: ", esc(inputs["dependency_file"])) + \
+        labelled_line("Path to library:", esc(inputs["library_path"])) + \
+        "<br><b>Vulnerability Details:</b> " + esc(row.get("description", "")) + \
+        "<br><b>Publish Date:</b> " + esc(row.get("publish_date", "")) + \
+        f"<br><b>URL:</b> <a href='{esc(row.get('url', ''))}'>{esc(row.get('name', ''))}</a>" + \
+        "<br><b>CVSS 3 Score Details </b>(" + esc(row.get("score", "")) + ")" + \
         build_enrich_html_v3(row, reachability_on) + \
-        "<br><b>Suggested Fix:</b> " + row.get("fix_type", "") + \
-        f"<br><b>Origin:</b> <a href='{row.get('fix_url', '')}'></a><br>" \
-        f"<b>Release Date:</b> " + row.get("fix_date", "") + \
-        "<br><b>Fix Resolution:</b> " + row.get("fix_resolution", "")
+        "<br><b>Suggested Fix:</b> " + esc(row.get("fix_type", "")) + \
+        f"<br><b>Origin:</b> <a href='{esc(row.get('fix_url', ''))}'></a><br>" \
+        f"<b>Release Date:</b> " + esc(row.get("fix_date", "")) + \
+        "<br><b>Fix Resolution:</b> " + esc(row.get("fix_resolution", ""))
 
 
 def library_block_v3(inputs: dict, with_hierarchy: bool) -> str:
-    """The library header block both MEND_DEPENDENCY branches open their description with."""
-    block = "<b>Library - </b>" + inputs["library"] + \
-        "<br>" + inputs["description"] + \
-        "<br><b>Path to dependency file: </b>" + inputs["dependency_file"] + \
-        "<br><b>Path to library:</b>" + inputs["library_path"] + \
-        "<br><b>Vulnerable Library: </b>" + inputs["library"]
+    """The library header block both MEND_DEPENDENCY branches open their description with.
+
+    The path lines and the home page are rendered ONLY when Mend supplied them -- see
+    labelled_line. On a license work item these come from the due-diligence component index
+    (source3.normalise_library_components); on a vulnerability work item, from the finding.
+    """
+    block = "<b>Library - </b>" + esc(inputs["library"]) + \
+        "<br>" + esc(inputs["description"]) + \
+        labelled_line("Path to dependency file: ", esc(inputs["dependency_file"])) + \
+        labelled_line("Path to library:", esc(inputs["library_path"])) + \
+        "<br><b>Vulnerable Library: </b>" + esc(inputs["library"])
     if with_hierarchy:
         block += "<br><b>Dependency Hierarchy: </b><br>" + \
                  generate_html_bulleted_list(items=inputs["parents"])
-    home = inputs["home_page"]
-    return block + f"<br><b> Library home page: </b><a href='{home}'>{home}</a>"
+    home = esc(inputs["home_page"])
+    if home:
+        block += f"<br><b> Library home page: </b><a href='{home}'>{home}</a>"
+    return block
 
 
 def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool) -> list:
@@ -1141,7 +1199,7 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
 
     if kind == "license":
         desc = library_block_v3(inputs, with_hierarchy=False) + \
-            build_license_html_v3(licenses, license_policy_name(entry))
+            build_license_html_v3(licenses, license_policy_name(entry), library_url(entry))
         return [{"title": license_title(library), "desc": desc, "score": "", "exact": True}]
 
     if not per_cve_mode():
@@ -1167,7 +1225,7 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
                 table_row["Reachability"] = row.get("reachability", "")
             table_row["URL"] = row.get("url", "")
             table_data.append(table_row)
-            sections += generate_expandable_section(row.get("name", ""),
+            sections += generate_expandable_section(esc(row.get("name", "")),
                                                     vuln_section_v3(row, inputs, reachability_on))
         # len(entry["findings"]) rather than len(rows): the count in the title is the number of
         # findings the entry holds, and the two are one-to-one by construction (_vulnerabilities
@@ -1175,7 +1233,7 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
         count = len(entry.get("findings") or []) if isinstance(entry, dict) else len(rows)
         max_severity = max_score_v3(rows)
         title = f"{library}: {count} vulnerabilities (highest severity is {max_severity})"
-        desc = generate_expandable_section(f"Vulnerable library - {library}",
+        desc = generate_expandable_section(f"Vulnerable library - {esc(library)}",
                                            library_block_v3(inputs, with_hierarchy=True)) + \
             "<br>" + create_html_table(data=table_data) + "<b>Details:</b><br>" + sections
         return [{"title": title, "desc": desc, "score": max_severity, "exact": False}]
@@ -1194,44 +1252,157 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
     return items
 
 
-def wi_content_unchanged(ops: list, fields: dict) -> bool:
-    """True when every field this run would write already holds that value in Azure.
+# The work item state machine. load_wi_json keeps every alwaysRequired field, and System.State
+# is alwaysRequired in most process templates, so it arrives in cstm_flds carrying Azure's DEFAULT
+# ("New", "To Do") -- which an UPDATE would then write over an operator's Active item. State
+# transitions belong to reconciliation (apply_close / apply_reopen, MEND_CLOSEDSTATE /
+# MEND_REOPENSTATE), never to a content update. System.Reason travels with State in the same
+# machine and is excluded with it.
+STATE_FIELDS = ("System.State", "System.Reason")
 
-    The point is NOT to save an API call: some Azure DevOps process rules reset a work item's
-    state on every edit, so a PATCH that changes nothing still drags an operator's Active item
-    back to New. Not issuing that PATCH is the fix. Anything this cannot prove identical -- an
-    op it does not understand, a field missing from the GET -- returns False, because writing
-    twice is harmless and skipping a real change is not.
+
+# A tag, and ONLY a tag. "<[^>]*>" also matches a bare "<" in CONTENT and eats everything up to
+# the next ">" with it: enrichment.EPSS_BELOW_ONE is the literal "<1%", and Mend descriptions say
+# things like "<=1.2.5 is vulnerable to ...". Azure stores those escaped and this tool sends them
+# raw, so the loose pattern deleted a different amount of real text on each side and every work
+# item carrying an EPSS score differed forever. Requiring a letter or "/" after the "<" is what
+# separates markup from prose -- an unavoidably heuristic line, and the cost of getting it wrong
+# is a stray "<b" in prose read as markup, which is the harmless direction.
+_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>|<!--.*?-->", re.DOTALL)
+_URL_RE = re.compile(r"""\b(?:href|src)\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+# An anchor with no visible text. vuln_section_v3's "Origin:" line renders one (a URL and no
+# label, inherited from the 1.4 shape), and Azure DevOps drops empty elements when it sanitises
+# stored HTML -- so its href never comes back. Its URL is invisible to an operator, so it is not
+# content: dropped from BOTH sides before URLs are collected, rather than making every work item
+# differ forever.
+_EMPTY_ANCHOR_RE = re.compile(r"<a\b[^>]*>\s*</a>", re.IGNORECASE)
+
+
+def canonical_html(value) -> str:
+    """An HTML value reduced to what it SAYS: its visible text, plus every URL in order.
+
+    Azure DevOps does not store HTML byte-for-byte as sent -- it sanitises and reformats it (a
+    wrapping <div>, <br> to <br />, its own whitespace) -- so a raw compare of System.Description
+    reports a change on every work item on every run, and nothing is ever skipped. Confirmed live.
+
+    URLs are kept because a link's target is content: changing where an operator lands is a real
+    change and must not be swallowed by ignoring markup. Everything else about the markup is
+    Azure's business -- including an anchor with no visible text, which is removed first (see
+    _EMPTY_ANCHOR_RE).
+
+    Deliberately regex, not an HTML parser: this compares two strings the tool itself generated
+    against Azure's echo of them, entity-for-entity fidelity is not needed, and it must never
+    raise on the render path. Tags are stripped BEFORE unescaping, so an escaped "&lt;b&gt;" on
+    one side and a real "<b>" on the other do NOT collapse -- that direction reports a change,
+    which is the safe way to be wrong.
+    """
+    text = _EMPTY_ANCHOR_RE.sub(" ", str(value if value is not None else ""))
+    urls = _URL_RE.findall(text)
+    text = _TAG_RE.sub(" ", text)
+    text = unescape(text).replace("\xa0", " ")
+    return " ".join(text.split()) + ("\x00" + "\x00".join(urls) if urls else "")
+
+
+def canonical_divergence(new_val, cur_val, window: int = 60) -> str:
+    """Where two values first differ once canonicalised, as a short "sent ... | azure ..." string.
+
+    For the DEBUG log when a description is rewritten. Naming the field was not enough to diagnose
+    this class of bug: what an operator needs to see is whether the delta is real content (a
+    rescore, a suppressed CVE dropping out) or markup Azure rewrote. Bounded to `window`
+    characters either side so one work item cannot flood a log.
+    """
+    new_c, cur_c = canonical_html(new_val), canonical_html(cur_val)
+    if new_c == cur_c:
+        return ""
+    at = 0
+    for at, (a, b) in enumerate(zip(new_c, cur_c)):
+        if a != b:
+            break
+    else:
+        at = min(len(new_c), len(cur_c))
+    return (f"at char {at}: sent {new_c[at:at + window]!r} | "
+            f"azure {cur_c[at:at + window]!r}")
+
+
+def wi_content_diff(ops: list, fields: dict) -> list:
+    """The fields this run would write that do NOT already hold that value in Azure.
+
+    [] means the PATCH would change nothing. Anything this cannot prove identical counts as a
+    difference -- writing twice is harmless, skipping a real change is not -- and each of those
+    cases names itself in the returned list so a run can say WHY it rewrote a work item:
+      - "{field} (absent)"          Azure's GET did not return the field at all. It omits empty
+                                    fields, which is indistinguishable from a real change.
+      - "{path} (unrecognised op)"  an op that is not a /fields/ write, so nothing to compare.
+      - "(no fields returned)"      an empty or failed GET proves nothing about what Azure holds.
+
+    Returned in op order, and EVERY difference is reported rather than short-circuiting on the
+    first: a run that rewrites every work item needs the whole story in one pass.
+
+    The description is compared exactly as written, with no HTML normalisation. If Azure DevOps
+    sanitises the HTML it stores, this reports a difference every run -- which is the honest
+    answer, because normalising here could hide a real content change. The DEBUG line in
+    write_wi_v3 names the field so that case is diagnosable from a log instead of guesswork.
     """
     if not fields:
-        return False
+        return ["(no fields returned)"]
+    diffs = []
     for op_ in ops or []:
         path = op_.get("path", "")
         if not path.startswith("/fields/"):
-            return False
+            diffs.append(f"{path} (unrecognised op)")
+            continue
         name = path[len("/fields/"):]
+        if name in STATE_FIELDS:
+            # Not content. A state difference must never be what forces a rewrite -- that is the
+            # rewrite that resets the state in the first place.
+            continue
         cur_val = fields.get(name)
         if op_.get("op") == "remove":
             # A remove only matters when Azure still holds something to remove.
             if cur_val not in (None, ""):
-                return False
+                diffs.append(name)
             continue
         new_val = op_.get("value")
-        if name == "System.Tags":
+        if name not in fields:
+            diffs.append(f"{name} (absent)")
+        elif name == "System.Tags":
             # Azure returns "; "-delimited and this tool writes comma-joined, and tag identity
             # is case-insensitive there -- comparing the raw strings would report a change on
             # every single run and skip nothing at all.
             if {t.lower() for t in tag_set(str(new_val or ""))} != \
                     {t.lower() for t in tag_set(str(cur_val or ""))}:
-                return False
+                diffs.append(name)
         elif name == "Microsoft.VSTS.Common.Priority":
             # Azure hands priority back as an int or a string depending on the field type.
             if try_or_error(lambda: int(float(new_val)), new_val) != \
                     try_or_error(lambda: int(float(cur_val)), cur_val):
-                return False
-        elif str(new_val if new_val is not None else "") != str(cur_val if cur_val is not None else ""):
-            return False
-    return True
+                diffs.append(name)
+        else:
+            new_text = str(new_val if new_val is not None else "")
+            cur_text = str(cur_val if cur_val is not None else "")
+            if new_text == cur_text:
+                continue
+            # Only a value carrying markup gets the tolerant compare, and only after the exact
+            # one has already failed. A plain-text field -- System.Title above all, which is the
+            # identity key classify_title decodes -- is never normalised.
+            if "<" in new_text or "<" in cur_text:
+                if canonical_html(new_text) == canonical_html(cur_text):
+                    continue
+            diffs.append(name)
+    return diffs
+
+
+def wi_content_unchanged(ops: list, fields: dict) -> bool:
+    """True when every field this run would write already holds that value in Azure.
+
+    The point is NOT to save an API call: some Azure DevOps process rules reset a work item's
+    state on every edit, so a PATCH that changes nothing still drags an operator's Active item
+    back to New. Not issuing that PATCH is the fix.
+
+    Defined in terms of wi_content_diff so the decision and the explanation logged next to it can
+    never disagree.
+    """
+    return not wi_content_diff(ops, fields)
 
 
 def restore_wi_state(exist_id: int, prior_state: str, patch_result) -> str:
@@ -1333,6 +1504,10 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
 
     for custom_ in cstm_flds:
         fld_name, fld_val = analyze_fields(custom_, item["source"])
+        if fld_name in STATE_FIELDS and azure_operation == "replace":
+            # A CREATE still writes these: the field is alwaysRequired, so Azure may want it in
+            # the create payload, and a brand-new item has no operator-set state to trample.
+            continue
         if fld_val and not any(fld_name in el_["path"] for el_ in data):
             data.append({"op": "add", "path": f"/fields/{fld_name}", "value": fld_val})
         elif not fld_val and "Custom." in fld_name:
@@ -1345,12 +1520,31 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
 
     # err_ == 0 is required: a failed GET proves nothing, so it falls through to the PATCH.
     prior_state = try_or_error(lambda: wi_data["fields"]["System.State"], "") if err_ == 0 else ""
-    if azure_operation == "replace" and err_ == 0 and wi_content_unchanged(
-            data, try_or_error(lambda: wi_data["fields"], {}) or {}):
-        logger.debug(f"[{fn()}] Work item {exist_id} ('{title}') is unchanged; skipping the "
-                     f"update so an Azure DevOps process rule cannot reset its state.")
-        updated_wi.append(exist_id)
-        return "unchanged"
+    if azure_operation == "replace" and err_ != 0:
+        # The unchanged-check and the state restore BOTH depend on this GET, and both are skipped
+        # when it fails. Logged loudly because the symptom -- every work item rewritten every run
+        # -- is identical to the content genuinely differing, and the two need different fixes.
+        logger.warning(f"[{fn()}] Work item {exist_id} ('{title}') could not be read back from "
+                       f"Azure (errorcode {err_}), so this run cannot tell whether its content "
+                       f"changed. Updating it unconditionally.")
+    if azure_operation == "replace" and err_ == 0:
+        changed = wi_content_diff(data, try_or_error(lambda: wi_data["fields"], {}) or {})
+        if not changed:
+            logger.debug(f"[{fn()}] Work item {exist_id} ('{title}') is unchanged; skipping the "
+                         f"update so an Azure DevOps process rule cannot reset its state.")
+            updated_wi.append(exist_id)
+            return "unchanged"
+        # Why this item is being rewritten. Without it, "everything updates every run" is
+        # indistinguishable from "the skip is not wired up", which cost a live debugging round.
+        logger.debug(f"[{fn()}] Work item {exist_id} ('{title}') differs from Azure in "
+                     f"{len(changed)} field(s), so it is being updated: {', '.join(changed)}")
+        azure_fields = try_or_error(lambda: wi_data["fields"], {}) or {}
+        for op_ in data:
+            name_ = op_.get("path", "")[len("/fields/"):]
+            if name_ in changed and name_ in azure_fields:
+                delta = canonical_divergence(op_.get("value"), azure_fields[name_])
+                if delta:
+                    logger.debug(f"[{fn()}]   {name_} {delta}")
 
     try:
         if azure_operation == "add":
@@ -1766,6 +1960,10 @@ def fetch_v3_projects():
 def fetch_v3_licenses(project_uuid: str):
     """One project's due-diligence license rows -> ({library_name: [license, ...]}, ok).
 
+    Returns (licenses, components, ok): the license list per library AND the library metadata
+    index built from the SAME rows (source3.normalise_library_components), which is the only
+    source a license work item has for its version, paths and home page.
+
     GET /projects/{projectUuid}/dependencies/libraries/licenses, confirmed GET-only against
     references/3.0 (2).json (the path declares only a "get" operation). See
     source3.normalise_licenses for the schema this reads.
@@ -1775,13 +1973,35 @@ def fetch_v3_licenses(project_uuid: str):
         logger.error(f"[{fn()}] Could not read library licenses for project {project_uuid}. "
                      f"Callers must not treat the absence of license data here as \"this "
                      f"library has no licenses\".")
-    return normalise_licenses(rows), ok
+    return normalise_licenses(rows), normalise_library_components(rows), ok
+
+
+def fetch_v3_libraries(project_uuid: str):
+    """One project's library list -> (components, licenses, ok).
+
+    This is the 1.4-EQUIVALENT source for the description's paths, description, home page and
+    license reference files. 1.4 read them from getProjectLibraryLocations and getProjectLicenses,
+    both keyed by library and both consulted for every work item regardless of violation type;
+    GET /projects/{projectUuid}/dependencies/libraries (LibraryDTOV3) is their 3.0 counterpart and
+    carries locations[] and licenses[].licenseReferences[] in the same shapes. See
+    source3.normalise_libraries / normalise_library_licenses.
+
+    A failed read returns ok=False and the caller must fold it into fetch_v3_desired's interlock:
+    the library list feeds only description content, but a read that failed must never be
+    presented as a complete one.
+    """
+    rows, ok = fetch_v3_pages(f"projects/{project_uuid}/dependencies/libraries")
+    if not ok:
+        logger.error(f"[{fn()}] Could not read the library list for project {project_uuid}. "
+                     f"Descriptions this run may omit library paths, versions and license "
+                     f"reference files that Mend does in fact know.")
+    return normalise_libraries(rows), normalise_library_licenses(rows), ok
 
 
 def fetch_v3_desired(project_uuid: str, floor: float):
     """One project's desired end state: {(kind, library): entry}.
 
-    `ok` is the AND of all three reads and is the closure interlock from spec 6.1 --
+    `ok` is the AND of all four reads and is the closure interlock from spec 6.1 --
     reconciliation closes work items absent from `desired`, so a partial read must never be
     mistaken for a shrunken one. A caller seeing ok=False may still create and update (which
     cannot destroy anything) but must NOT close.
@@ -1793,13 +2013,20 @@ def fetch_v3_desired(project_uuid: str, floor: float):
     CVE. conf is read HERE and threaded into normalise_findings as a flag; source3 stays pure.
 
     Every entry carries "licenses" (a list, [] when the library has none) so downstream
-    rendering never has to guard for the key's absence.
+    rendering never has to guard for the key's absence. A LICENSE entry also carries "component"
+    ({} when the library has no due-diligence row), because ProjectViolationDTOV3 has no
+    component of its own -- see normalise_library_components.
     """
     findings, findings_ok = fetch_v3_pages(
         f"projects/{project_uuid}/dependencies/findings/security")
     violations, violations_ok = fetch_v3_pages(
         f"orgs/{org_uuid()}/projects/{project_uuid}/violations")
-    licenses, licenses_ok = fetch_v3_licenses(project_uuid)
+    dd_licenses, dd_components, licenses_ok = fetch_v3_licenses(project_uuid)
+    lib_components, lib_licenses, libraries_ok = fetch_v3_libraries(project_uuid)
+    # The libraries call is the 1.4-equivalent projection and wins; due diligence fills only the
+    # fields it leaves blank. Neither is complete on its own -- see source3.merge_component_index.
+    components = merge_component_index(lib_components, dd_components)
+    licenses = merge_license_index(lib_licenses, dd_licenses)
 
     vuln_entries, unscored = normalise_findings(findings, floor, per_cve=per_cve_mode())
     lic_entries = normalise_violations(violations)
@@ -1811,15 +2038,34 @@ def fetch_v3_desired(project_uuid: str, floor: float):
                     f"and a real finding vanishing because Mend has not scored it yet is the "
                     f"worse failure.")
 
+    # Which source each License Details link will come from. Every candidate field is optional
+    # in 3.0, so a license rendering without a link is a DATA fact, not a code fact -- and it has
+    # to be visible without a live debugging round.
+    link_report = license_link_report(licenses, components)
+    # Deliberately DEBUG-only, not a warning: Joshua confirmed the missing license URLs are a
+    # Mend-side data gap, not something a run should nag about every time.
+    logger.debug(f"[{fn()}] Project {project_uuid} license links -- "
+                 f"{len(link_report['license_url'])} from a license URL, "
+                 f"{len(link_report['library_page'])} from the library's Mend page, "
+                 f"{len(link_report['no_link'])} with none: {link_report}")
+
     desired = {}
     for key, entry in vuln_entries.items():
-        # licenses are indexed by LIBRARY, and `key` is not the library in per-CVE mode.
+        # licenses and components are indexed by LIBRARY, and `key` is not the library in
+        # per-CVE mode. The component index is a FALLBACK here: a finding's own component is
+        # authoritative and render_inputs only reaches for the index where the finding is blank.
         entry["licenses"] = licenses.get(entry["library"], [])
+        entry["component"] = components.get(entry["library"], {})
         desired[("vulnerability", key)] = entry
     for lib, entry in lic_entries.items():
         entry["licenses"] = licenses.get(lib, [])
+        # A license violation carries no component of its own (ProjectViolationDTOV3 has none),
+        # so its version/paths/home page come from the due-diligence index. {} when the library
+        # has no due-diligence row -- render_inputs then yields blanks and the renderer omits
+        # those lines rather than showing empty labels.
+        entry["component"] = components.get(lib, {})
         desired[("license", lib)] = entry
-    return desired, (findings_ok and violations_ok and licenses_ok)
+    return desired, (findings_ok and violations_ok and licenses_ok and libraries_ok)
 
 
 def extract_url(url: str) -> str:

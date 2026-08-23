@@ -396,7 +396,7 @@ def _drive(findings, azure, conf):
     with mock.patch.object(core, "conf", conf), \
          mock.patch.object(core, "call_azure_api", azure), \
          mock.patch.object(core, "fetch_v3_pages", side_effect=pages), \
-         mock.patch.object(core, "fetch_v3_licenses", return_value=({}, True)), \
+         mock.patch.object(core, "fetch_v3_licenses", return_value=({}, {}, True)), \
          mock.patch.object(core, "updated_wi", []), \
          mock.patch.object(core, "synced_projects", []):
         core.sync_project_v3(PROJECT, 7.0, [], "Task")

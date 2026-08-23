@@ -106,12 +106,15 @@ def test_desired_reads_stay_get_not_post():
             return [_finding()], True
         if "libraries/licenses" in api:
             return [], True
+        if api.endswith("dependencies/libraries"):
+            return [], True
         return [_violation()], True
 
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "fetch_v3_pages", fake_pages):
         core.fetch_v3_desired("p-1", 7.0)
-    assert methods == ["GET", "GET", "GET"]
+    # findings, violations, due-diligence licenses, and the library list.
+    assert methods == ["GET", "GET", "GET", "GET"]
 
 
 def _license_row(lib="log4j-core", name="MIT", url="https://opensource.org/licenses/MIT",
@@ -172,8 +175,12 @@ def test_a_successful_license_read_leaves_ok_true():
 def test_fetch_v3_licenses_normalises_and_reports_ok():
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "fetch_v3_pages", return_value=([_license_row()], True)):
-        index, ok = core.fetch_v3_licenses("p-1")
+        index, components, ok = core.fetch_v3_licenses("p-1")
     assert ok is True
+    assert components == {"log4j-core": {"version": "", "description": "",
+                                         "dependency_type": "", "dependency_file": "",
+                                         "library_path": "", "home_page": "",
+                                         "mend_url": ""}}
     assert index == {"log4j-core": [
         {"name": "MIT", "url": "https://opensource.org/licenses/MIT",
          "reference_file": "https://repo.maven.apache.org/log4j-core.pom"}]}
@@ -182,8 +189,9 @@ def test_fetch_v3_licenses_normalises_and_reports_ok():
 def test_fetch_v3_licenses_reports_failure():
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "fetch_v3_pages", return_value=([], False)):
-        index, ok = core.fetch_v3_licenses("p-1")
+        index, components, ok = core.fetch_v3_licenses("p-1")
     assert ok is False
+    assert (index, components) == ({}, {})
 
 
 def test_an_empty_project_is_ok_with_an_empty_desired():
