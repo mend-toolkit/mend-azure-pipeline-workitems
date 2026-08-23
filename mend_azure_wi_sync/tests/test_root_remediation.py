@@ -51,11 +51,25 @@ def test_the_major_series_comes_from_the_installed_versions_leading_component():
     assert result["fix"] == "none available in 2.x"
 
 
-def test_an_unparseable_version_falls_back_to_the_unqualified_wording():
-    """Never print a guessed series."""
+def test_an_unparseable_version_without_major_falls_back_to_unqualified():
+    """recommendedFix equals version, no major present. major="" bypasses the series check."""
     for version in ("", "latest", "v", "-"):
         result = source3.root_remediation(_entry(version=version, recommended=version, major=""))
         assert result["fix"] == "none available", version
+        assert result["major"] == ""
+
+
+def test_an_unparseable_version_with_major_rejects_the_guessed_series():
+    """recommendedFix equals version, major present. The series.isdigit() check MUST reject
+    unparseable leading components and not print them. version="latest" must never produce
+    "none available in latest.x" -- that would be false and misleading."""
+    for version in ("", "latest", "v", "-"):
+        result = source3.root_remediation(_entry(version=version, recommended=version,
+                                                  major="4.0.3"))
+        # The series-check must have rejected it and fallen back to the unqualified form
+        assert result["fix"] == "none available", f"version={version}: {result['fix']}"
+        # major must survive: the installed version is unparseable, but the major fix exists
+        assert result["major"] == "4.0.3", version
 
 
 def test_a_failed_fix_computation_is_reported_as_such():
