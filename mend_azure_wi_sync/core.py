@@ -769,8 +769,11 @@ def actual_work_items(project_name: str):
     return found
 
 
-def _patch_state(work_item_id, state: str, verb: str) -> bool:
-    """PATCH System.State and NOTHING else.
+def _patch_state(work_item_id, state: str, verb: str):
+    """PATCH System.State and NOTHING else. Returns (ok, unsupported_state).
+
+    `unsupported_state` tells the caller this exact failure was Azure rejecting the state NAME, so
+    another candidate is worth trying -- see _apply_state. Every other failure is final.
 
     Deliberately not a description rewrite: this path has no enrichment join, so rewriting the
     description would blank the EPSS and reachability columns (observed live), and a closed work
@@ -781,23 +784,121 @@ def _patch_state(work_item_id, state: str, verb: str) -> bool:
         response, errorcode = call_azure_api(api_type="PATCH", api=f"wit/workitems/{work_item_id}",
                                              data=data, project=conf.azure_project)
         if errorcode != 0:
-            logger.error(f"[{fn()}] Could not {verb} work item {work_item_id} to state "
-                         f"'{state}': {response}. This one item is left as it was; the run "
-                         f"continues.")
-            return False
+            unsupported = bool(_UNSUPPORTED_STATE.search(str(response)))
+            if unsupported:
+                # Not an error yet: the caller has another candidate to try. DEBUG, so a Scrum
+                # board's one rejected attempt per project does not read as a failure.
+                logger.debug(f"[{fn()}] Work item {work_item_id}: state '{state}' is not valid for "
+                             f"this project's process; trying the next known state.")
+            else:
+                logger.error(f"[{fn()}] Could not {verb} work item {work_item_id} to state "
+                             f"'{state}': {response}. This one item is left as it was; the run "
+                             f"continues.")
+            return False, unsupported
         logger.info(f"[{fn()}] Work item {work_item_id} {verb}d ({state})")
-        return True
+        return True, False
     except Exception as err:
         logger.error(f"[{ex()}] Could not {verb} work item {work_item_id}: {err}")
+        return False, False
+
+
+# The closed/reopen states of Azure DevOps's four out-of-box processes. Work item 8118 failed live
+# with "The field 'State' contains the value 'Closed' that is not in the list of supported values"
+# because MEND_CLOSEDSTATE was one global string and this customer runs two boards on different
+# processes.
+#
+#   | Process | States                                | Closed | Reopen   |
+#   | Agile   | New / Active / Resolved / Closed      | Closed | New      |
+#   | CMMI    | Proposed / Active / Resolved / Closed | Closed | Proposed |
+#   | Scrum   | New / Approved / Committed / Done     | Done   | New      |
+#   | Scrum   | To Do / In Progress / Done   (Task)   | Done   | To Do    |
+#   | Basic   | To Do / Doing / Done                  | Done   | To Do    |
+#
+# So closure needs only two values and reopen three -- no state-discovery API call. A DERIVED
+# process that renames the state is the operator's job to declare via MEND_CLOSEDSTATE /
+# MEND_REOPENSTATE, and an explicit value is then used ALONE: never followed by a fallback guess,
+# because an operator who says "Retired" did not ask for "Closed".
+CLOSED_STATE_CANDIDATES = ("Closed", "Done")
+REOPEN_STATE_CANDIDATES = ("New", "To Do", "Proposed")
+
+# {(azure_project, verb): the state Azure accepted}. A Scrum board pays ONE rejected PATCH on its
+# first closed item and none afterwards; without it, every closed item in every run pays one.
+# Keyed by PROJECT because MEND_ROUTING sends different Mend projects to different Azure projects,
+# which can sit on different processes -- one global answer would apply Scrum's state to an Agile
+# board.
+STATE_RESOLVED = {}
+
+# The ONE error that means "wrong state NAME, try another". A refused TRANSITION or a missing
+# required field is a 400 too, and retrying those would issue a second bad write against a work
+# item whose state name was perfectly legal.
+_UNSUPPORTED_STATE = re.compile(r"not in the list of supported values", re.IGNORECASE)
+
+
+def state_candidates(configured, defaults) -> list:
+    """A configured state -> the ordered list of values to try.
+
+    An explicit value is returned ALONE. Unset, blank, or an unexpanded Azure placeholder
+    ("$(MEND_CLOSEDSTATE)", which Config.update_properties normally blanks) yields every default
+    candidate in order.
+    """
+    text = str(configured or "").strip()
+    if not text or re.match(r"^\$\(.+\)$", text):
+        return list(defaults)
+    return [text]
+
+
+def closed_state_candidates() -> list:
+    """MEND_CLOSEDSTATE -> the states closure may try, in order."""
+    return state_candidates(getattr(conf, "closed_state", ""), CLOSED_STATE_CANDIDATES)
+
+
+def reopen_state_candidates() -> list:
+    """MEND_REOPENSTATE -> the states reopen may try, in order.
+
+    Three candidates, not two: Scrum uses "New" for a Product Backlog Item but "To Do" for a Task,
+    so the same process needs both depending on MEND_AZURETYPE.
+    """
+    return state_candidates(getattr(conf, "reopen_state", ""), REOPEN_STATE_CANDIDATES)
+
+
+def _apply_state(work_item_id, states, verb: str, env_var: str) -> bool:
+    """PATCH the first state Azure accepts, remembering the winner for this project.
+
+    `states` is a list of candidates or a single string (a bare string keeps the old
+    one-attempt-no-fallback behaviour, which is what an explicit MEND_CLOSEDSTATE resolves to).
+
+    Only an unsupported-state 400 advances to the next candidate -- see _UNSUPPORTED_STATE. Any
+    other failure returns immediately, so one bad work item never triggers a sweep of guesses.
+    """
+    candidates = [states] if isinstance(states, str) else list(states)
+    if not candidates:
         return False
+    cache_key = (getattr(conf, "azure_project", ""), verb)
+    remembered = STATE_RESOLVED.get(cache_key)
+    if remembered in candidates:
+        # Try the known-good one first, but keep the rest: a project can be reconfigured mid-life.
+        candidates = [remembered] + [c for c in candidates if c != remembered]
+
+    for state in candidates:
+        ok, unsupported = _patch_state(work_item_id, state, verb)
+        if ok:
+            STATE_RESOLVED[cache_key] = state
+            return True
+        if not unsupported:
+            return False
+    logger.error(f"[{fn()}] Could not {verb} work item {work_item_id}: Azure rejected every state "
+                 f"this process is known to use ({', '.join(candidates)}). If this board runs a "
+                 f"derived process with a renamed state, set {env_var} to it. This one item is "
+                 f"left as it was; the run continues.")
+    return False
 
 
-def apply_close(work_item_id, state: str) -> bool:
-    return _patch_state(work_item_id, state, "close")
+def apply_close(work_item_id, state) -> bool:
+    return _apply_state(work_item_id, state, "close", "MEND_CLOSEDSTATE")
 
 
-def apply_reopen(work_item_id, state: str) -> bool:
-    return _patch_state(work_item_id, state, "reopen")
+def apply_reopen(work_item_id, state) -> bool:
+    return _apply_state(work_item_id, state, "reopen", "MEND_REOPENSTATE")
 
 
 def per_cve_mode() -> bool:
@@ -848,8 +949,11 @@ def reconcile_project(project, floor=None, desired=None, ok=None):
     every work item between the two thresholds created, closed and re-created every run.
     """
     project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
-    closed_state = normalise_state(getattr(conf, "closed_state", ""), "Closed")
-    reopen_state = normalise_state(getattr(conf, "reopen_state", ""), "New")
+    # Candidate LISTS, not single states: Azure's four out-of-box processes disagree about what
+    # "closed" is called, and an unset MEND_CLOSEDSTATE must work on all of them. An explicit
+    # value resolves to a one-item list and is never second-guessed.
+    closed_state = closed_state_candidates()
+    reopen_state = reopen_state_candidates()
     if floor is None:
         floor = run_severity_floor()
 
@@ -2274,18 +2378,6 @@ def mend_api_url() -> str:
     if host.startswith("api-"):
         return normalised
     return f"https://api-{host}"
-
-
-def normalise_state(raw, default: str) -> str:
-    """A work item state name, falling back to `default` for an unset or placeholder value.
-
-    Never returns "": Azure rejects an empty System.State, which would fail every close in the
-    run and look like a permissions problem.
-    """
-    text = str(raw or "").strip()
-    if not text or re.match(r"\$\(.+\)$", text):
-        return default
-    return text
 
 
 def startup():

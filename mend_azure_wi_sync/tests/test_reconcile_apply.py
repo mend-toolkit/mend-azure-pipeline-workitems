@@ -15,16 +15,20 @@ def test_config_carries_both_fields():
 
 
 def test_unset_states_take_the_documented_defaults():
-    """An unexpanded $(MEND_CLOSEDSTATE) must become the default, not empty -- an empty
-    System.State would be rejected by Azure on every close."""
+    """An unexpanded $(MEND_CLOSEDSTATE) must never reach Azure as an empty System.State, which
+    would fail every close and look like a permissions problem.
+
+    normalise_state used to do this and is gone: state_candidates subsumes it, because one default
+    is not enough when Azure's four out-of-box processes disagree about the name. See
+    test_state_candidates.py."""
     for raw in ("", "$(MEND_CLOSEDSTATE)"):
-        assert core.normalise_state(raw, "Closed") == "Closed"
-        assert core.normalise_state(raw, "New") == "New"
+        assert core.state_candidates(raw, core.CLOSED_STATE_CANDIDATES)[0] == "Closed"
+        assert core.state_candidates(raw, core.REOPEN_STATE_CANDIDATES)[0] == "New"
 
 
 def test_an_explicit_state_wins():
-    assert core.normalise_state("Done", "Closed") == "Done"
-    assert core.normalise_state("  To Do  ", "New") == "To Do"
+    assert core.state_candidates("Done", core.CLOSED_STATE_CANDIDATES) == ["Done"]
+    assert core.state_candidates("  To Do  ", core.REOPEN_STATE_CANDIDATES) == ["To Do"]
 
 
 TAGS = "ProductX/api; security vulnerability"
@@ -182,7 +186,12 @@ def test_an_incomplete_read_still_reopens():
                                                                            "state": "Closed"}}), \
          mock.patch.object(core, "apply_reopen", lambda *a: reopens.append(a) or True):
         stats = core.reconcile_project(PROJECT)
-    assert reopens == [(42, "New")]
+    # reconcile_project passes a CANDIDATE LIST now, not a bare state: Azure's four
+    # out-of-box processes disagree about what "closed" is called (work item 8118 failed
+    # live for exactly that reason). These fixtures set MEND_CLOSEDSTATE/MEND_REOPENSTATE
+    # explicitly, and an explicit value resolves to a ONE-ITEM list -- never followed by a
+    # fallback guess.
+    assert reopens == [(42, ["New"])]
     assert stats[3] == 1
 
 
@@ -195,7 +204,12 @@ def test_a_complete_read_does_close():
                                                                            "state": "Active"}}), \
          mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
         stats = core.reconcile_project(PROJECT)
-    assert closes == [(42, "Closed")]
+    # reconcile_project passes a CANDIDATE LIST now, not a bare state: Azure's four
+    # out-of-box processes disagree about what "closed" is called (work item 8118 failed
+    # live for exactly that reason). These fixtures set MEND_CLOSEDSTATE/MEND_REOPENSTATE
+    # explicitly, and an explicit value resolves to a ONE-ITEM list -- never followed by a
+    # fallback guess.
+    assert closes == [(42, ["Closed"])]
     assert stats[2] == 1
 
 
@@ -343,7 +357,12 @@ def test_an_empty_desired_still_closes_everything():
          mock.patch.object(core, "actual_work_items", return_value=_actual_two()), \
          mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
         stats = core.reconcile_project(PROJECT)
-    assert sorted(closes) == [(42, "Closed"), (43, "Closed")]
+    # reconcile_project passes a CANDIDATE LIST now, not a bare state: Azure's four
+    # out-of-box processes disagree about what "closed" is called (work item 8118 failed
+    # live for exactly that reason). These fixtures set MEND_CLOSEDSTATE/MEND_REOPENSTATE
+    # explicitly, and an explicit value resolves to a ONE-ITEM list -- never followed by a
+    # fallback guess.
+    assert sorted(closes) == [(42, ["Closed"]), (43, ["Closed"])]
     assert stats[2] == 2
 
 
@@ -356,7 +375,12 @@ def test_a_partial_overlap_closes_only_the_missing_one():
          mock.patch.object(core, "actual_work_items", return_value=_actual_two()), \
          mock.patch.object(core, "apply_close", lambda *a: closes.append(a) or True):
         stats = core.reconcile_project(PROJECT)
-    assert closes == [(43, "Closed")]
+    # reconcile_project passes a CANDIDATE LIST now, not a bare state: Azure's four
+    # out-of-box processes disagree about what "closed" is called (work item 8118 failed
+    # live for exactly that reason). These fixtures set MEND_CLOSEDSTATE/MEND_REOPENSTATE
+    # explicitly, and an explicit value resolves to a ONE-ITEM list -- never followed by a
+    # fallback guess.
+    assert closes == [(43, ["Closed"])]
     assert stats[2] == 1
 
 

@@ -15,14 +15,26 @@ REOPEN = "reopen"
 SKIP = "skip"
 
 
-def _is_closed(state, closed_state: str) -> bool:
-    """Case-insensitive: Azure returns state names as the process defines them, and a case
-    mismatch would turn a skip into a close, then a reopen, then a close -- an item flapping
-    on every run."""
-    return str(state or "").strip().casefold() == str(closed_state or "").strip().casefold()
+def _is_closed(state, closed_state) -> bool:
+    """Is this work item already in a closed state?
+
+    `closed_state` is one name or a collection of them. A collection is the normal case now:
+    Azure's out-of-box processes call it "Closed" (Agile, CMMI) or "Done" (Scrum, Basic), and an
+    unset MEND_CLOSEDSTATE has to work on all four. Matching against every candidate also FIXES a
+    latent bug -- with a single "Closed" configured, a Scrum board's Done item was not recognised
+    as closed, so every run tried to close it again and a returning finding never reopened it.
+
+    Case-insensitive: Azure returns state names as the process defines them, and a case mismatch
+    would turn a skip into a close, then a reopen, then a close -- an item flapping every run.
+    """
+    current = str(state or "").strip().casefold()
+    if not current:
+        return False
+    names = [closed_state] if isinstance(closed_state, str) else (closed_state or [])
+    return any(current == str(name or "").strip().casefold() for name in names)
 
 
-def plan_actions(desired, actual, closed_state: str):
+def plan_actions(desired, actual, closed_state):
     """One action per work item key. Keys are (kind, identity-key) -- the identity being the
     library in MEND_DEPENDENCY=true mode and "{cve}|{library}" in per-CVE mode, since that mode
     puts one CVE on each work item. This module never inspects a key; it only matches the two
