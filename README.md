@@ -207,7 +207,7 @@ Closing sets the Work Item's `System.State` to `MEND_CLOSEDSTATE` (default `Clos
 
 >**_NOTE_**: Reconciliation identifies Work Items by their **title** and by the `{product}/{project}` tag the integration writes. A Work Item whose title was hand-edited is no longer recognised, and will neither be updated nor closed — a second Work Item is created for the finding instead. Do not rename the titles the integration generates.
 
->**_NOTE_**: In `MEND_DEPENDENCY: true` (the default) one Work Item covers one library, so it is closed only once **every** vulnerability in that library is gone. In `MEND_DEPENDENCY: false` one Work Item is one CVE and is closed as soon as that CVE is gone.
+>**_NOTE_**: In `MEND_DEPENDENCY: true` (the default) one Work Item covers one root library and every vulnerable library beneath it, so it is closed only once **every** vulnerability in that group is gone. In `MEND_DEPENDENCY: false` one Work Item is one CVE and is closed as soon as that CVE is gone.
 <br />
 
 ## Unchanged Work Items and State Preservation
