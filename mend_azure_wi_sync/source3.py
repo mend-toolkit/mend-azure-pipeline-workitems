@@ -525,6 +525,55 @@ def normalise_root_libraries(rows) -> dict:
     return index
 
 
+def root_remediation(entry) -> dict:
+    """A root index entry -> {"fix", "major", "note"}, the words the work item shows.
+
+    Four states, because recommendedFix frequently EQUALS the installed version and that means
+    "no fix inside the current major" rather than "upgrade to what you already have":
+
+      recommendedFix differs, major present -> "4.22.2"                / "5.2.1"
+      recommendedFix differs, no major      -> "1.19.0"                / ""
+      recommendedFix equals,  major present -> "none available in 2.x" / "4.0.3"
+      recommendedFix equals,  no major      -> "none available"        / ""
+
+    Six of ten roots in the sampled project were in the bottom two states, so they are the common
+    case, not the edge.
+
+    An EMPTY entry returns all-empty rather than "none available": a root missing from the index is
+    a read we did not make, and claiming "no fix available" would assert something we never saw.
+    The renderer omits empty lines.
+
+    suggestedFixFailed becomes a note -- "Mend tried and could not" is a different fact from "there
+    is nothing to do".
+
+    Mend does not publish which CVEs a root version fixes (spec: "The API limitation"), so nothing
+    here may be phrased as per-CVE coverage.
+    """
+    if not isinstance(entry, dict) or not entry:
+        return {"fix": "", "major": "", "note": ""}
+    version = str(entry.get("version") or "").strip()
+    recommended = str(entry.get("recommended_fix") or "").strip()
+    major = str(entry.get("major_fix") or "").strip()
+
+    if recommended and recommended != version:
+        # recommended differs from version: use the recommended fix
+        fix = recommended
+    elif not recommended:
+        # recommended is empty/missing: treat as no fix
+        fix = "none available"
+    else:
+        # recommended equals version: check for major fix to qualify the message
+        if major:
+            series = version.split(".")[0].strip() if version else ""
+            # Only a numeric leading component names a series; anything else prints no guess.
+            fix = f"none available in {series}.x" if series.isdigit() else "none available"
+        else:
+            fix = "none available"
+
+    note = "Mend could not compute a fix for this library." if entry.get("fix_failed") else ""
+    return {"fix": fix, "major": major, "note": note}
+
+
 def try_or_error_int(value) -> int:
     """An integer or 0. Local to this module because source3 is pure and cannot import core's
     try_or_error."""
