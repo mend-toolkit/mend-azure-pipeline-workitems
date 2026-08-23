@@ -114,6 +114,9 @@ def test_when_every_candidate_is_rejected_the_error_names_all_of_them(caplog):
             assert core.apply_close(42, ["Closed", "Done"]) is False
     assert "Closed" in caplog.text and "Done" in caplog.text
     assert "MEND_CLOSEDSTATE" in caplog.text
+    # Which board, so an operator running 107 projects does not have to look up work item 42.
+    assert "TestProj" in caplog.text
+    assert "Task" in caplog.text
 
 
 def test_an_explicit_state_is_attempted_once_and_never_followed_by_a_guess():

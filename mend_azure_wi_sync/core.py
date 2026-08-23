@@ -886,10 +886,14 @@ def _apply_state(work_item_id, states, verb: str, env_var: str) -> bool:
             return True
         if not unsupported:
             return False
-    logger.error(f"[{fn()}] Could not {verb} work item {work_item_id}: Azure rejected every state "
-                 f"this process is known to use ({', '.join(candidates)}). If this board runs a "
-                 f"derived process with a renamed state, set {env_var} to it. This one item is "
-                 f"left as it was; the run continues.")
+    # The Azure PROJECT is in the message deliberately: at 107 projects, "work item 8118" alone
+    # makes an operator go and look up which board they need to reconfigure.
+    logger.error(f"[{fn()}] Could not {verb} work item {work_item_id} in Azure project "
+                 f"'{getattr(conf, 'azure_project', '')}' (work item type "
+                 f"'{getattr(conf, 'azure_type', '')}'): Azure rejected every state this process "
+                 f"is known to use ({', '.join(candidates)}). If this board runs a derived process "
+                 f"with a renamed state, set {env_var} to it. This one item is left as it was; the "
+                 f"run continues.")
     return False
 
 
