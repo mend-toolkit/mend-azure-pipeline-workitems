@@ -837,14 +837,31 @@ _UNSUPPORTED_STATE = re.compile(r"not in the list of supported values", re.IGNOR
 def state_candidates(configured, defaults) -> list:
     """A configured state -> the ordered list of values to try.
 
-    An explicit value is returned ALONE. Unset, blank, or an unexpanded Azure placeholder
-    ("$(MEND_CLOSEDSTATE)", which Config.update_properties normally blanks) yields every default
-    candidate in order.
+    Unset, blank, or an unexpanded Azure placeholder ("$(MEND_CLOSEDSTATE)", which
+    Config.update_properties normally blanks) yields every default candidate in order.
+
+    An explicit value is returned ALONE -- what an operator lists is what gets tried, never
+    extended with the defaults. It may be a COMMA-SEPARATED list, tried in order, which is what
+    makes one global variable serve a MIXED fleet: with a derived board wanting "Retired" and an
+    Agile board wanting "Closed", neither "" nor "Retired" alone can satisfy both, but
+    "Retired,Closed" does. Same convention MEND_BRANCHES uses.
+
+    Empty entries are dropped -- Azure rejects an empty System.State, so a trailing comma must not
+    become an attempt -- and duplicates are collapsed case-insensitively, keeping first position,
+    because a repeat is only a second rejected write.
     """
     text = str(configured or "").strip()
     if not text or re.match(r"^\$\(.+\)$", text):
         return list(defaults)
-    return [text]
+    states, seen = [], set()
+    for part in text.split(","):
+        name = part.strip()
+        if not name or name.casefold() in seen:
+            continue
+        seen.add(name.casefold())
+        states.append(name)
+    # Nothing but separators is as good as unset; falling back beats sending nothing to Azure.
+    return states or list(defaults)
 
 
 def closed_state_candidates() -> list:

@@ -239,3 +239,71 @@ def test_an_empty_or_missing_state_is_never_treated_as_closed():
     from mend_azure_wi_sync import reconcile
     for state in ("", "   ", None):
         assert reconcile._is_closed(state, ["Closed", "Done"]) is False
+
+
+# ------------------------------------------------- a comma-separated list, for a MIXED fleet
+#
+# MEND_CLOSEDSTATE is one global variable, and an explicit value is used alone. That combination
+# cannot serve a fleet where one board runs a DERIVED process with a renamed state and another runs
+# an out-of-box one: unset fails the derived board, and setting "Retired" fails the Agile board
+# because explicit means no fallback. A list fixes it without per-board configuration, and matches
+# the convention MEND_BRANCHES already uses.
+
+def test_a_comma_separated_list_is_tried_in_order():
+    assert core.state_candidates("Retired,Closed", core.CLOSED_STATE_CANDIDATES) \
+        == ["Retired", "Closed"]
+
+
+def test_whitespace_around_each_entry_is_stripped():
+    assert core.state_candidates("  Retired , Done  ", core.CLOSED_STATE_CANDIDATES) \
+        == ["Retired", "Done"]
+
+
+def test_empty_entries_are_dropped_rather_than_sent_to_azure():
+    """An empty System.State is rejected by Azure, so a trailing comma must not become an attempt."""
+    assert core.state_candidates("Retired,,Closed,", core.CLOSED_STATE_CANDIDATES) \
+        == ["Retired", "Closed"]
+
+
+def test_a_list_of_nothing_but_separators_falls_back_to_the_defaults():
+    for raw in (",", ",,,", "  ,  , "):
+        assert core.state_candidates(raw, core.CLOSED_STATE_CANDIDATES) == ["Closed", "Done"], raw
+
+
+def test_duplicates_are_collapsed_keeping_first_position():
+    """Two attempts at the same state would just be a second rejected write."""
+    assert core.state_candidates("Done,Closed,Done", core.CLOSED_STATE_CANDIDATES) \
+        == ["Done", "Closed"]
+
+
+def test_duplicates_differing_only_in_case_are_collapsed_too():
+    assert core.state_candidates("Done,DONE,done", core.CLOSED_STATE_CANDIDATES) == ["Done"]
+
+
+def test_an_explicit_list_is_still_never_extended_with_the_defaults():
+    """The escape hatch's contract is unchanged: what an operator lists is what gets tried."""
+    result = core.state_candidates("Retired,Archived", core.CLOSED_STATE_CANDIDATES)
+    assert result == ["Retired", "Archived"]
+    assert "Closed" not in result and "Done" not in result
+
+
+def test_a_single_value_is_unaffected_by_list_support():
+    assert core.state_candidates("Retired", core.CLOSED_STATE_CANDIDATES) == ["Retired"]
+
+
+def test_a_mixed_fleet_closes_on_the_second_configured_state():
+    """The scenario this exists for: a derived board wants 'Retired', an Agile board wants
+    'Closed', and one variable now serves both."""
+    with mock.patch.object(core, "conf", _conf(closed_state="Retired,Closed")), \
+         mock.patch.object(core, "STATE_RESOLVED", {}), \
+         _patch_results((UNSUPPORTED, 2), ({"id": 42}, 0)) as api:
+        assert core.apply_close(42, core.closed_state_candidates()) is True
+    assert _states_sent(api) == ["Retired", "Closed"]
+
+
+def test_the_reopen_variable_takes_a_list_too():
+    with mock.patch.object(core, "conf", _conf(reopen_state="Reopened,New")), \
+         mock.patch.object(core, "STATE_RESOLVED", {}), \
+         _patch_results((UNSUPPORTED, 2), ({"id": 42}, 0)) as api:
+        assert core.apply_reopen(42, core.reopen_state_candidates()) is True
+    assert _states_sent(api) == ["Reopened", "New"]
