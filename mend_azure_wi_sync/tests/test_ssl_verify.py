@@ -5,9 +5,14 @@ InsecureRequestWarning for api-saas.mend.io and dev.azure.com. Nothing here need
 installed: requests ships the certifi CA bundle and both hosts serve publicly trusted certs, so an
 Azure DevOps hosted agent validates them with no configuration at all.
 
-MEND_SSLVERIFY exists for the case this tool cannot see -- a self-hosted runner behind a
-TLS-inspecting proxy, where the presented cert is the proxy's. "false" restores the old unverified
-behaviour, and a path supplies a CA bundle. Neither is needed on a hosted agent.
+MEND_SSLVERIFY is a BOOLEAN and nothing more. "false" restores the old unverified behaviour and is
+the escape hatch if verification ever fails on a self-hosted runner -- one variable instead of a
+code change and a release.
+
+It deliberately does NOT accept a CA bundle path. requests already honours REQUESTS_CA_BUNDLE
+whenever verify is True (sessions.py:855-860), so a self-hosted agent behind a TLS-inspecting proxy
+is served by upstream's own tested code rather than by a branch here that nobody can exercise. A
+path passed to MEND_SSLVERIFY therefore VERIFIES and says so, rather than silently doing nothing.
 
 When verification IS off, the warning is suppressed once at source rather than logged per call:
 the previous code caught and logged it in three transports and MISSED the 2.0 login, which is why
@@ -45,8 +50,12 @@ def test_false_means_do_not_verify():
         assert core.verify_setting(raw) is False, raw
 
 
-def test_a_path_is_passed_through_as_a_ca_bundle():
-    assert core.verify_setting("/etc/ssl/corp-ca.pem") == "/etc/ssl/corp-ca.pem"
+def test_a_path_verifies_and_points_the_operator_at_requests_ca_bundle(caplog):
+    """Not supported here, and silence would be the worst outcome: an operator would think they
+    had configured a trust store and get default verification instead."""
+    with caplog.at_level("WARNING"):
+        assert core.verify_setting("/etc/ssl/corp-ca.pem") is True
+    assert "REQUESTS_CA_BUNDLE" in caplog.text
 
 
 def test_an_unexpanded_azure_placeholder_falls_back_to_verify():
@@ -104,12 +113,16 @@ def test_setting_it_false_restores_the_unverified_behaviour():
     assert get.call_args.kwargs["verify"] is False
 
 
-def test_a_ca_bundle_path_reaches_requests_verbatim():
-    with mock.patch.object(core, "conf", _conf(ssl_verify="/etc/ssl/corp-ca.pem")), \
+def test_requests_ca_bundle_is_what_supplies_a_trust_store(monkeypatch):
+    """The self-hosted-proxy path, handled entirely by requests: verify stays True and requests
+    swaps in the bundle itself. Nothing in this tool has to know about it."""
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/ssl/corp-ca.pem")
+    with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core.requests, "get") as get:
         get.return_value = mock.MagicMock(status_code=200, text="{}")
         core._get_v2("https://api-saas.mend.io/api/v3.0/x", "tok", {})
-    assert get.call_args.kwargs["verify"] == "/etc/ssl/corp-ca.pem"
+    # requests resolves the env var downstream of this call; the tool must not override it.
+    assert get.call_args.kwargs["verify"] is True
 
 
 # --------------------------------------------------------------- a verification failure is loud

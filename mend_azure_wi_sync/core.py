@@ -214,19 +214,20 @@ def _silence_tls_warnings():
 
 
 def verify_setting(raw=None):
-    """MEND_SSLVERIFY -> what requests should use for `verify`.
+    """MEND_SSLVERIFY -> True or False, the `verify` argument for every request this tool makes.
 
-    Returns True (validate against the certifi bundle requests ships), False (do not validate), or
-    a path to a CA bundle. `raw` defaults to reading conf, so call sites need no argument.
+    A BOOLEAN, deliberately -- no CA bundle path. requests already honours REQUESTS_CA_BUNDLE and
+    CURL_CA_BUNDLE whenever verify is True (sessions.py:855-860), so a self-hosted agent behind a
+    TLS-inspecting proxy is served by upstream's tested code instead of a branch here that cannot
+    be exercised in this project's environment. A path passed in verifies and logs where to put it.
 
-    NOTHING has to be installed for the default: api-saas.mend.io and dev.azure.com serve publicly
-    trusted certificates and an Azure DevOps hosted agent validates them out of the box. The
-    variable exists for what this tool cannot see -- a self-hosted runner behind a TLS-inspecting
-    proxy, where the presented certificate is the proxy's.
+    Nothing has to be installed for the default: api-saas.mend.io and dev.azure.com serve publicly
+    trusted certificates, so certifi validates them out of the box. `false` is the escape hatch if
+    verification ever fails on a self-hosted runner -- one variable rather than a code change.
 
     Anything unrecognised verifies. A typo must never be the thing that silently disables TLS
     validation, so only an explicit false/no/0 turns it off, and an unexpanded Azure placeholder
-    ("$(MEND_SSLVERIFY)") is not mistaken for a bundle path.
+    ("$(MEND_SSLVERIFY)") is not read as a value.
     """
     if raw is None:
         raw = getattr(conf, "ssl_verify", "") if conf else ""
@@ -241,8 +242,14 @@ def verify_setting(raw=None):
         return False
     if lowered in ("true", "yes", "1"):
         return True
-    # A path is the only remaining meaning; anything else is a typo and verifies.
-    return text if ("/" in text or "\\" in text or "." in text) else True
+    if "/" in text or "\\" in text:
+        # Looks like somebody expected a CA bundle here. Verifying anyway is the safe outcome, but
+        # doing it silently would leave them believing they had configured a trust store.
+        logger.warning(f"[{fn()}] MEND_SSLVERIFY is a true/false switch and does not take a "
+                       f"path, so '{text}' is ignored and certificates ARE being verified. To "
+                       f"supply a CA bundle for a TLS-inspecting proxy, set REQUESTS_CA_BUNDLE "
+                       f"to that path instead -- requests reads it directly.")
+    return True
 
 
 def ssl_error_hint(host_desc: str, err) -> str:
@@ -250,8 +257,9 @@ def ssl_error_hint(host_desc: str, err) -> str:
     run. It has to name the variable that restores the old behaviour, or an operator is left
     reading a stack trace about handshakes."""
     return (f"TLS certificate verification failed for {host_desc}: {err}. If this runs behind a "
-            f"TLS-inspecting proxy, set MEND_SSLVERIFY to the proxy's CA bundle path, or to "
-            f"'false' to skip verification as previous versions did.")
+            f"TLS-inspecting proxy, set REQUESTS_CA_BUNDLE to the proxy's CA bundle path "
+            f"(requests reads it directly), or set MEND_SSLVERIFY=false to skip verification as "
+            f"previous versions did.")
 
 
 def _post_v2_login():
