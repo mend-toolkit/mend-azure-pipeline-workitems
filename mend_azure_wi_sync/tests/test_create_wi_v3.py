@@ -248,9 +248,15 @@ def test_a_library_name_containing_a_colon_decodes_in_per_cve_mode():
 def test_colon_library_round_trips_from_desired_through_the_title_and_back_dependency_mode():
     """The full loop for a Maven coordinate: the key source3 builds `desired` on -> the title
     create_wi_v3 renders -> the key classify_title decodes. The first and last must be equal or
-    reconciliation reads the live work item as an orphan and closes it."""
+    reconciliation reads the live work item as an orphan and closes it.
+
+    Dependency mode keys on the ROOT library (Task 1: root-library grouping), so the finding's own
+    root is set to the colon-bearing coordinate itself -- a direct Maven dependency is its own
+    root -- rather than relying on the `_finding` helper's default "app" root."""
     conf = _conf()
     finding = _finding(cve="CVE-2021-44228", score=10.0, lib="org.apache:log4j")
+    finding["dependencyContexts"] = [{"isDirect": True, "directRoots": [
+        {"rootLibraryName": "org.apache:log4j", "rootLibraryVersion": "1.0.0"}]}]
     entries, _ = source3.normalise_findings([finding], 0.0, per_cve=False)
     assert list(entries) == ["org.apache:log4j"]
     with mock.patch.object(core, "conf", conf):

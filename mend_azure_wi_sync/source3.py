@@ -83,6 +83,45 @@ def _walk(obj, *path):
     return obj
 
 
+def root_names(finding: dict) -> list:
+    """Every distinct root library a finding is reachable from, sorted.
+
+    A ROOT is a direct dependency of the project -- the thing an operator can actually change. A
+    transitive library reachable from three roots yields three names, and the finding is filed under
+    each: whoever owns express needs to see everything upgrading express would fix, and so does
+    whoever owns webpack.
+
+    Read from dependencyContexts[].directRoots[] (DirectRootDTOV3), which is ALREADY in the
+    findings response -- the grouping costs no extra call. Several contexts can each carry roots:
+    body-parser-1.18.3.tgz is both a DIRECT dependency (root = itself) and TRANSITIVE via express,
+    and both are real.
+
+    A finding with no usable context falls back to its own component name, so it becomes its own
+    root rather than vanishing: a work item that should exist and does not is strictly worse than
+    one filed under the library itself. Returns [] only when there is no name to use at all.
+
+    Sorted, not first-seen: first-seen is Mend's API order, which is not stable between runs, and
+    an unstable grouping rewrites every work item in the project when it reshuffles.
+    """
+    names = set()
+    if isinstance(finding, dict):
+        contexts = finding.get("dependencyContexts")
+        if isinstance(contexts, list):
+            for context in contexts:
+                if not isinstance(context, dict):
+                    continue
+                roots = context.get("directRoots")
+                if not isinstance(roots, list):
+                    continue
+                for root in roots:
+                    if isinstance(root, dict) and root.get("rootLibraryName"):
+                        names.add(root["rootLibraryName"])
+    if names:
+        return sorted(names)
+    own = _walk(finding, "component", "name") if isinstance(finding, dict) else None
+    return [own] if own else []
+
+
 def normalise_findings(findings, floor: float, per_cve: bool = False):
     """3.0 security findings -> ({identity_key: entry}, unscored_count).
 
@@ -96,7 +135,8 @@ def normalise_findings(findings, floor: float, per_cve: bool = False):
     `per_cve` is MEND_DEPENDENCY=false and it changes the GROUPING, because in that mode one work
     item is one CVE rather than one library, and the key must be the work item's identity or
     reconciliation cannot find it:
-      - False -> key is the library name; every CVE of a library shares one entry.
+      - False -> key is the ROOT LIBRARY name (see root_names); every finding reachable from that
+                 root shares one entry, and a finding with several roots appears under each.
       - True  -> key is "{cve}|{library}" (identity.cve_key); one entry per CVE per library. Both
                  halves are in the key: the CVE alone collides when one CVE hits two libraries in
                  a project, the library alone is dependency mode.
@@ -122,16 +162,23 @@ def normalise_findings(findings, floor: float, per_cve: bool = False):
         score = _walk(finding, "vulnerability", "score")
         if not meets_threshold(score, floor):
             continue
-        key = lib
+        if score is None or score == "":
+            # Counted once per FINDING, not once per root: this tally is a project-level report.
+            unscored += 1
         if per_cve:
             cve = _walk(finding, "vulnerability", "name")
             if not cve:
                 continue
-            key = cve_key(cve, lib)
-        if score is None or score == "":
-            unscored += 1
-        entry = entries.setdefault(key, {"library": lib, "kind": "vulnerability", "findings": []})
-        entry["findings"].append(finding)
+            entry = entries.setdefault(cve_key(cve, lib),
+                                       {"library": lib, "kind": "vulnerability", "findings": []})
+            entry["findings"].append(finding)
+            continue
+        # Dependency mode groups by ROOT library. One finding reachable from several roots is
+        # filed under each -- see root_names.
+        for root in root_names(finding):
+            entry = entries.setdefault(root, {"library": root, "kind": "vulnerability",
+                                              "findings": []})
+            entry["findings"].append(finding)
     return entries, unscored
 
 
