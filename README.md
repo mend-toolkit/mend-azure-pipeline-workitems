@@ -312,7 +312,7 @@ Both of these are long-standing `MEND:` resolution behaviours, not new — but t
 
 **1. `findings.X` resolves against the LAST finding, not the first and not the most severe.**
 
-In the default `MEND_DEPENDENCY: true` mode, one Work Item covers a whole library, and `findings` is a *list*. A path through it resolves against **whichever finding Mend returned last** — which is arbitrary. It is *not* the first finding, and it is *not* the highest-severity one:
+In the default `MEND_DEPENDENCY: true` mode, one Work Item covers a whole root library and every vulnerable library beneath it, and `findings` is a *list*. A path through it resolves against **whichever finding Mend returned last** — which is arbitrary. It is *not* the first finding, and it is *not* the highest-severity one:
 
 ```
 entry.findings = [ CVE-2020-8203 (7.4, HIGH),
