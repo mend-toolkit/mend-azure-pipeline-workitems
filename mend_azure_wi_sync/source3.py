@@ -749,6 +749,10 @@ def _vulnerability_row(finding: dict) -> dict:
         "fix_date": top_fix.get("date") or "",
         "fix_url": top_fix.get("url") or "",
         "publish_date": vuln.get("publishDate") or "",
+        "library": _walk(finding, "component", "name") or "",
+        "dependency_type": _dependency_type(
+            _walk(finding, "component") if isinstance(_walk(finding, "component"), dict) else {},
+            finding),
     }
 
 
@@ -758,21 +762,30 @@ def _vulnerabilities(findings: list) -> list:
     An operator scans this table top-down, so the most severe, comparable finding must lead.
     0.0 is a real score (sorts normally); None/"" is unscored and always sorts after every
     scored row, regardless of value.
+
+    The row's `library` is a second tiebreaker, after the CVE name. Under root grouping a single
+    work item can hold the SAME CVE for two different library versions (live:
+    CVE-2022-25883 on both semver-5.7.0.tgz and semver-5.6.0.tgz, both scored 5.3) -- those two
+    rows tie on (band, score, name) too, and without `library` they fall through to whatever
+    order the Mend API happened to return them in, which is NOT stable between runs. That is
+    exactly the spurious-rewrite bug fixed in 5c53f8a, reintroduced one level up.
     """
     rows = [_vulnerability_row(f) for f in findings]
 
     def sort_key(row):
-        # The CVE name is the tiebreaker, and it is what makes this deterministic. Without it,
-        # two findings with equal scores keep whatever order the Mend API returned them in, and a
-        # reshuffle between runs rewrites every work item in the project for no reason.
+        # The CVE name is the primary tiebreaker, and `library` the secondary one -- together they
+        # make this deterministic even when two rows share both a CVE and a score. Without them,
+        # two such findings keep whatever order the Mend API returned them in, and a reshuffle
+        # between runs rewrites every work item in the project for no reason.
         name = row["name"]
+        library = row["library"]
         score = row["score"]
         if score == "":
-            return (1, 0.0, name)
+            return (1, 0.0, name, library)
         try:
-            return (0, -float(score), name)
+            return (0, -float(score), name, library)
         except (TypeError, ValueError):
-            return (1, 0.0, name)
+            return (1, 0.0, name, library)
 
     rows.sort(key=sort_key)
     return rows

@@ -20,8 +20,8 @@ from source3 import (library_url, license_policy_name, license_link_report,
                      merge_component_index,
                      merge_license_index, normalise_findings, normalise_libraries,
                      normalise_library_components, normalise_library_licenses, normalise_licenses,
-                     normalise_projects, normalise_violations, render_inputs, select_projects,
-                     severity_floor)
+                     normalise_projects, normalise_violations, render_inputs, root_remediation,
+                     select_projects, severity_floor)
 import warnings
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
@@ -1162,6 +1162,36 @@ def build_enrich_html_v3(row: dict, reachability_on: bool) -> str:
     return html
 
 
+def remediation_block_v3(remediation: dict) -> str:
+    """The prominent Recommended Fix / Recommended Major Version block, above the CVE table.
+
+    Rendered as an inline-styled table because that is the ONE prominent pattern proven to survive
+    Azure DevOps's HTML sanitiser -- create_html_table has used it in production throughout. A
+    styled <div> or an <h3> is untested here, and this branch has already been bitten twice by
+    assuming Azure keeps what it is sent.
+
+    "" when every value is empty, so a root missing from the index (a partial read) adds nothing
+    rather than an empty box. Each line is omitted individually when its own value is empty.
+    """
+    if not isinstance(remediation, dict):
+        return ""
+    rows = []
+    if remediation.get("fix"):
+        rows.append(("Recommended Fix", remediation["fix"]))
+    if remediation.get("major"):
+        rows.append(("Recommended Major Version", remediation["major"]))
+    if not rows and not remediation.get("note"):
+        return ""
+    cell = "border: 1px solid black; padding: 5px;"
+    html = "<table style='border-collapse: collapse; table-layout: auto'>\n"
+    for label, value in rows:
+        html += f"<tr><td style='{cell}'><b>{label}</b></td>" \
+                f"<td style='{cell}'>{esc(value)}</td></tr>\n"
+    if remediation.get("note"):
+        html += f"<tr><td style='{cell}' colspan='2'>{esc(remediation['note'])}</td></tr>\n"
+    return html + "</table><br>"
+
+
 def build_license_html_v3(licenses: list, policy_name: str, library_url: str = "") -> str:
     """The <details> License Details block, same shape the 1.4 path renders it in.
 
@@ -1238,14 +1268,16 @@ def vuln_section_v3(row: dict, inputs: dict, reachability_on: bool) -> str:
         "<br><b>Fix Resolution:</b> " + esc(row.get("fix_resolution", ""))
 
 
-def library_block_v3(inputs: dict, with_hierarchy: bool) -> str:
+def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False) -> str:
     """The library header block both MEND_DEPENDENCY branches open their description with.
 
     The path lines and the home page are rendered ONLY when Mend supplied them -- see
     labelled_line. On a license work item these come from the due-diligence component index
     (source3.normalise_library_components); on a vulnerability work item, from the finding.
     """
-    block = "<b>Library - </b>" + esc(inputs["library"]) + \
+    # "Root Library" in dependency mode: the item is about the direct dependency an operator can
+    # upgrade, not about the transitive library the CVE is in.
+    block = ("<b>Root Library - </b>" if root else "<b>Library - </b>") + esc(inputs["library"]) + \
         "<br>" + esc(inputs["description"]) + \
         labelled_line("Path to dependency file: ", esc(inputs["dependency_file"])) + \
         labelled_line("Path to library:", esc(inputs["library_path"])) + \
@@ -1301,9 +1333,13 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
                 "CVSS": row.get("score", ""),
                 "EPSS": row.get("epss", ""),
                 "Exploit": row.get("maturity", ""),
-                "Dependency": inputs["library"],
-                "Type": inputs["dependency_type"],
-                "Fixed in": row.get("fix_resolution", ""),
+                # The actually-vulnerable library, per row. Under root grouping one item covers
+                # several, so this column carries information for the first time.
+                "Dependency": row.get("library", ""),
+                "Type": row.get("dependency_type", ""),
+                # No "Fixed in": Mend publishes no per-CVE root fix version, and the transitive
+                # library's version is not something an operator can set. Remediation is stated
+                # once, at root level, by remediation_block_v3.
             }
             if reachability_on:
                 table_row["Reachability"] = row.get("reachability", "")
@@ -1317,9 +1353,10 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
         count = len(entry.get("findings") or []) if isinstance(entry, dict) else len(rows)
         max_severity = max_score_v3(rows)
         title = f"{library}: {count} vulnerabilities (highest severity is {max_severity})"
-        desc = generate_expandable_section(f"Vulnerable library - {esc(library)}",
-                                           library_block_v3(inputs, with_hierarchy=True)) + \
-            "<br>" + create_html_table(data=table_data) + "<b>Details:</b><br>" + sections
+        desc = library_block_v3(inputs, with_hierarchy=False, root=True) + "<br>" + \
+            remediation_block_v3(root_remediation(entry.get("root") if isinstance(entry, dict)
+                                                  else {})) + \
+            create_html_table(data=table_data) + "<b>Details:</b><br>" + sections
         return [{"title": title, "desc": desc, "score": max_severity, "exact": False}]
 
     items = []

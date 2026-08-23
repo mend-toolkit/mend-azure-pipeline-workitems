@@ -101,9 +101,15 @@ def test_the_epss_below_one_marker_is_escaped():
 
 
 def test_library_metadata_and_parents_are_escaped():
+    """Dependency mode no longer renders a Dependency Hierarchy list at all (Task 4,
+    root-library-grouping): the root IS the top of the hierarchy, so its own parents are
+    meaningless there. Per-CVE mode still renders one (library_block_v3(with_hierarchy=True)),
+    so that is exercised here instead to keep the parents-are-escaped guarantee covered."""
     desc = _render(_entry())
     assert "A &lt;fast&gt; framework" in desc
-    assert "app&lt;1&gt;@1.0.0" in desc
+
+    per_cve_desc = _render(_entry(), conf=_conf(dependency="false"))
+    assert "app&lt;1&gt;@1.0.0" in per_cve_desc
 
 
 def test_a_url_with_an_ampersand_is_escaped_inside_the_attribute():

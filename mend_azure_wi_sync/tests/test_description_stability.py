@@ -75,6 +75,21 @@ def test_unscored_findings_are_ordered_among_themselves_by_name():
     assert [r["name"] for r in source3._vulnerabilities(findings)] == ["CVE-A", "CVE-Z"]
 
 
+def test_two_rows_sharing_a_cve_and_score_still_sort_deterministically():
+    """Under root grouping, one work item can hold the SAME CVE for two different library
+    versions -- live: CVE-2022-25883 on both semver-5.7.0.tgz and semver-5.6.0.tgz, both scored
+    5.3. Those two rows tie on (band, score, name) too, the total order (band, -score, name) was
+    a total order back when one work item meant one library, but is not one any more. Without
+    `library` as a further tiebreaker they fall through to Mend's API order, which is not stable
+    between runs -- reintroducing the exact spurious-rewrite bug fixed in 5c53f8a."""
+    one = [_finding("CVE-2022-25883", 5.3, lib="semver-5.7.0.tgz"),
+           _finding("CVE-2022-25883", 5.3, lib="semver-5.6.0.tgz")]
+    other = list(reversed(one))
+    assert [r["library"] for r in source3._vulnerabilities(one)] == \
+           [r["library"] for r in source3._vulnerabilities(other)] == \
+           ["semver-5.6.0.tgz", "semver-5.7.0.tgz"]
+
+
 def test_the_dependency_hierarchy_is_ordered_not_api_ordered():
     one = source3._parents([_finding("CVE-1", 7.0, parents=("zeta", "alpha"))])
     other = source3._parents([_finding("CVE-1", 7.0, parents=("alpha", "zeta"))])
