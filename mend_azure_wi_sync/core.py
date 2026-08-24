@@ -1255,6 +1255,47 @@ def generate_html_bulleted_list(items):
     return html
 
 
+def _nested_list_node(path, index, leaf_label, indent):
+    """One <li> of a single root->leaf chain, recursing one level per remaining hop.
+
+    The root (index 0) is always suffixed " (Root Library)"; the leaf (the last index) is
+    suffixed " ({leaf_label})" only when leaf_label is non-empty. A single-node path is both
+    root and leaf at once, and the root label wins -- never both on one node.
+    """
+    pad = "  " * indent
+    name = esc(path[index])
+    is_leaf = index == len(path) - 1
+    if index == 0:
+        name += " (Root Library)"
+    elif is_leaf and leaf_label:
+        name += f" ({leaf_label})"
+    if is_leaf:
+        return f"{pad}<li>{name}</li>\n"
+    child = _nested_list_node(path, index + 1, leaf_label, indent + 2)
+    return f"{pad}<li>{name}\n{pad}  <ul>\n{child}{pad}  </ul>\n{pad}</li>\n"
+
+
+def generate_html_nested_list(paths, leaf_label="") -> str:
+    """Root->leaf dependency chains (Task 1/2's `paths`) -> nested <ul>/<li> HTML.
+
+    One <ul> per path, one <li> nested inside the previous for each hop -- a six-hop chain
+    that generate_html_bulleted_list would collapse to one flat bullet instead shows every
+    hop. Several paths render as sibling <ul> blocks, concatenated in retval order (Global
+    Constraint 1: never sorted). Every node name is data from Mend and goes through esc();
+    " (Root Library)" / " ({leaf_label})" are literal text, not escaped.
+
+    [] or None yields "" -- there is nothing to render, not an empty <ul>.
+    """
+    if not paths:
+        return ""
+    html = ""
+    for path in paths:
+        if not path:
+            continue
+        html += "<ul>\n" + _nested_list_node(path, 0, leaf_label, 1) + "</ul>\n"
+    return html
+
+
 def get_field_ref(fld_name, cstm_flds):
     for c_fld_ in cstm_flds:
         if fld_name == c_fld_["name"]:
@@ -1413,12 +1454,18 @@ def vuln_section_v3(row: dict, inputs: dict, reachability_on: bool) -> str:
         "<br><b>Fix Resolution:</b> " + esc(row.get("fix_resolution", ""))
 
 
-def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False) -> str:
+def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False,
+                     leaf_label: str = "") -> str:
     """The library header block both MEND_DEPENDENCY branches open their description with.
 
     The path lines and the home page are rendered ONLY when Mend supplied them -- see
     labelled_line. On a license work item these come from the due-diligence component index
     (source3.normalise_library_components); on a vulnerability work item, from the finding.
+
+    `leaf_label` is threaded through to generate_html_nested_list: "Vulnerable Library" on a
+    vulnerability item, "" on a license item, where the leaf is not vulnerable and must not
+    say so (Task 4 decides root-grouping's leaf_label; this call site keeps with_hierarchy=False
+    for it either way, so leaf_label is moot there for now).
     """
     # "Root Library" in dependency mode: the item is about the direct dependency an operator can
     # upgrade, not about the transitive library the CVE is in.
@@ -1432,8 +1479,17 @@ def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False) -> 
     if not root:
         block += "<br><b>Vulnerable Library: </b>" + esc(inputs["library"])
     if with_hierarchy:
-        block += "<br><b>Dependency Hierarchy: </b><br>" + \
-                 generate_html_bulleted_list(items=inputs["parents"])
+        if inputs["paths"]:
+            block += "<br><b>Dependency Hierarchy: </b><br>" + \
+                     generate_html_nested_list(inputs["paths"], leaf_label=leaf_label)
+        elif inputs["dependency_type"].strip().lower() == "transitive" and inputs["parents"]:
+            # The failed-call path: attach_library_paths only sets "paths" for a TRANSITIVE
+            # library with a known uuid, and a call can still fail. Information already held
+            # (parents, from the 1.4-era finding walk) must not vanish because of that.
+            block += "<br><b>Dependency Hierarchy: </b><br>" + \
+                     generate_html_bulleted_list(items=inputs["parents"])
+        # Else: a direct dependency gets no call and no line (Global Constraint 3) -- the
+        # whole line, heading included, is omitted per the labelled_line house rule.
     home = esc(inputs["home_page"])
     if home:
         block += f"<br><b> Library home page: </b><a href='{home}'>{home}</a>"
@@ -1514,7 +1570,7 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
         if not vul_name:
             continue
         severity = str(row.get("severity", "")).capitalize()
-        desc = library_block_v3(inputs, with_hierarchy=True) + \
+        desc = library_block_v3(inputs, with_hierarchy=True, leaf_label="Vulnerable Library") + \
             vuln_section_v3(row, inputs, reachability_on)
         items.append({"title": f"{vul_name} ({severity}) detected in {library}",
                       "desc": desc, "score": row.get("score", ""), "exact": False,

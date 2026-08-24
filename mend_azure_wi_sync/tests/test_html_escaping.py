@@ -109,11 +109,17 @@ def test_library_metadata_and_parents_are_escaped():
     """Dependency mode no longer renders a Dependency Hierarchy list at all (Task 4,
     root-library-grouping): the root IS the top of the hierarchy, so its own parents are
     meaningless there. Per-CVE mode still renders one (library_block_v3(with_hierarchy=True)),
-    so that is exercised here instead to keep the parents-are-escaped guarantee covered."""
+    so that is exercised here instead to keep the parents-are-escaped guarantee covered.
+
+    Task 3: that fallback only fires for a TRANSITIVE library whose "paths" call either never
+    happened or failed -- the default fixture is a Direct dependency (Global Constraint 3: no
+    call, no line), so this uses a Transitive finding with no "paths" attached instead."""
     desc = _render(_entry())
     assert "A &lt;fast&gt; framework" in desc
 
-    per_cve_desc = _render(_entry(), conf=_conf(dependency="false"))
+    finding = _finding()
+    finding["component"]["dependencyType"] = "Transitive"
+    per_cve_desc = _render(_entry(finding), conf=_conf(dependency="false"))
     assert "app&lt;1&gt;@1.0.0" in per_cve_desc
 
 
@@ -163,6 +169,19 @@ def test_table_cells_and_headers_are_escaped():
 
 def test_a_bulleted_list_escapes_its_items():
     assert core.generate_html_bulleted_list(["a<b>c"]) == "<ul>\n  <li>a&lt;b&gt;c</li>\n</ul>"
+
+
+def test_a_nested_dependency_list_escapes_its_node_names():
+    """See core.py's Azure-deletes-raw-'<'-sentences finding above: a library name with a raw
+    '<' in a dependency chain is exactly the kind of content Azure would otherwise mangle."""
+    html = core.generate_html_nested_list([["app", "lib<script>", "a&b\"c"]],
+                                          leaf_label="Vulnerable Library")
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+    assert "a&amp;b&quot;c" in html
+    # the literal labels themselves are not escaped
+    assert "(Root Library)" in html
+    assert "(Vulnerable Library)" in html
 
 
 def test_an_expandable_section_escapes_nothing_itself():

@@ -149,6 +149,29 @@ def test_two_runs_over_reshuffled_api_output_render_an_identical_description():
     assert descs[0] == descs[1]
 
 
+# ---------------------------------------------- Task 3: nested dependency-path rendering
+
+def test_two_renders_of_the_same_entry_with_paths_are_byte_identical():
+    """attach_library_paths (Task 2) sets entry["paths"] outside of normalise_findings, so this
+    exercises render_entry_v3 directly rather than the reshuffled-API-order test above. The
+    guarantee is the same one Task 2's own commit relies on: rendering never becomes a second,
+    independent source of run-to-run drift."""
+    from unittest import mock
+    findings = [_finding("CVE-2021-0001", 7.5, lib="fastify", meta=_meta("fastify"))]
+    conf = mock.MagicMock(dependency="false")
+    entries, _ = source3.normalise_findings(findings, 0.0)
+    entry = entries["fastify"]
+    entry["licenses"] = []
+    entry["component"] = {}
+    entry["paths"] = [["app", "koa", "fastify"], ["app", "express", "fastify"]]
+    with mock.patch.object(core, "conf", conf):
+        first = core.render_entry_v3("vulnerability", "fastify", entry, False)[0]["desc"]
+        second = core.render_entry_v3("vulnerability", "fastify", entry, False)[0]["desc"]
+    assert first == second
+    assert "app (Root Library)" in first
+    assert "fastify (Vulnerable Library)" in first
+
+
 # ------------------------------------------------------- saying WHERE two descriptions diverge
 
 def test_the_divergence_snippet_points_at_the_first_difference():
