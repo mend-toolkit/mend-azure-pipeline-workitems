@@ -336,21 +336,34 @@ def _get_v2(url: str, token: str, params: dict, timeout: float = None):
     # timeout is optional and defaults to None (today's behaviour: no timeout at all) so every
     # existing caller (call_ws_api_v2, call_ws_api_v3, the 2.0 login) is byte-for-byte unaffected.
     # Only the batch /paths fetch (_fetch_paths_batch, Task 2) passes one -- a tool-wide timeout
-    # is a separate, wider decision left for later.
+    # is a separate, wider decision left for later. `timeout is not None` doubles as "this call
+    # came from a ThreadPoolExecutor worker": warnings.catch_warnings(record=True) below swaps
+    # process-wide state (the filter list via simplefilter, and warnings.showwarning) on
+    # __enter__/__exit__, which is not thread-safe -- with several workers concurrently
+    # entering/exiting, one thread's __exit__ can restore another's saved state and leak an
+    # "always" filter for the rest of the run. WARNING_MSG/TLS_WARNINGS_SILENCED are idempotent
+    # latches so no data is corrupted either way, only log fidelity, so a batch-path call skips
+    # the recording entirely rather than risk racing it.
     global WARNING_MSG
     try:
-        with warnings.catch_warnings(record=True) as warning_list:
-            warnings.simplefilter("always", InsecureRequestWarning)
+        if timeout is None:
+            with warnings.catch_warnings(record=True) as warning_list:
+                warnings.simplefilter("always", InsecureRequestWarning)
+                res_ = requests.get(url, params=params or {}, verify=verify_setting(),
+                                    proxies=conf.proxy, timeout=timeout,
+                                    headers={"Authorization": f"Bearer {token}",
+                                             "Content-Type": "application/json"})
+            if not WARNING_MSG:
+                for warning in warning_list:
+                    if issubclass(warning.category, InsecureRequestWarning):
+                        index_of_see = str(warning.message).find("See:")
+                        logger.warning(str(warning.message)[:index_of_see].strip())
+                        WARNING_MSG = True
+        else:
             res_ = requests.get(url, params=params or {}, verify=verify_setting(),
                                 proxies=conf.proxy, timeout=timeout,
                                 headers={"Authorization": f"Bearer {token}",
                                          "Content-Type": "application/json"})
-        if not WARNING_MSG:
-            for warning in warning_list:
-                if issubclass(warning.category, InsecureRequestWarning):
-                    index_of_see = str(warning.message).find("See:")
-                    logger.warning(str(warning.message)[:index_of_see].strip())
-                    WARNING_MSG = True
         if res_.status_code == 200:
             return json.loads(res_.text), 0
         return try_or_error(lambda: json.loads(res_.text), {}), res_.status_code
@@ -990,11 +1003,25 @@ def dep_paths_enabled() -> bool:
     return raw not in ("false", "no", "0")
 
 
+_library_paths_pool_size_cache = None
+
+
+def reset_library_paths_pool_size_cache():
+    """Drop the memoised MEND_DEPPATHS_CONCURRENCY resolution -- called once per run (alongside
+    the other library_paths_* run-scoped resets in run_sync) so a fresh run re-reads `conf`, and
+    by tests that need library_paths_pool_size() to see a new conf mid-test."""
+    global _library_paths_pool_size_cache
+    _library_paths_pool_size_cache = None
+
+
 def library_paths_pool_size() -> int:
     """MEND_DEPPATHS_CONCURRENCY -> the ThreadPoolExecutor width for the batch /paths fetch.
 
     The ONE place conf.dep_paths_concurrency is turned into a number -- the same one-place
     pattern as per_cve_mode and verify_setting, so nothing else in the codebase re-parses it.
+    Resolved once and memoised for the run: `_fetch_paths_batch` runs once per project (up to
+    107 times in a real org), and a misconfigured value must log its fallback WARNING once, not
+    once per project.
 
     Unset, blank, or an unexpanded placeholder defaults to LIBRARY_PATHS_POOL_SIZE (16, the
     value the brief specifies). A non-numeric value, a negative value, or exactly `0` is a config
@@ -1006,23 +1033,32 @@ def library_paths_pool_size() -> int:
     and is a useful escape hatch while diagnosing, exercising the same batch code path as any
     other pool size rather than a special case.
     """
+    global _library_paths_pool_size_cache
+    if _library_paths_pool_size_cache is not None:
+        return _library_paths_pool_size_cache
     raw = str(getattr(conf, "dep_paths_concurrency", "") or "").strip()
     if not raw or re.match(r"^\$\(.+\)$", raw):
-        return LIBRARY_PATHS_POOL_SIZE
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} is not a whole number; "
-                       f"using the default of {LIBRARY_PATHS_POOL_SIZE}.")
-        return LIBRARY_PATHS_POOL_SIZE
-    if value <= 0:
-        logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} must be a positive integer; "
-                       f"using the default of {LIBRARY_PATHS_POOL_SIZE}.")
-        return LIBRARY_PATHS_POOL_SIZE
-    if value > LIBRARY_PATHS_POOL_SIZE_MAX:
-        logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} exceeds the maximum of "
-                       f"{LIBRARY_PATHS_POOL_SIZE_MAX}; clamping to it.")
-        return LIBRARY_PATHS_POOL_SIZE_MAX
+        value = LIBRARY_PATHS_POOL_SIZE
+    else:
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} is not a whole number; "
+                           f"using the default of {LIBRARY_PATHS_POOL_SIZE}.")
+            parsed = None
+        if parsed is None:
+            value = LIBRARY_PATHS_POOL_SIZE
+        elif parsed <= 0:
+            logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} must be a positive "
+                           f"integer; using the default of {LIBRARY_PATHS_POOL_SIZE}.")
+            value = LIBRARY_PATHS_POOL_SIZE
+        elif parsed > LIBRARY_PATHS_POOL_SIZE_MAX:
+            logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} exceeds the maximum of "
+                           f"{LIBRARY_PATHS_POOL_SIZE_MAX}; clamping to it.")
+            value = LIBRARY_PATHS_POOL_SIZE_MAX
+        else:
+            value = parsed
+    _library_paths_pool_size_cache = value
     return value
 
 
@@ -2240,6 +2276,7 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     library_paths_cache = {}
     library_paths_consecutive_failures = 0
     library_paths_breaker_tripped = False
+    reset_library_paths_pool_size_cache()
     floor = run_severity_floor()
     logger.info(f"Severity floor: MEND_SEVERITY '{conf.severity}' -> {floor}. The SAME floor "
                 f"decides which findings earn a work item and which findings hold one open.")
@@ -2502,51 +2539,86 @@ def fetch_v2_library_paths(project_uuid: str, library_uuid: str) -> list:
 
 
 def _fetch_paths_batch(project_uuid: str, library_uuids: list) -> dict:
-    """Concurrently fetch /paths for many libraries in one project; the fix for this change.
+    """Concurrently fetch /paths for many libraries in one project, in WAVES of the pool size,
+    checking the breaker between waves -- the fix for a review finding on the first version of
+    this change (see the dep-paths-perf brief and its review).
 
     Returns {library_uuid: (payload, errorcode)} for every uuid actually attempted. Workers touch
     NO shared state -- each is a bare `_get_v2` call whose only output is its own return value;
     the JWT is pre-warmed once before fanning out so no worker ever triggers its own re-login.
-    All mutation (the cache, the breaker counters, entry["paths"]) happens on the caller's main
-    thread, after this function returns, in the deterministic (sorted) order attach_library_paths
-    applies -- see its docstring and the breaker's own docstring on fetch_v2_library_paths for why
-    that determinism matters.
+    All REAL mutation (the cache, the breaker counters, entry["paths"]) still happens in
+    attach_library_paths, on the main thread, after this function returns, in the deterministic
+    (sorted) order it applies -- see its docstring. This function's own wave loop keeps a purely
+    LOCAL simulation of that same rule (starting from the real counters, read once, never
+    written here) so it knows when to stop submitting further waves; because it walks the exact
+    same sorted uuids in the exact same order attach_library_paths will apply afterward, the two
+    always trip at the same point.
+
+    THE BUG THIS FIXES: submitting the entire `library_uuids` set to one `pool.map()` call, with
+    the breaker only checked at entry and applied at the end, defeats the breaker within a
+    project -- a PAT lacking Mend 2.0 permission on a 383-library project fires all 383 calls
+    (plus a full 383-wide retry misdiagnosed as an expired JWT: 766 calls) before the breaker,
+    consulted only afterward, ever gets a chance to trip on the 5th applied result. Chunking into
+    waves of `library_paths_pool_size()` and checking the (simulated) breaker between waves
+    bounds the damage to roughly one wave before the fetch loop itself stops: worst case is one
+    pool-sized wave plus one pool-sized retry pass for that wave (e.g. 16 + 16 = 32 calls with the
+    default pool size), not the whole project.
+
+    THE RETRY CAP: a 401/403 on any worker means the pre-warmed JWT expired mid-wave, OR the PAT
+    genuinely lacks permission -- those two cases are indistinguishable from a status code alone.
+    Retrying is only ever right for the former, so the retry pass is capped to the CURRENT WAVE's
+    own failing uuids (at most `library_paths_pool_size()` of them, never the whole project), and
+    happens at most ONCE per call to this function (the first wave to see a 401/403 triggers one
+    fresh mend_v2_token(); later waves reuse that refreshed token and are not retried again even
+    if they also fail) -- never a re-login inside a worker, and never a retry sized to hundreds of
+    uuids that were never going to succeed anyway.
 
     Returns {} and makes no call at all if there is nothing to fetch, or if the breaker is
     already tripped -- "subsequent batches make no calls at all" once tripped.
-
-    A 401/403 on any worker means the pre-warmed JWT expired mid-fan-out. That is handled here,
-    once, on this thread, after every worker has returned: one fresh mend_v2_session = None, one
-    fresh mend_v2_token(), and one retry pass over just the uuids that failed that way -- never a
-    re-login inside a worker.
     """
     global mend_v2_session
     if not library_uuids or library_paths_breaker_tripped:
         return {}
     uuids = sorted(set(library_uuids))
+    pool_size = library_paths_pool_size()
     token = mend_v2_token()
-    pool_size = min(library_paths_pool_size(), len(uuids))
+    relogin_done = False
 
     def _fetch_one(library_uuid, bearer):
         url = f"{mend_api_url()}/api/v2.0/projects/{project_uuid}/libraries/{library_uuid}/paths"
         payload, errorcode = _get_v2(url, bearer, None, timeout=LIBRARY_PATHS_TIMEOUT)
         return library_uuid, payload, errorcode
 
-    results = {}
-    with ThreadPoolExecutor(max_workers=pool_size) as pool:
-        for library_uuid, payload, errorcode in pool.map(
-                lambda u: _fetch_one(u, token), uuids):
-            results[library_uuid] = (payload, errorcode)
-
-    retry_uuids = sorted(uuid for uuid, (_, code) in results.items() if code in (401, 403))
-    if retry_uuids:
-        mend_v2_session = None
-        retry_token = mend_v2_token()
-        retry_pool_size = min(library_paths_pool_size(), len(retry_uuids))
-        with ThreadPoolExecutor(max_workers=retry_pool_size) as pool:
+    def _fetch_many(uuid_list, bearer):
+        out = {}
+        with ThreadPoolExecutor(max_workers=min(pool_size, len(uuid_list))) as pool:
             for library_uuid, payload, errorcode in pool.map(
-                    lambda u: _fetch_one(u, retry_token), retry_uuids):
-                results[library_uuid] = (payload, errorcode)
+                    lambda u: _fetch_one(u, bearer), uuid_list):
+                out[library_uuid] = (payload, errorcode)
+        return out
+
+    results = {}
+    # Purely local control-flow state -- never written to the real (global) counters. Starts
+    # from the real value so a run of failures that began in an earlier project (not yet at the
+    # threshold) is honoured rather than reset to 0 here.
+    simulated_consecutive = library_paths_consecutive_failures
+    for wave_start in range(0, len(uuids), pool_size):
+        if simulated_consecutive >= LIBRARY_PATHS_BREAKER_THRESHOLD:
+            break
+        wave = uuids[wave_start:wave_start + pool_size]
+        wave_results = _fetch_many(wave, token)
+
+        retry_uuids = sorted(u for u, (_, code) in wave_results.items() if code in (401, 403))
+        if retry_uuids and not relogin_done:
+            mend_v2_session = None
+            token = mend_v2_token()
+            relogin_done = True
+            wave_results.update(_fetch_many(retry_uuids, token))
+
+        for library_uuid in sorted(wave_results):
+            _, errorcode = wave_results[library_uuid]
+            simulated_consecutive = 0 if errorcode == 0 else simulated_consecutive + 1
+        results.update(wave_results)
 
     return results
 
@@ -2575,16 +2647,26 @@ def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
         MEND_DEPENDENCY=true root-grouping descriptions are out of scope. License entries are
         fetched in both modes.
       - An entry with no library_uuid is skipped -- there is nothing to look up.
-    2. Batch fetch (_fetch_paths_batch) of only the uuids not already in library_paths_cache.
-       Its raw (payload, errorcode) results are then applied HERE, on the main thread, in
-       library_uuid-sorted order, one at a time -- the circuit breaker
-       (library_paths_consecutive_failures / library_paths_breaker_tripped /
+    2. Batch fetch (_fetch_paths_batch) of only the uuids not already in library_paths_cache,
+       WAVE by wave, stopping early once its own local simulation predicts the breaker will
+       trip -- see that function's docstring for why the fetch loop itself now bounds the
+       damage, not just the apply loop below. Its raw (payload, errorcode) results are then
+       applied HERE, on the main thread, in library_uuid-sorted order, one at a time -- the
+       circuit breaker (library_paths_consecutive_failures / library_paths_breaker_tripped /
        LIBRARY_PATHS_BREAKER_THRESHOLD) is evaluated exactly as fetch_v2_library_paths always
        evaluated it, just against pre-fetched results instead of a fresh call per entry, so "five
        consecutive failures" stays a meaningful, deterministic count even though the underlying
-       HTTP calls raced concurrently. Once tripped mid-batch, the remaining (already-fetched)
-       results are not applied -- those entries simply get no cached path this run, same
-       observable outcome as if fetch_v2_library_paths had refused the call.
+       HTTP calls raced concurrently.
+       EVERY result _fetch_paths_batch returns is applied here, including any that sort after
+       the point where the breaker actually trips: those uuids were already fetched (paid for)
+       before the trip was known, often concurrently in the same wave as the one that tripped
+       it, and a successful one must not be thrown away -- doing so would make which libraries
+       render a hierarchy depend on sort order relative to which ones happened to fail, and
+       change descriptions (hence PATCHes) run to run for no reason. Only *further fetching* is
+       what the breaker stops (enforced inside _fetch_paths_batch and by the check at its own
+       entry on the next call); applying results already in hand is unconditional. The "giving
+       up" ERROR is still logged only once (guarded on the False->True transition), not once per
+       failing result after the trip.
     3. Assignment -- entry["paths"] for every collected entry, read back out of
        library_paths_cache (a cache hit either way: pre-existing, or just populated in step 2).
 
@@ -2617,9 +2699,8 @@ def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
     failed = 0
 
     results = _fetch_paths_batch(project_uuid, to_fetch) if to_fetch else {}
+    already_tripped_here = False
     for library_uuid in sorted(results):
-        if library_paths_breaker_tripped:
-            break
         payload, errorcode = results[library_uuid]
         cache_key = (project_uuid, library_uuid)
         if errorcode != 0:
@@ -2630,8 +2711,10 @@ def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
             result = []
             failed += 1
             library_paths_consecutive_failures += 1
-            if library_paths_consecutive_failures >= LIBRARY_PATHS_BREAKER_THRESHOLD:
+            if not already_tripped_here and \
+                    library_paths_consecutive_failures >= LIBRARY_PATHS_BREAKER_THRESHOLD:
                 library_paths_breaker_tripped = True
+                already_tripped_here = True
                 logger.error(f"[{fn()}] Dependency-path lookups failed "
                             f"{LIBRARY_PATHS_BREAKER_THRESHOLD} times in a row (most recently "
                             f"for library {library_uuid} in project {project_uuid}). Giving up "
