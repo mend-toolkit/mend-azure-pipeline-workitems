@@ -17,17 +17,18 @@ from mend_azure_wi_sync import core
 
 @pytest.fixture(autouse=True)
 def _reset_state():
+    # The pool-size memo itself is reset by the shared reset_core_globals fixture in
+    # tests/conftest.py (so no test file has to remember to do it) -- this fixture only owns the
+    # state specific to this file's subject matter: the cache, the breaker, and the JWT session.
     core.library_paths_cache = {}
     core.library_paths_consecutive_failures = 0
     core.library_paths_breaker_tripped = False
     core.mend_v2_session = None
-    core.reset_library_paths_pool_size_cache()
     yield
     core.library_paths_cache = {}
     core.library_paths_consecutive_failures = 0
     core.library_paths_breaker_tripped = False
     core.mend_v2_session = None
-    core.reset_library_paths_pool_size_cache()
 
 
 def _conf(dep_paths="", dep_paths_concurrency=""):
@@ -221,6 +222,37 @@ def test_a_permission_denial_storm_is_bounded_to_one_wave_plus_one_capped_retry(
     # the refreshed token, still 403 -> breaker trips before wave 2 is ever submitted.
     assert get_mock.call_count <= 2 * core.LIBRARY_PATHS_POOL_SIZE
     assert get_mock.call_count < 383
+
+
+def test_simulated_trip_is_sticky_across_a_later_success_in_the_same_wave():
+    """IMPORTANT review finding: the simulation's consecutive-failure COUNTER resets to 0 on a
+    success, same as the real one, but the real library_paths_breaker_tripped flag is STICKY
+    once set -- the simulation's own "should I submit another wave" decision must be too. A wave
+    of exactly `threshold` consecutive failures followed by one success (sorted order, all in
+    the SAME wave) must still stop further waves, even though the counter itself reads 0 right
+    after that success. Two extra uuids are added that would only ever be fetched in a second
+    wave -- if the simulation wrongly un-tripped on the success, they would get fetched too."""
+    threshold = core.LIBRARY_PATHS_BREAKER_THRESHOLD
+    wave_size = threshold + 1  # lib-0..lib-4 fail, lib-5 (this wave's last uuid) succeeds
+    desired = {("license", f"lib{i}"): _license_entry(library_uuid=f"lib-{i}")
+              for i in range(wave_size + 2)}  # + lib-6, lib-7 -- would only fire in wave 2
+
+    def fake_get(url, token, params, timeout=None):
+        if f"lib-{threshold}" in url:  # "lib-5" -- the wave's one success, sorts last
+            return _ok("u-ok")
+        return {"error": "nope"}, 2
+
+    with mock.patch.object(core, "conf", _conf(dep_paths_concurrency=str(wave_size))), \
+         mock.patch.object(core, "mend_v2_token", return_value="jwt-1"), \
+         mock.patch.object(core, "_get_v2", side_effect=fake_get) as get_mock:
+        core.attach_library_paths("proj-1", desired, per_cve=False)
+    assert core.library_paths_breaker_tripped is True
+    # Only the first (and only) wave was ever submitted -- lib-6/lib-7 were never fetched, which
+    # would not hold if the simulation forgot the trip after the success reset its counter.
+    assert get_mock.call_count == wave_size
+    assert desired[("license", f"lib{threshold}")]["paths"] == [["app"]]
+    assert desired[("license", "lib6")]["paths"] == []
+    assert desired[("license", "lib7")]["paths"] == []
 
 
 # ------------------------------------------------------------------- ok interlock

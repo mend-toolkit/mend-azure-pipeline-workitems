@@ -2600,10 +2600,19 @@ def _fetch_paths_batch(project_uuid: str, library_uuids: list) -> dict:
     results = {}
     # Purely local control-flow state -- never written to the real (global) counters. Starts
     # from the real value so a run of failures that began in an earlier project (not yet at the
-    # threshold) is honoured rather than reset to 0 here.
+    # threshold) is honoured rather than reset to 0 here. `simulated_tripped` mirrors the real
+    # `library_paths_breaker_tripped` flag's STICKINESS: the counter itself resets to 0 on a
+    # success (matching the real counter, so the two agree on ordinary runs), but once the
+    # simulated count reaches the threshold, `simulated_tripped` latches and stops further waves
+    # even if a later success in the same batch would otherwise have reset the counter back down.
+    # Without this, a wave of `threshold` consecutive failures followed by a success would trip
+    # the REAL breaker (applied afterward in attach_library_paths, which is also sticky) while
+    # this simulation forgot the trip and kept submitting waves -- "once tripped, the rest of
+    # the batch is not attempted" must hold in both directions.
     simulated_consecutive = library_paths_consecutive_failures
+    simulated_tripped = simulated_consecutive >= LIBRARY_PATHS_BREAKER_THRESHOLD
     for wave_start in range(0, len(uuids), pool_size):
-        if simulated_consecutive >= LIBRARY_PATHS_BREAKER_THRESHOLD:
+        if simulated_tripped:
             break
         wave = uuids[wave_start:wave_start + pool_size]
         wave_results = _fetch_many(wave, token)
@@ -2618,6 +2627,8 @@ def _fetch_paths_batch(project_uuid: str, library_uuids: list) -> dict:
         for library_uuid in sorted(wave_results):
             _, errorcode = wave_results[library_uuid]
             simulated_consecutive = 0 if errorcode == 0 else simulated_consecutive + 1
+            if simulated_consecutive >= LIBRARY_PATHS_BREAKER_THRESHOLD:
+                simulated_tripped = True
         results.update(wave_results)
 
     return results

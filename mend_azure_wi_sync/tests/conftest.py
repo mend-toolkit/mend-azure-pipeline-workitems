@@ -58,6 +58,12 @@ def reset_core_globals():
     core.global_errors = 0
     core.run_failed = False
     core.synced_projects = []
+    # library_paths_pool_size() memoises MEND_DEPPATHS_CONCURRENCY for the run (see its
+    # docstring): a test elsewhere that sets conf.dep_paths_concurrency to a specific value would
+    # otherwise leak that resolved number into every test that runs after it, in any file, not
+    # just the ones that know to reset it themselves. Reset here so no file has to remember to.
+    core.reset_library_paths_pool_size_cache()
     yield
     (core.exist_wis, core.updated_wi, core.global_errors, core.conf,
      core.run_failed, core.synced_projects) = saved
+    core.reset_library_paths_pool_size_cache()
