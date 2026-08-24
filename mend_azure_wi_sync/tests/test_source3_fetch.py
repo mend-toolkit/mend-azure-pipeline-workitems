@@ -20,8 +20,12 @@ def _reset_library_paths_breaker_state():
 def _conf(dependency="true"):
     # dependency is explicit: fetch_v3_desired now reads it to choose the grouping, and a bare
     # MagicMock attribute is not "true", which would silently put every test in per-CVE mode.
+    # dep_paths/dep_paths_concurrency are explicit "" too: a bare MagicMock attribute is truthy
+    # and not a real number, which would make library_paths_pool_size() log a bogus warning on
+    # every batch fetch in this file.
     return mock.MagicMock(org_uuid="org-1", ws_org_token="tok", email="a@b.com",
-                          ws_url="saas.mend.io", proxy={}, dependency=dependency)
+                          ws_url="saas.mend.io", proxy={}, dependency=dependency,
+                          dep_paths="", dep_paths_concurrency="")
 
 
 def test_projects_are_fetched_and_normalised():
@@ -366,7 +370,8 @@ def test_the_ok_interlock_stays_true_while_the_breaker_is_tripped():
     _reset_library_paths_breaker()
     with mock.patch.object(core, "conf", _conf(dependency="false")), \
          mock.patch.object(core, "fetch_v3_pages", fake_pages), \
-         mock.patch.object(core, "call_ws_api_v2", return_value=({"error": "nope"}, 2)):
+         mock.patch.object(core, "mend_v2_token", return_value="jwt-1"), \
+         mock.patch.object(core, "_get_v2", return_value=({"error": "nope"}, 2)):
         desired, ok = core.fetch_v3_desired("p-1", 7.0)
     assert ok is True
     assert core.library_paths_breaker_tripped is True
@@ -389,49 +394,82 @@ def _entry(kind="vulnerability", dependency_type="Transitive", library_uuid="lib
 
 def test_attach_library_paths_skips_direct_dependencies():
     desired = {("license", "log4j-core"): _entry(kind="license", dependency_type="Direct")}
-    with mock.patch.object(core, "fetch_v2_library_paths") as fetch:
+    with mock.patch.object(core, "_fetch_paths_batch") as batch:
         core.attach_library_paths("proj-1", desired, per_cve=True)
-    fetch.assert_not_called()
+    batch.assert_not_called()
     assert "paths" not in desired[("license", "log4j-core")]
 
 
 def test_attach_library_paths_is_case_insensitive_on_dependency_type():
+    _reset_library_paths_cache()
     desired = {("license", "log4j-core"): _entry(kind="license", dependency_type="TRANSITIVE")}
-    with mock.patch.object(core, "fetch_v2_library_paths", return_value=_PATHS_CHAINS) as fetch:
+    with mock.patch.object(core, "_fetch_paths_batch",
+                           return_value={"lib-1": (_PATHS_PAYLOAD, 0)}) as batch:
         core.attach_library_paths("proj-1", desired, per_cve=True)
-    fetch.assert_called_once_with("proj-1", "lib-1")
+    batch.assert_called_once_with("proj-1", ["lib-1"])
     assert desired[("license", "log4j-core")]["paths"] == _PATHS_CHAINS
 
 
 def test_attach_library_paths_skips_uuid_less_entries():
     desired = {("license", "log4j-core"): _entry(kind="license", library_uuid="")}
-    with mock.patch.object(core, "fetch_v2_library_paths") as fetch:
+    with mock.patch.object(core, "_fetch_paths_batch") as batch:
         core.attach_library_paths("proj-1", desired, per_cve=True)
-    fetch.assert_not_called()
+    batch.assert_not_called()
     assert "paths" not in desired[("license", "log4j-core")]
 
 
 def test_attach_library_paths_skips_vulnerability_entries_in_root_grouping_mode():
     desired = {("vulnerability", "log4j-core"): _entry(kind="vulnerability")}
-    with mock.patch.object(core, "fetch_v2_library_paths") as fetch:
+    with mock.patch.object(core, "_fetch_paths_batch") as batch:
         core.attach_library_paths("proj-1", desired, per_cve=False)
-    fetch.assert_not_called()
+    batch.assert_not_called()
     assert "paths" not in desired[("vulnerability", "log4j-core")]
 
 
 def test_attach_library_paths_fetches_vulnerability_entries_in_per_cve_mode():
+    _reset_library_paths_cache()
     desired = {("vulnerability", "CVE-1|log4j-core"): _entry(kind="vulnerability")}
-    with mock.patch.object(core, "fetch_v2_library_paths", return_value=_PATHS_CHAINS) as fetch:
+    with mock.patch.object(core, "_fetch_paths_batch",
+                           return_value={"lib-1": (_PATHS_PAYLOAD, 0)}) as batch:
         core.attach_library_paths("proj-1", desired, per_cve=True)
-    fetch.assert_called_once_with("proj-1", "lib-1")
+    batch.assert_called_once_with("proj-1", ["lib-1"])
     assert desired[("vulnerability", "CVE-1|log4j-core")]["paths"] == _PATHS_CHAINS
 
 
 def test_attach_library_paths_fetches_a_transitive_license_entry():
+    _reset_library_paths_cache()
     desired = {("license", "log4j-core"): _entry(kind="license")}
-    with mock.patch.object(core, "fetch_v2_library_paths", return_value=_PATHS_CHAINS) as fetch:
+    with mock.patch.object(core, "_fetch_paths_batch",
+                           return_value={"lib-1": (_PATHS_PAYLOAD, 0)}) as batch:
         core.attach_library_paths("proj-1", desired, per_cve=False)
-    fetch.assert_called_once_with("proj-1", "lib-1")
+    batch.assert_called_once_with("proj-1", ["lib-1"])
+    assert desired[("license", "log4j-core")]["paths"] == _PATHS_CHAINS
+
+
+def test_attach_library_paths_batches_several_entries_sharing_one_uuid_into_one_call():
+    """forever's 51 findings on one library must still cost ONE /paths call, not 51 --
+    now proven at the attach_library_paths -> _fetch_paths_batch boundary rather than via
+    fetch_v2_library_paths' own memoisation, since the batch path no longer calls through it."""
+    _reset_library_paths_cache()
+    desired = {
+        ("vulnerability", "CVE-1|log4j-core"): _entry(kind="vulnerability", library_uuid="lib-1"),
+        ("vulnerability", "CVE-2|log4j-core"): _entry(kind="vulnerability", library_uuid="lib-1"),
+    }
+    with mock.patch.object(core, "_fetch_paths_batch",
+                           return_value={"lib-1": (_PATHS_PAYLOAD, 0)}) as batch:
+        core.attach_library_paths("proj-1", desired, per_cve=True)
+    batch.assert_called_once_with("proj-1", ["lib-1"])
+    assert desired[("vulnerability", "CVE-1|log4j-core")]["paths"] == _PATHS_CHAINS
+    assert desired[("vulnerability", "CVE-2|log4j-core")]["paths"] == _PATHS_CHAINS
+
+
+def test_attach_library_paths_does_not_refetch_uuids_already_in_the_cache():
+    _reset_library_paths_cache()
+    core.library_paths_cache[("proj-1", "lib-1")] = _PATHS_CHAINS
+    desired = {("license", "log4j-core"): _entry(kind="license")}
+    with mock.patch.object(core, "_fetch_paths_batch") as batch:
+        core.attach_library_paths("proj-1", desired, per_cve=False)
+    batch.assert_not_called()
     assert desired[("license", "log4j-core")]["paths"] == _PATHS_CHAINS
 
 
@@ -459,18 +497,20 @@ def test_an_empty_attach_pass_leaves_fetch_v3_desired_ok_true():
     _reset_library_paths_cache()
     with mock.patch.object(core, "conf", _conf(dependency="false")), \
          mock.patch.object(core, "fetch_v3_pages", fake_pages), \
-         mock.patch.object(core, "call_ws_api_v2") as api_mock:
+         mock.patch.object(core, "mend_v2_token") as token_mock, \
+         mock.patch.object(core, "_get_v2") as get_mock:
         desired, ok = core.fetch_v3_desired("p-1", 7.0)
     assert ok is True
     assert desired
     # No library_uuid on the stub finding/violation, so nothing was actually fetched.
-    api_mock.assert_not_called()
+    token_mock.assert_not_called()
+    get_mock.assert_not_called()
 
 
 def test_a_failed_paths_call_leaves_fetch_v3_desired_ok_true():
     """The closure interlock: a decorative /paths failure must never gate `ok`. This is the
-    most important test in this task -- it must exercise a REAL fetch_v2_library_paths call
-    that actually fails, not an entry attach_library_paths skips before ever reaching it."""
+    most important test in this task -- it must exercise a REAL batch fetch that actually fails,
+    not an entry attach_library_paths skips before ever reaching it."""
     def fake_pages(api, params=None, limit=1000, method="GET"):
         if _is_root_path(api):
             return [], True
@@ -481,12 +521,15 @@ def test_a_failed_paths_call_leaves_fetch_v3_desired_ok_true():
     _reset_library_paths_cache()
     with mock.patch.object(core, "conf", _conf(dependency="false")), \
          mock.patch.object(core, "fetch_v3_pages", fake_pages), \
-         mock.patch.object(core, "call_ws_api_v2",
-                           return_value=({"error": "nope"}, 2)) as api_mock:
+         mock.patch.object(core, "mend_v2_token", return_value="jwt-1"), \
+         mock.patch.object(core, "_get_v2",
+                           return_value=({"error": "nope"}, 2)) as get_mock:
         desired, ok = core.fetch_v3_desired("p-1", 7.0)
     assert ok is True
     # The call genuinely happened and genuinely failed -- proving the interlock actually held
     # under a real failure, not merely under an entry that was skipped beforehand.
-    api_mock.assert_called_once_with("projects/p-1/libraries/lib-uuid-1/paths")
+    get_mock.assert_called_once()
+    called_url = get_mock.call_args[0][0]
+    assert called_url.endswith("projects/p-1/libraries/lib-uuid-1/paths")
     entry = desired[("vulnerability", "CVE-1|log4j-core")]
     assert entry["paths"] == []

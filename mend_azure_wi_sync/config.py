@@ -55,6 +55,8 @@ class varenvs(Enum):  # Lit of Env.variables
     wsclosedstate = ("WS_CLOSEDSTATE", "MEND_CLOSEDSTATE")
     wsreopenstate = ("WS_REOPENSTATE", "MEND_REOPENSTATE")
     wssslverify = ("WS_SSLVERIFY", "MEND_SSLVERIFY")
+    wsdeppaths = ("WS_DEPPATHS", "MEND_DEPPATHS")
+    wsdeppathsconcurrency = ("WS_DEPPATHS_CONCURRENCY", "MEND_DEPPATHS_CONCURRENCY")
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -129,6 +131,11 @@ class Config:
     # existing Config(...) call that predates this variable keeps working AND gets the secure
     # behaviour rather than having to opt in.
     ssl_verify: str = ""
+    # Defaulted like ssl_verify above: the accessor (core.dep_paths_enabled /
+    # core.library_paths_pool_size) owns the actual default, not update_properties, so an
+    # existing Config(...) call that predates these two variables keeps working unchanged.
+    dep_paths: str = ""
+    dep_paths_concurrency: str = ""
 
     def conf_json(self):
         return {
@@ -159,6 +166,8 @@ class Config:
             "wsclosedstate": self.closed_state,
             "wsreopenstate": self.reopen_state,
             "wssslverify": self.ssl_verify,
+            "wsdeppaths": self.dep_paths,
+            "wsdeppathsconcurrency": self.dep_paths_concurrency,
         }
 
     def get_values(self):

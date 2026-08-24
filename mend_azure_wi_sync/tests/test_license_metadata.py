@@ -242,7 +242,7 @@ def _fake_pages(license_rows):
 def test_fetch_v3_desired_attaches_the_component_index_to_license_entries():
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "org_uuid", return_value="org-1"), \
-         mock.patch.object(core, "fetch_v2_library_paths", return_value=[]), \
+         mock.patch.object(core, "attach_library_paths"), \
          mock.patch.object(core, "fetch_v3_pages", _fake_pages([_dd_row()])):
         desired, ok = core.fetch_v3_desired("p-1", 7.0)
     assert ok is True
@@ -262,7 +262,7 @@ def test_a_license_violation_with_no_due_diligence_row_gets_an_empty_component()
 def test_the_rendered_license_work_item_shows_the_paths_end_to_end():
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "org_uuid", return_value="org-1"), \
-         mock.patch.object(core, "fetch_v2_library_paths", return_value=[]), \
+         mock.patch.object(core, "attach_library_paths"), \
          mock.patch.object(core, "fetch_v3_pages", _fake_pages([_dd_row()])):
         desired, _ = core.fetch_v3_desired("p-1", 7.0)
     entry = desired[("license", "log4j-core")]
@@ -446,7 +446,7 @@ def _fake_pages_v2(lib_rows, dd_rows, lib_ok=True):
 def test_the_libraries_call_is_the_primary_source_for_a_license_work_item():
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "org_uuid", return_value="org-1"), \
-         mock.patch.object(core, "fetch_v2_library_paths", return_value=[]), \
+         mock.patch.object(core, "attach_library_paths"), \
          mock.patch.object(core, "fetch_v3_pages", _fake_pages_v2([_lib_row()], [_dd_row()])):
         desired, ok = core.fetch_v3_desired("p-1", 7.0)
     assert ok is True
@@ -460,7 +460,7 @@ def test_due_diligence_fills_a_field_the_libraries_call_left_blank():
     sparse["extraInformation"] = {}
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "org_uuid", return_value="org-1"), \
-         mock.patch.object(core, "fetch_v2_library_paths", return_value=[]), \
+         mock.patch.object(core, "attach_library_paths"), \
          mock.patch.object(core, "fetch_v3_pages", _fake_pages_v2([sparse], [_dd_row()])):
         desired, _ = core.fetch_v3_desired("p-1", 7.0)
     component = desired[("license", "log4j-core")]["component"]
@@ -474,7 +474,7 @@ def test_a_failed_libraries_read_clears_ok_so_nothing_is_closed():
     mistaken for a shrunken desired, or reconciliation closes live work items."""
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "org_uuid", return_value="org-1"), \
-         mock.patch.object(core, "fetch_v2_library_paths", return_value=[]), \
+         mock.patch.object(core, "attach_library_paths"), \
          mock.patch.object(core, "fetch_v3_pages",
                            _fake_pages_v2([], [_dd_row()], lib_ok=False)):
         _, ok = core.fetch_v3_desired("p-1", 7.0)
@@ -596,7 +596,7 @@ def test_a_license_work_item_is_rendered_with_its_library_page_link_end_to_end()
     row["license"]["textUrl"] = ""
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "org_uuid", return_value="org-1"), \
-         mock.patch.object(core, "fetch_v2_library_paths", return_value=[]), \
+         mock.patch.object(core, "attach_library_paths"), \
          mock.patch.object(core, "fetch_v3_pages", _fake_pages_v2([], [row])):
         desired, _ = core.fetch_v3_desired("p-1", 7.0)
     entry = desired[("license", "log4j-core")]
@@ -642,7 +642,7 @@ def test_an_mit_license_with_only_a_library_wide_url_renders_as_a_link_end_to_en
     row["extraInformation"] = {"licenseUrl": "https://opensource.org/licenses/MIT"}
     with mock.patch.object(core, "conf", _conf()), \
          mock.patch.object(core, "org_uuid", return_value="org-1"), \
-         mock.patch.object(core, "fetch_v2_library_paths", return_value=[]), \
+         mock.patch.object(core, "attach_library_paths"), \
          mock.patch.object(core, "fetch_v3_pages", _fake_pages_v2([row], [])):
         desired, _ = core.fetch_v3_desired("p-1", 7.0)
     desc = core.render_entry_v3("license", "log4j-core",

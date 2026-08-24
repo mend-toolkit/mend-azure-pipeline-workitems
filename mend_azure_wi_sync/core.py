@@ -2,7 +2,9 @@ import inspect
 import json
 import logging
 import os
+import time
 # The FUNCTION, not the html module: build_enrich_html_v3 binds a local `html` and would shadow it.
+from concurrent.futures import ThreadPoolExecutor
 from html import escape, unescape
 
 import requests
@@ -84,6 +86,22 @@ library_paths_cache = {}
 LIBRARY_PATHS_BREAKER_THRESHOLD = 5
 library_paths_consecutive_failures = 0
 library_paths_breaker_tripped = False
+# Default width of the ThreadPoolExecutor the batch /paths fetch fans out over (see
+# _fetch_paths_batch). Mend confirmed no rate limit, so this is a latency/throughput knob, not a
+# politeness one -- 16 was chosen so the 383-library project that stalled for minutes in serial
+# finishes in low tens of seconds instead. MEND_DEPPATHS_CONCURRENCY (library_paths_pool_size)
+# overrides it; this constant is also the fallback that a bad override resolves to.
+LIBRARY_PATHS_POOL_SIZE = 16
+# Clamp for MEND_DEPPATHS_CONCURRENCY. 4x the default is already generous headroom for a bigger
+# org than the one that triggered this fix, without letting a pasted "5000" spin up thousands of
+# threads against a host that has no rate limit but still finite real capacity.
+LIBRARY_PATHS_POOL_SIZE_MAX = 64
+# Per-call timeout (seconds) for the batch /paths fetch ONLY (Task 2) -- deliberately not shared
+# with call_ws_api_v2/v3's unbounded _get_v2 callers, which is a separate, wider decision left for
+# later. 30s is generous next to this endpoint's observed sub-second-to-a-few-second latency, but
+# short enough that one stuck socket cannot recreate the multi-minute hang this change fixes --
+# with a 16-wide pool a handful of hangs would otherwise stack up to real wall-clock damage.
+LIBRARY_PATHS_TIMEOUT = 30
 run_failed = False
 
 
@@ -314,13 +332,17 @@ def mend_v2_token() -> str:
     return token
 
 
-def _get_v2(url: str, token: str, params: dict):
+def _get_v2(url: str, token: str, params: dict, timeout: float = None):
+    # timeout is optional and defaults to None (today's behaviour: no timeout at all) so every
+    # existing caller (call_ws_api_v2, call_ws_api_v3, the 2.0 login) is byte-for-byte unaffected.
+    # Only the batch /paths fetch (_fetch_paths_batch, Task 2) passes one -- a tool-wide timeout
+    # is a separate, wider decision left for later.
     global WARNING_MSG
     try:
         with warnings.catch_warnings(record=True) as warning_list:
             warnings.simplefilter("always", InsecureRequestWarning)
             res_ = requests.get(url, params=params or {}, verify=verify_setting(),
-                                proxies=conf.proxy,
+                                proxies=conf.proxy, timeout=timeout,
                                 headers={"Authorization": f"Bearer {token}",
                                          "Content-Type": "application/json"})
         if not WARNING_MSG:
@@ -951,6 +973,57 @@ def per_cve_mode() -> bool:
     "true" is per-CVE -- the same test render_entry_v3 has always applied.
     """
     return str(getattr(conf, "dependency", "")).lower() != "true"
+
+
+def dep_paths_enabled() -> bool:
+    """MEND_DEPPATHS -- kill switch for attach_library_paths' /paths fetch, default ON.
+
+    The ONE place conf.dep_paths is turned into a boolean, the same pattern as per_cve_mode:
+    attach_library_paths reads this directly rather than each call site re-deriving it.
+
+    Only an explicit false-y value ("false"/"no"/"0", case-insensitive) turns it off. Unset,
+    blank, or an unexpanded Azure placeholder ("$(MEND_DEPPATHS)") all mean "fetch them" --
+    exactly the behaviour before this variable existed, so a typo can never silently disable a
+    feature nobody asked to turn off (same reasoning as verify_setting for MEND_SSLVERIFY).
+    """
+    raw = str(getattr(conf, "dep_paths", "") or "").strip().lower()
+    return raw not in ("false", "no", "0")
+
+
+def library_paths_pool_size() -> int:
+    """MEND_DEPPATHS_CONCURRENCY -> the ThreadPoolExecutor width for the batch /paths fetch.
+
+    The ONE place conf.dep_paths_concurrency is turned into a number -- the same one-place
+    pattern as per_cve_mode and verify_setting, so nothing else in the codebase re-parses it.
+
+    Unset, blank, or an unexpanded placeholder defaults to LIBRARY_PATHS_POOL_SIZE (16, the
+    value the brief specifies). A non-numeric value, a negative value, or exactly `0` is a config
+    mistake rather than a request for a serial or degenerate pool -- each falls back to the same
+    default, and each is logged at WARNING so a typo in a pipeline variable is visible instead of
+    silently changing performance. A value above LIBRARY_PATHS_POOL_SIZE_MAX is clamped down to
+    it rather than rejected, so pasting an unreasonably large number gets a safe upper bound
+    instead of an error. `1` is returned exactly as given -- it makes the fetch genuinely serial
+    and is a useful escape hatch while diagnosing, exercising the same batch code path as any
+    other pool size rather than a special case.
+    """
+    raw = str(getattr(conf, "dep_paths_concurrency", "") or "").strip()
+    if not raw or re.match(r"^\$\(.+\)$", raw):
+        return LIBRARY_PATHS_POOL_SIZE
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} is not a whole number; "
+                       f"using the default of {LIBRARY_PATHS_POOL_SIZE}.")
+        return LIBRARY_PATHS_POOL_SIZE
+    if value <= 0:
+        logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} must be a positive integer; "
+                       f"using the default of {LIBRARY_PATHS_POOL_SIZE}.")
+        return LIBRARY_PATHS_POOL_SIZE
+    if value > LIBRARY_PATHS_POOL_SIZE_MAX:
+        logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} exceeds the maximum of "
+                       f"{LIBRARY_PATHS_POOL_SIZE_MAX}; clamping to it.")
+        return LIBRARY_PATHS_POOL_SIZE_MAX
+    return value
 
 
 def run_severity_floor() -> float:
@@ -2428,10 +2501,68 @@ def fetch_v2_library_paths(project_uuid: str, library_uuid: str) -> list:
     return list(result)
 
 
+def _fetch_paths_batch(project_uuid: str, library_uuids: list) -> dict:
+    """Concurrently fetch /paths for many libraries in one project; the fix for this change.
+
+    Returns {library_uuid: (payload, errorcode)} for every uuid actually attempted. Workers touch
+    NO shared state -- each is a bare `_get_v2` call whose only output is its own return value;
+    the JWT is pre-warmed once before fanning out so no worker ever triggers its own re-login.
+    All mutation (the cache, the breaker counters, entry["paths"]) happens on the caller's main
+    thread, after this function returns, in the deterministic (sorted) order attach_library_paths
+    applies -- see its docstring and the breaker's own docstring on fetch_v2_library_paths for why
+    that determinism matters.
+
+    Returns {} and makes no call at all if there is nothing to fetch, or if the breaker is
+    already tripped -- "subsequent batches make no calls at all" once tripped.
+
+    A 401/403 on any worker means the pre-warmed JWT expired mid-fan-out. That is handled here,
+    once, on this thread, after every worker has returned: one fresh mend_v2_session = None, one
+    fresh mend_v2_token(), and one retry pass over just the uuids that failed that way -- never a
+    re-login inside a worker.
+    """
+    global mend_v2_session
+    if not library_uuids or library_paths_breaker_tripped:
+        return {}
+    uuids = sorted(set(library_uuids))
+    token = mend_v2_token()
+    pool_size = min(library_paths_pool_size(), len(uuids))
+
+    def _fetch_one(library_uuid, bearer):
+        url = f"{mend_api_url()}/api/v2.0/projects/{project_uuid}/libraries/{library_uuid}/paths"
+        payload, errorcode = _get_v2(url, bearer, None, timeout=LIBRARY_PATHS_TIMEOUT)
+        return library_uuid, payload, errorcode
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=pool_size) as pool:
+        for library_uuid, payload, errorcode in pool.map(
+                lambda u: _fetch_one(u, token), uuids):
+            results[library_uuid] = (payload, errorcode)
+
+    retry_uuids = sorted(uuid for uuid, (_, code) in results.items() if code in (401, 403))
+    if retry_uuids:
+        mend_v2_session = None
+        retry_token = mend_v2_token()
+        retry_pool_size = min(library_paths_pool_size(), len(retry_uuids))
+        with ThreadPoolExecutor(max_workers=retry_pool_size) as pool:
+            for library_uuid, payload, errorcode in pool.map(
+                    lambda u: _fetch_one(u, retry_token), retry_uuids):
+                results[library_uuid] = (payload, errorcode)
+
+    return results
+
+
 def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
     """Fill in entry["paths"] for every `desired` entry that has earned a dependency-path call.
 
-    Called from fetch_v3_desired after `desired` is fully assembled. Per entry:
+    Called from fetch_v3_desired after `desired` is fully assembled. Rewritten (see the
+    dep-paths-perf brief) into three passes so the number of HTTP calls scales with distinct
+    transitive libraries, fetched CONCURRENTLY, instead of one serial call per entry:
+
+    1. Selection -- unchanged filter, verbatim: skip non-dict entries, skip vulnerability entries
+       when `per_cve` is False, resolve `render_inputs(entry)`, skip unless
+       dependency_type.strip().lower() == "transitive", skip entries with no library_uuid.
+       Collected into {library_uuid: [entry, ...]} so several entries sharing one uuid (every CVE
+       of one library in per-CVE mode) still cost ONE call, exactly as before.
       - `render_inputs(entry)` resolves library_uuid and dependency_type -- called again here
         (it already runs at render time) deliberately, so the fetch and the render can never
         disagree about which library an item is about; it is pure and cheap.
@@ -2444,10 +2575,29 @@ def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
         MEND_DEPENDENCY=true root-grouping descriptions are out of scope. License entries are
         fetched in both modes.
       - An entry with no library_uuid is skipped -- there is nothing to look up.
-    Every other entry gets entry["paths"] = fetch_v2_library_paths(project_uuid, library_uuid),
-    which is itself memoised, so calling this once per project costs one HTTP call per distinct
-    (project, library) pair, not one per entry.
+    2. Batch fetch (_fetch_paths_batch) of only the uuids not already in library_paths_cache.
+       Its raw (payload, errorcode) results are then applied HERE, on the main thread, in
+       library_uuid-sorted order, one at a time -- the circuit breaker
+       (library_paths_consecutive_failures / library_paths_breaker_tripped /
+       LIBRARY_PATHS_BREAKER_THRESHOLD) is evaluated exactly as fetch_v2_library_paths always
+       evaluated it, just against pre-fetched results instead of a fresh call per entry, so "five
+       consecutive failures" stays a meaningful, deterministic count even though the underlying
+       HTTP calls raced concurrently. Once tripped mid-batch, the remaining (already-fetched)
+       results are not applied -- those entries simply get no cached path this run, same
+       observable outcome as if fetch_v2_library_paths had refused the call.
+    3. Assignment -- entry["paths"] for every collected entry, read back out of
+       library_paths_cache (a cache hit either way: pre-existing, or just populated in step 2).
+
+    MEND_DEPPATHS (dep_paths_enabled) is the run's kill switch: if disabled, this returns
+    immediately, making no calls at all, and every entry is left exactly as fetch_v3_desired
+    built it -- descriptions fall back to the pre-existing rendering (no nested list; the flat
+    parents fallback for a non-direct library, same as an unknown dependency_type today).
     """
+    if not dep_paths_enabled():
+        return
+    global library_paths_consecutive_failures, library_paths_breaker_tripped
+    start = time.monotonic()
+    by_uuid = {}
     for entry in desired.values():
         if not isinstance(entry, dict):
             continue
@@ -2460,7 +2610,48 @@ def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
         library_uuid = inputs.get("library_uuid") or ""
         if not library_uuid:
             continue
-        entry["paths"] = fetch_v2_library_paths(project_uuid, library_uuid)
+        by_uuid.setdefault(library_uuid, []).append(entry)
+
+    to_fetch = sorted(uuid for uuid in by_uuid if (project_uuid, uuid) not in library_paths_cache)
+    cache_hits = len(by_uuid) - len(to_fetch)
+    failed = 0
+
+    results = _fetch_paths_batch(project_uuid, to_fetch) if to_fetch else {}
+    for library_uuid in sorted(results):
+        if library_paths_breaker_tripped:
+            break
+        payload, errorcode = results[library_uuid]
+        cache_key = (project_uuid, library_uuid)
+        if errorcode != 0:
+            logger.warning(f"[{fn()}] Could not read dependency paths for library "
+                           f"{library_uuid} in project {project_uuid}. This work item's "
+                           f"description will omit its dependency path this run; closure is "
+                           f"NOT affected -- see fetch_v2_library_paths.")
+            result = []
+            failed += 1
+            library_paths_consecutive_failures += 1
+            if library_paths_consecutive_failures >= LIBRARY_PATHS_BREAKER_THRESHOLD:
+                library_paths_breaker_tripped = True
+                logger.error(f"[{fn()}] Dependency-path lookups failed "
+                            f"{LIBRARY_PATHS_BREAKER_THRESHOLD} times in a row (most recently "
+                            f"for library {library_uuid} in project {project_uuid}). Giving up "
+                            f"on /paths for the rest of this run -- likely cause: the "
+                            f"configured PAT lacks Mend 2.0 permission. Every remaining work "
+                            f"item's description this run will omit its dependency hierarchy; "
+                            f"closure is NOT affected.")
+        else:
+            library_paths_consecutive_failures = 0
+            result = normalise_library_paths(payload)
+        library_paths_cache[cache_key] = result
+
+    for library_uuid, entries in by_uuid.items():
+        paths = list(library_paths_cache.get((project_uuid, library_uuid), []))
+        for entry in entries:
+            entry["paths"] = paths
+
+    logger.debug(f"[{fn()}] project {project_uuid}: {len(results)} /paths call(s) made, "
+                f"{cache_hits} served from cache, {failed} failed, "
+                f"{time.monotonic() - start:.2f}s elapsed.")
 
 
 def fetch_v3_desired(project_uuid: str, floor: float):
@@ -2614,6 +2805,8 @@ def startup():
         closed_state=varenvs.get_env("wsclosedstate").strip(),
         reopen_state=varenvs.get_env("wsreopenstate").strip(),
         ssl_verify=varenvs.get_env("wssslverify").strip(),
+        dep_paths=varenvs.get_env("wsdeppaths").strip(),
+        dep_paths_concurrency=varenvs.get_env("wsdeppathsconcurrency").strip(),
     )
     try:
         return conf
