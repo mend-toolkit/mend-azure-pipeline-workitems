@@ -343,6 +343,9 @@ def normalise_library_components(rows) -> dict:
             # license entry otherwise has no source for -- see library_url) and the License
             # Details link when Mend publishes no license text URL.
             "mend_url": references.get("url") or references.get("homePage") or "",
+            # LibraryComponentDTOV3.uuid -- carried so a later stage can fetch this library's
+            # dependency path without a second lookup keyed by name.
+            "library_uuid": component.get("uuid") or "",
         }
         current = index.setdefault(lib, dict.fromkeys(found, ""))
         for key, value in found.items():
@@ -401,6 +404,8 @@ def normalise_libraries(rows) -> dict:
             # LibraryDTOV3 has no ComponentReferencesDTO, so it cannot supply the Mend library
             # page -- the key is present and empty so the due-diligence index can fill it.
             "mend_url": "",
+            # LibraryDTOV3.uuid -- see normalise_library_components for why this is carried.
+            "library_uuid": row.get("uuid") or "",
         }
         current = index.setdefault(lib, dict.fromkeys(found, ""))
         for key, value in found.items():
@@ -461,6 +466,57 @@ def normalise_library_licenses(rows) -> dict:
                 "reference_file": reference,
             })
     return index
+
+
+def _path_order(node: dict):
+    """A libraryPath node's `order`, or 0 when missing/non-integer -- never raises, never None."""
+    try:
+        return int(node.get("order"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalise_library_paths(payload) -> list:
+    """The Mend 2.0 dependency-path payload -> [[name, name, ...], ...], root first.
+
+    {"retVal": [{"libraryPath": [{uuid, name, order}, ...]}, ...]}. Each entry's nodes are sorted
+    by `order` (stably, so nodes sharing an order keep their arrival sequence) and reduced to
+    their names; a node that is not a dict or carries no name is dropped, and a path that ends up
+    empty after that filtering is skipped entirely.
+
+    retVal's OWN order is preserved, never sorted -- Global Constraint 1 -- because it is the
+    order Mend chose to present the paths in and this module has no basis to reorder it.
+
+    Identical chains (same names, same order) are deduped, keeping the first-seen position: two
+    retVal entries that reduce to the same chain render as one bullet block, not two.
+
+    A non-dict payload, a missing/non-list `retVal`, or `None` yields [] rather than raising.
+    """
+    if not isinstance(payload, dict):
+        return []
+    entries = payload.get("retVal")
+    if not isinstance(entries, list):
+        return []
+
+    chains = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        library_path = entry.get("libraryPath")
+        if not isinstance(library_path, list):
+            continue
+        nodes = [n for n in library_path if isinstance(n, dict)]
+        nodes.sort(key=_path_order)
+        names = [n.get("name") for n in nodes if n.get("name")]
+        if not names:
+            continue
+        key = tuple(names)
+        if key in seen:
+            continue
+        seen.add(key)
+        chains.append(names)
+    return chains
 
 
 def merge_component_index(primary: dict, fallback: dict) -> dict:
@@ -876,6 +932,9 @@ def _component_fields(finding: dict) -> dict:
         or first_location.get("dependencyFile") or "",
         "library_path": component.get("localPath") or component.get("path")
         or first_location.get("localPath") or "",
+        # BaseLocationComponentDTOV3.uuid -- see normalise_library_components for why this is
+        # carried.
+        "library_uuid": component.get("uuid") or "",
     }
 
 
@@ -936,17 +995,29 @@ def render_inputs(entry: dict) -> dict:
         "dependency_type": "",
         "dependency_file": "",
         "library_path": "",
+        "library_uuid": "",
         "parents": [],
         "vulnerabilities": [],
+        "paths": [],
     }
     if not isinstance(entry, dict):
         return result
+
+    # Set before either branch returns, so a license entry (which returns early below) gets it
+    # too. Guarded to a list of non-empty lists of strings: anything else is not a chain this
+    # renderer can trust, and yields [] rather than a malformed shape downstream code must guard
+    # against a second time.
+    raw_paths = entry.get("paths")
+    if isinstance(raw_paths, list):
+        result["paths"] = [p for p in raw_paths
+                            if isinstance(p, list) and p
+                            and all(isinstance(name, str) for name in p)]
 
     if entry.get("kind") != "vulnerability":
         component = entry.get("component")
         if isinstance(component, dict):
             for key in ("version", "description", "dependency_type", "dependency_file",
-                        "library_path", "home_page"):
+                        "library_path", "home_page", "library_uuid"):
                 result[key] = component.get(key) or ""
             # mend_url is deliberately NOT copied: it is the Hyperlink relation's value (see
             # library_url), not a line in the description.
@@ -968,7 +1039,7 @@ def render_inputs(entry: dict) -> dict:
     # it, because the index row is keyed by the work item's own library and the finding is not.
     sources = (from_finding, from_index) if matched else (from_index, from_finding)
     for key in ("version", "description", "dependency_type", "dependency_file",
-                "library_path", "home_page"):
+                "library_path", "home_page", "library_uuid"):
         for candidate in sources:
             value = candidate.get(key) or ""
             if value:

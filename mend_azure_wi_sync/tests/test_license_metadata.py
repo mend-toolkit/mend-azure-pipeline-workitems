@@ -23,6 +23,7 @@ def _dd_row(lib="log4j-core", name="GPL-3.0"):
         "name": name,
         "component": {
             "name": lib,
+            "uuid": "lib-uuid-log4j-core",
             "version": "2.14.1",
             "description": "Apache Log4j Core",
             "dependencyType": "Transitive",
@@ -55,6 +56,7 @@ def test_component_index_is_keyed_by_library_and_carries_the_render_fields():
         "library_path": "/root/.m2/log4j-core-2.14.1.jar",
         "home_page": "https://logging.apache.org/log4j/",
         "mend_url": "https://logging.apache.org/log4j/",
+        "library_uuid": "lib-uuid-log4j-core",
     }}
 
 
@@ -98,6 +100,21 @@ def test_garbage_input_returns_an_empty_index_rather_than_raising():
     assert source3.normalise_library_components(None) == {}
     assert source3.normalise_library_components(["nope", 42, None]) == {}
     assert source3.normalise_library_components([]) == {}
+
+
+def test_library_uuid_is_carried_and_first_non_empty_wins():
+    sparse = _dd_row(name="MIT")
+    sparse["component"]["uuid"] = ""
+    full = _dd_row(name="GPL-3.0")
+    index = source3.normalise_library_components([sparse, full])
+    assert index["log4j-core"]["library_uuid"] == "lib-uuid-log4j-core"
+
+
+def test_library_uuid_is_always_present_and_a_string_when_unknown():
+    row = _dd_row()
+    row["component"].pop("uuid")
+    index = source3.normalise_library_components([row])
+    assert index["log4j-core"]["library_uuid"] == ""
 
 
 # ------------------------------------------------------------------------------- render_inputs
@@ -274,6 +291,7 @@ def _lib_row(lib="log4j-core", locations=None, licenses=None):
     """One LibraryDTOV3 row."""
     return {
         "name": lib,
+        "uuid": "lib-uuid-log4j-core",
         "version": "2.14.1",
         "description": "Apache Log4j Core (libraries call)",
         "dependencyType": "Transitive",
@@ -298,7 +316,17 @@ def test_library_rows_yield_the_same_component_shape_as_due_diligence():
         "home_page": "https://logging.apache.org/log4j/",
         # LibraryDTOV3 carries no ComponentReferencesDTO -- due diligence fills this on merge.
         "mend_url": "",
+        "library_uuid": "lib-uuid-log4j-core",
     }}
+
+
+def test_library_uuid_is_carried_from_the_libraries_call():
+    row = _lib_row()
+    row["uuid"] = ""
+    index = source3.normalise_libraries([row])
+    assert index["log4j-core"]["library_uuid"] == ""
+    assert source3.normalise_libraries([_lib_row()])["log4j-core"]["library_uuid"] \
+        == "lib-uuid-log4j-core"
 
 
 def test_paths_come_from_the_first_location_that_has_them():

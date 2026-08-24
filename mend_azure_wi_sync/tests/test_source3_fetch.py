@@ -201,7 +201,7 @@ def test_fetch_v3_licenses_normalises_and_reports_ok():
     assert components == {"log4j-core": {"version": "", "description": "",
                                          "dependency_type": "", "dependency_file": "",
                                          "library_path": "", "home_page": "",
-                                         "mend_url": ""}}
+                                         "mend_url": "", "library_uuid": ""}}
     assert index == {"log4j-core": [
         {"name": "MIT", "url": "https://opensource.org/licenses/MIT",
          "reference_file": "https://repo.maven.apache.org/log4j-core.pom"}]}

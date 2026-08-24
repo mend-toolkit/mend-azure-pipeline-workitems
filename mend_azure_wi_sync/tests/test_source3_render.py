@@ -5,6 +5,7 @@ def _finding(**overrides):
     finding = {
         "component": {
             "name": "lodash",
+            "uuid": "lib-uuid-lodash",
             "description": "Lodash modular utilities.",
             "version": "4.17.15",
             "dependencyType": "",
@@ -58,6 +59,49 @@ def test_fields_are_lifted_from_component_and_references():
     assert result["home_page"] == "https://lodash.com/"
     assert result["dependency_file"] == "package.json"
     assert result["library_path"] == "/app/node_modules/lodash"
+
+
+def test_library_uuid_is_lifted_from_the_matched_findings_component():
+    entry = {"library": "lodash", "kind": "vulnerability", "findings": [_finding()]}
+    result = source3.render_inputs(entry)
+    assert result["library_uuid"] == "lib-uuid-lodash"
+
+
+def test_library_uuid_is_lifted_from_the_attached_component_for_a_license_entry():
+    entry = {
+        "library": "some-lib",
+        "kind": "license",
+        "findings": [{"findingType": "LEGAL", "originName": "some-lib"}],
+        "component": {"library_uuid": "lib-uuid-license"},
+    }
+    result = source3.render_inputs(entry)
+    assert result["library_uuid"] == "lib-uuid-license"
+
+
+def test_paths_default_to_empty_list_when_entry_has_none():
+    entry = {"library": "lodash", "kind": "vulnerability", "findings": [_finding()]}
+    result = source3.render_inputs(entry)
+    assert result["paths"] == []
+
+    license_entry = {"library": "x", "kind": "license", "findings": []}
+    assert source3.render_inputs(license_entry)["paths"] == []
+
+
+def test_paths_pass_through_when_well_formed():
+    well_formed = [["app", "express", "lodash"], ["app", "webpack", "lodash"]]
+    entry = {"library": "lodash", "kind": "vulnerability", "findings": [_finding()],
+              "paths": well_formed}
+    result = source3.render_inputs(entry)
+    assert result["paths"] == well_formed
+
+
+def test_paths_are_guarded_to_lists_of_strings():
+    entry = {
+        "library": "lodash", "kind": "vulnerability", "findings": [_finding()],
+        "paths": [["app", "lodash"], "not-a-list", [], [1, 2], ["ok"], None],
+    }
+    result = source3.render_inputs(entry)
+    assert result["paths"] == [["app", "lodash"], ["ok"]]
 
 
 def test_dependency_type_prefers_component_then_falls_back_to_context():
@@ -197,8 +241,10 @@ def test_license_entry_with_no_component_attached_returns_only_the_library_name(
         "dependency_type": "",
         "dependency_file": "",
         "library_path": "",
+        "library_uuid": "",
         "parents": [],
         "vulnerabilities": [],
+        "paths": [],
     }
 
 
@@ -223,8 +269,10 @@ def test_malformed_entry_inputs_never_raise():
         "dependency_type": "",
         "dependency_file": "",
         "library_path": "",
+        "library_uuid": "",
         "parents": [],
         "vulnerabilities": [],
+        "paths": [],
     }
     assert source3.render_inputs({"library": "x", "kind": "vulnerability", "findings": [None, "not-a-dict"]}) == {
         "library": "x",
@@ -234,6 +282,8 @@ def test_malformed_entry_inputs_never_raise():
         "dependency_type": "",
         "dependency_file": "",
         "library_path": "",
+        "library_uuid": "",
         "parents": [],
         "vulnerabilities": [],
+        "paths": [],
     }
