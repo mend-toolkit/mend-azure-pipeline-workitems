@@ -7,6 +7,7 @@ else. Every title generated here -- dependency mode AND per-CVE mode -- is asser
 round-trip.
 """
 
+import re
 from unittest import mock
 
 from mend_azure_wi_sync import core, source3
@@ -317,6 +318,77 @@ def test_reachability_stays_gated_on_mend_reachability():
     (_, _, _), on = _run(desired, conf=_conf(reachability="true"))
     desc = _field(_posted(on)[0], "/fields/System.Description")
     assert "<b>Reachability</b>" in desc and "<b>Reachability:</b>" in desc
+
+
+# --- the Type column is relative to THIS work item's root, not Mend's global dependencyType --
+
+def _type_cell_for(desc, library):
+    """Pull the rendered Type value out of the table row whose Dependency cell is `library`.
+    The table renders Dependency immediately followed by Type (URL is dropped last), with no
+    reachability column in these tests, so the pattern is exact."""
+    match = re.search(
+        r"<td style='border: 1px solid black; padding: 5px;'>" + re.escape(library) +
+        r"</td><td style='border: 1px solid black; padding: 5px;'>(\w+)</td></tr>", desc)
+    assert match, f"no table row found for library {library!r} in:\n{desc}"
+    return match.group(1)
+
+
+def test_root_grouped_row_for_the_root_itself_is_direct():
+    """body-parser is its own root: the row for body-parser under the body-parser root item
+    must render Direct."""
+    conf = _conf()
+    entry = _vuln_entry(_finding(lib="body-parser-1.18.3.tgz"))
+    entry["library"] = "body-parser-1.18.3.tgz"
+    with mock.patch.object(core, "conf", conf):
+        items = core.render_entry_v3("vulnerability", "body-parser-1.18.3.tgz", entry, False)
+    assert _type_cell_for(items[0]["desc"], "body-parser-1.18.3.tgz") == "Direct"
+
+
+def test_root_grouped_row_for_a_library_under_a_different_root_is_transitive():
+    """The same finding, filed under the express root instead, must render Transitive for the
+    exact same body-parser row -- this is the live bug: one library, two roots, two verdicts."""
+    conf = _conf()
+    entry = _vuln_entry(_finding(lib="body-parser-1.18.3.tgz"))
+    entry["library"] = "express-4.16.4.tgz"
+    with mock.patch.object(core, "conf", conf):
+        items = core.render_entry_v3("vulnerability", "express-4.16.4.tgz", entry, False)
+    assert _type_cell_for(items[0]["desc"], "body-parser-1.18.3.tgz") == "Transitive"
+
+
+def test_type_ignores_mends_own_dependency_type_when_library_differs_from_root():
+    """Mend's component.dependencyType says Direct, but the row's library is not this item's
+    root, so the rendered verdict must still be Transitive."""
+    conf = _conf()
+    finding = _finding(lib="qs-6.5.2.tgz")
+    finding["component"]["dependencyType"] = "Direct"
+    entry = _vuln_entry(finding)
+    entry["library"] = "express-4.16.4.tgz"
+    with mock.patch.object(core, "conf", conf):
+        items = core.render_entry_v3("vulnerability", "express-4.16.4.tgz", entry, False)
+    assert _type_cell_for(items[0]["desc"], "qs-6.5.2.tgz") == "Transitive"
+
+
+def test_type_verdict_is_exact_not_case_folded():
+    """Whitespace around either name must not change the verdict, but case must still matter --
+    stripping is required, case-folding is not (it could merge distinct library names)."""
+    conf = _conf()
+    entry = _vuln_entry(_finding(lib="  body-parser-1.18.3.tgz  "))
+    entry["library"] = " body-parser-1.18.3.tgz "
+    with mock.patch.object(core, "conf", conf):
+        items = core.render_entry_v3("vulnerability", "body-parser-1.18.3.tgz", entry, False)
+    assert _type_cell_for(items[0]["desc"], "  body-parser-1.18.3.tgz  ") == "Direct"
+
+
+def test_type_fix_leaves_other_columns_and_the_title_unchanged():
+    conf = _conf()
+    entry = _vuln_entry(_finding(lib="body-parser-1.18.3.tgz"))
+    entry["library"] = "express-4.16.4.tgz"
+    with mock.patch.object(core, "conf", conf):
+        items = core.render_entry_v3("vulnerability", "express-4.16.4.tgz", entry, False)
+    assert items[0]["title"] == "express-4.16.4.tgz: 1 vulnerabilities (highest severity is 7.4)"
+    desc = items[0]["desc"]
+    assert "CVE-2020-8203" in desc
+    assert "<b>EPSS</b>" in desc and "<b>Exploit</b>" in desc
 
 
 def test_per_cve_mode_creates_one_work_item_per_cve():

@@ -1667,7 +1667,14 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
                 # The actually-vulnerable library, per row. Under root grouping one item covers
                 # several, so this column carries information for the first time.
                 "Dependency": row.get("library", ""),
-                "Type": row.get("dependency_type", ""),
+                # Relative to THIS work item's root, not Mend's global dependencyType: a library
+                # can be direct under one root and transitive under another (body-parser is both
+                # a direct dependency of itself and a transitive one via express), so the verdict
+                # is "Direct" iff the row's library equals the root, else "Transitive" -- always
+                # one or the other, no fallback. Stripped but NOT case-folded: folding could
+                # merge two genuinely distinct library names.
+                "Type": "Direct" if str(row.get("library", "")).strip() ==
+                str(library).strip() else "Transitive",
                 # No "Fixed in": Mend publishes no per-CVE root fix version, and the transitive
                 # library's version is not something an operator can set. Remediation is stated
                 # once, at root level, by remediation_block_v3.
