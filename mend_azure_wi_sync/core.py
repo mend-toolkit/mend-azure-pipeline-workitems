@@ -1464,8 +1464,8 @@ def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False,
 
     `leaf_label` is threaded through to generate_html_nested_list: "Vulnerable Library" on a
     vulnerability item, "" on a license item, where the leaf is not vulnerable and must not
-    say so (Task 4 decides root-grouping's leaf_label; this call site keeps with_hierarchy=False
-    for it either way, so leaf_label is moot there for now).
+    say so. The root-grouping call site keeps with_hierarchy=False (Global Constraint 4, out of
+    scope for Task 4), so leaf_label is moot there.
     """
     # "Root Library" in dependency mode: the item is about the direct dependency an operator can
     # upgrade, not about the transitive library the CVE is in.
@@ -1519,7 +1519,7 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
     licenses = entry.get("licenses") or [] if isinstance(entry, dict) else []
 
     if kind == "license":
-        desc = library_block_v3(inputs, with_hierarchy=False) + \
+        desc = library_block_v3(inputs, with_hierarchy=True, leaf_label="") + \
             build_license_html_v3(licenses, license_policy_name(entry), library_url(entry))
         return [{"title": license_title(library), "desc": desc, "score": "", "exact": True}]
 

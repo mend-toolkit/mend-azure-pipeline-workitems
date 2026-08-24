@@ -147,3 +147,68 @@ def test_with_hierarchy_false_never_renders_the_line_even_with_paths():
     inputs = _inputs(paths=[["app", "fastify"]], dependency_type="Transitive")
     block = core.library_block_v3(inputs, with_hierarchy=False)
     assert "Dependency Hierarchy" not in block
+
+
+# --------------------------------------------------------------- Task 4: license items, via render_entry_v3
+
+def _license_entry(**overrides):
+    entry = {
+        "library": "lodash", "kind": "license",
+        "component": {"description": "A framework", "dependency_type": "Transitive",
+                      "dependency_file": "package.json",
+                      "library_path": "/app/node_modules/lodash",
+                      "home_page": "https://lodash.com/"},
+        "findings": [{"findingType": "LEGAL", "originName": "lodash",
+                      "name": "[Legal] No copyleft", "uuid": "v-1"}],
+        "licenses": [{"name": "GPL-3.0", "url": "https://spdx.org/gpl",
+                      "reference_file": "pom.xml"}],
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _render_license(entry):
+    from unittest import mock
+    conf = mock.MagicMock(dependency="true")
+    with mock.patch.object(core, "conf", conf):
+        return core.render_entry_v3("license", "lodash", entry, False)[0]["desc"]
+
+
+def test_license_entry_with_paths_renders_nested_hierarchy_with_unlabelled_leaf():
+    entry = _license_entry(paths=[["app", "express", "lodash"]])
+    desc = _render_license(entry)
+    assert "<br><b>Dependency Hierarchy: </b><br>" in desc
+    assert "app (Root Library)" in desc
+    assert "<li>lodash</li>" in desc
+    assert "lodash (Vulnerable Library)" not in desc
+
+
+def test_license_entry_without_paths_is_byte_identical_to_the_pre_task_4_baseline():
+    """Baseline captured before flipping with_hierarchy on for the license branch (Task 4):
+    with no paths and a license entry's parents always empty (render_inputs never populates
+    them for kind == "license"), the hierarchy branch has nothing to render either way -- this
+    pins that so the license description does not change shape for the common no-paths case."""
+    entry = _license_entry()
+    desc = _render_license(entry)
+    baseline = (
+        "<b>Library - </b>lodash<br>A framework<br>"
+        "<b>Path to dependency file: </b>package.json<br>"
+        "<b>Path to library:</b>/app/node_modules/lodash<br>"
+        "<b>Vulnerable Library: </b>lodash<br>"
+        "<b> Library home page: </b><a href='https://lodash.com/'>https://lodash.com/</a>"
+        "<details>\n  <summary><b>License Details</b></summary>\n  "
+        "<p><a href='https://spdx.org/gpl'>GPL-3.0</a><br>"
+        "<b>License Reference File: </b><a href='pom.xml'>pom.xml</a><br>"
+        "<b>License Policy Violation - </b>No copyleft<br></p>\n</details>"
+    )
+    assert desc == baseline
+    assert "Dependency Hierarchy" not in desc
+
+
+def test_root_grouping_vulnerability_description_is_unchanged_by_task_4():
+    """Global Constraint 4: MEND_DEPENDENCY=true root-grouping vulnerability items are out of
+    scope. This pins library_block_v3(root=True) -- the root-grouping call site -- to stay at
+    with_hierarchy=False regardless of what Task 4 does to the license call site."""
+    inputs = _inputs(paths=[["app", "express", "fastify"]], dependency_type="Transitive")
+    block = core.library_block_v3(inputs, with_hierarchy=False, root=True)
+    assert "Dependency Hierarchy" not in block
