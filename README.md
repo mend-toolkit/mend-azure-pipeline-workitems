@@ -8,7 +8,7 @@
 A self-hosted tool that creates, updates and closes Azure Work Items from Mend SCA findings.  
 
 The tool is deployed within an Azure Pipeline triggered on fixed intervals by a cron schedule.  
-It runs entirely on **Mend API 3.0**. Every run reads each in-scope Mend project's **complete current state** — its security findings, its license policy violations and its library licenses — and then reconciles Azure DevOps against it: it creates a Work Item for a finding that has none, updates one whose finding has changed, **closes** one whose finding is gone, and **reopens** one whose finding has come back.  
+It runs on **Mend API 3.0**, with one read-only call to **Mend API 2.0** per library for dependency paths (see [Dependency Hierarchy](#dependency-hierarchy)). Every run reads each in-scope Mend project's **complete current state** — its security findings, its license policy violations and its library licenses — and then reconciles Azure DevOps against it: it creates a Work Item for a finding that has none, updates one whose finding has changed, **closes** one whose finding is gone, and **reopens** one whose finding has come back.  
 
 There is no watermark, no "modified since" window and no stored sync state. A run that fails is simply repeated in full on the next schedule.  
 
@@ -34,6 +34,7 @@ There is no watermark, no "modified since" window and no stored sync state. A ru
 - [Azure Pipeline Variables](#azure-pipeline-variables)
 - [Enrichment: Reachability, EPSS and Exploit Code Maturity](#enrichment-reachability-epss-and-exploit-code-maturity)
 - [Root Library Grouping and Remediation](#root-library-grouping-and-remediation)
+- [Dependency Hierarchy](#dependency-hierarchy)
 - [Setting Scan Tags for Tag-Based Routing](#setting-scan-tags-for-tag-based-routing)
 - [Closing and Reopening Work Items](#closing-and-reopening-work-items)
 - [Unchanged Work Items and State Preservation](#unchanged-work-items-and-state-preservation)
@@ -57,6 +58,7 @@ There is no watermark, no "modified since" window and no stored sync state. A ru
 * Mend SCA license policies, if you want license Work Items — see [Mend SCA Setup](#mend-sca-setup). Vulnerability Work Items need no policy.
 * Mend SCA service user with associated with a [role assignment](https://docs.mend.io/bundle/sca_user_guide/page/managing_groups.html#Assigning-a-Role-to-a-Group) of either **Organization Administrator** or **Organization Auditor**  
 * The **email address** of that Mend service user, supplied as `MEND_EMAIL`. It is required: the integration logs in against Mend API 2.0 with `MEND_EMAIL` + `MEND_USERKEY` + `MEND_APIKEY` to obtain the JWT that authenticates every Mend API 3.0 call.  
+* That same Mend user needs read access to the **Mend API 2.0** endpoint `/projects/{project}/libraries/{library}/paths`, which supplies the dependency hierarchy. It uses the JWT above, so no extra credential is involved. If access is denied the run does **not** fail: after a handful of consecutive failures the integration stops asking for the rest of the run, logs one ERROR saying so, and every description simply omits its dependency hierarchy. Work Item creation, updating, closing and reopening are all unaffected. Set `MEND_DEPPATHS: false` to skip it deliberately.  
 
 The PAT needs **Work Items (Read, write & manage)** and **Project and Team (Read)**.
 
@@ -162,7 +164,48 @@ Each root-library work item shows **Recommended Fix** and **Recommended Major Ve
 
 >**_NOTE_**: Mend does not publish which individual CVEs a given root version clears. Its remediation fields are aggregate over the root's entire CVE set, and no Mend endpoint joins a CVE to a root-library version. That is why dependency mode's CVE table has no per-CVE **Fixed in** column: the column it replaced showed the *transitive* library's own fix version, which is not something an operator can set by upgrading the root. Treat the absence as a documented Mend API limitation, not a missing feature. `MEND_DEPENDENCY: false` is unaffected and keeps its "Fixed in" column, because a per-CVE work item genuinely is about one CVE in one library.
 
+The CVE table's **Type** column is relative to **that work item's own root**, not to the library's global status in the project: a row reads `Direct` when the vulnerable library *is* the root, and `Transitive` otherwise. This matters because a library can be both. `body-parser` is a direct dependency in its own right *and* is pulled in transitively by `express`, so it gets a work item under each — and the same CVE is correctly labelled `Direct` in one and `Transitive` in the other. Mend's API publishes a single global dependency type per library, which cannot express that.
+
 >**_NOTE_**: This grouping change is a **one-time, disruptive changeover**. Existing dependency-mode vulnerability work items were titled per vulnerable library, and none of those titles match the new root-library titles. The first run after upgrading therefore closes every existing dependency-mode vulnerability work item and creates root-library work items in their place. Comments, assignees and history do not carry across to the new items — the closed items remain in Azure DevOps as a record and are never deleted. On a sampled project this took roughly 40 work items down to 10. Pilot the upgrade on one project before running it fleet-wide.
+<br />
+
+## Dependency Hierarchy
+When a vulnerable library is **transitive** — something you did not ask for, pulled in by something
+you did — its Work Item description shows the full chain from the root library down to it, as
+nested bullets:
+
+```
+Dependency Hierarchy:
+ • forever-2.0.0.tgz (Root Library)
+    • forever-monitor-2.0.0.tgz
+       • chokidar-2.1.8.tgz
+          • anymatch-2.0.0.tgz
+             • micromatch-3.1.10.tgz
+                • nanomatch-1.2.13.tgz
+                   • arr-diff-4.0.0.tgz (Vulnerable Library)
+```
+
+A library reachable by more than one route shows **each** route as its own block, because each is a
+real answer to "why is this here". On a **license** Work Item the same chain is shown, with the last
+entry left unlabelled — the library is not vulnerable, it just carries the license.
+
+**Direct dependencies show no hierarchy line at all.** There is no chain to draw: the library is its
+own root, and the description already names it.
+
+This applies to `MEND_DEPENDENCY: false` (per-CVE) vulnerability Work Items and to license Work
+Items. Root-library Work Items (`MEND_DEPENDENCY: true`) show their CVE table and per-CVE sections
+as before.
+
+The chain comes from Mend API 2.0, one call per distinct library per project — Mend API 3.0
+publishes only a library's immediate root libraries, not the intermediate links. Those calls run
+concurrently and are cached per library, so a library with fifty findings costs one call. Two
+variables control it: `MEND_DEPPATHS` turns it off entirely, and `MEND_DEPPATHS_CONCURRENCY` sets
+how many calls run at once (default `16`). See [Azure Pipeline Variables](#azure-pipeline-variables).
+
+>**_NOTE_**: Adding these lines changes the description of every affected Work Item, so the first
+run after upgrading updates them all once. Titles are unchanged, so nothing is closed, recreated or
+orphaned, and comments, assignees and history are all preserved. Subsequent runs report them as
+unchanged again.
 <br />
 
 ## Setting Scan Tags for Tag-Based Routing
