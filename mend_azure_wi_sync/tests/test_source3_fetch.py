@@ -349,9 +349,20 @@ def test_attach_library_paths_fetches_a_transitive_license_entry():
     assert desired[("license", "log4j-core")]["paths"] == _PATHS_CHAINS
 
 
-def test_a_failed_paths_call_leaves_fetch_v3_desired_ok_true():
-    """The closure interlock: a decorative /paths failure must never gate `ok`. This is the
-    most important test in this task."""
+def _transitive_finding(cve="CVE-1", lib="log4j-core", uuid="lib-uuid-1"):
+    """A per-CVE finding whose component IS uuid-bearing and TRANSITIVE, so
+    attach_library_paths actually calls through to fetch_v2_library_paths rather than skipping
+    the entry for lack of a library_uuid."""
+    return {"name": cve, "findingInfo": {"status": "ACTIVE"},
+           "component": {"name": lib, "uuid": uuid, "dependencyType": "TRANSITIVE"},
+           "vulnerability": {"name": cve, "score": 9.8}}
+
+
+def test_an_empty_attach_pass_leaves_fetch_v3_desired_ok_true():
+    """A project with nothing uuid-bearing/transitive: attach_library_paths runs but never calls
+    through. Kept alongside the end-to-end failure test below because it pins down the OTHER
+    half of the interlock claim -- that simply running attach_library_paths costs nothing when
+    there is nothing to fetch."""
     def fake_pages(api, params=None, limit=1000, method="GET"):
         if _is_root_path(api):
             return [], True
@@ -362,9 +373,34 @@ def test_a_failed_paths_call_leaves_fetch_v3_desired_ok_true():
     _reset_library_paths_cache()
     with mock.patch.object(core, "conf", _conf(dependency="false")), \
          mock.patch.object(core, "fetch_v3_pages", fake_pages), \
-         mock.patch.object(core, "call_ws_api_v2", return_value=({"error": "nope"}, 2)):
+         mock.patch.object(core, "call_ws_api_v2") as api_mock:
         desired, ok = core.fetch_v3_desired("p-1", 7.0)
     assert ok is True
-    # No library_uuid on the stub finding/violation, so nothing was actually fetched -- the point
-    # of this test is that even if it HAD been, a failure could not have touched `ok`.
     assert desired
+    # No library_uuid on the stub finding/violation, so nothing was actually fetched.
+    api_mock.assert_not_called()
+
+
+def test_a_failed_paths_call_leaves_fetch_v3_desired_ok_true():
+    """The closure interlock: a decorative /paths failure must never gate `ok`. This is the
+    most important test in this task -- it must exercise a REAL fetch_v2_library_paths call
+    that actually fails, not an entry attach_library_paths skips before ever reaching it."""
+    def fake_pages(api, params=None, limit=1000, method="GET"):
+        if _is_root_path(api):
+            return [], True
+        if "findings/security" in api:
+            return [_transitive_finding()], True
+        return [_violation()], True
+
+    _reset_library_paths_cache()
+    with mock.patch.object(core, "conf", _conf(dependency="false")), \
+         mock.patch.object(core, "fetch_v3_pages", fake_pages), \
+         mock.patch.object(core, "call_ws_api_v2",
+                           return_value=({"error": "nope"}, 2)) as api_mock:
+        desired, ok = core.fetch_v3_desired("p-1", 7.0)
+    assert ok is True
+    # The call genuinely happened and genuinely failed -- proving the interlock actually held
+    # under a real failure, not merely under an entry that was skipped beforehand.
+    api_mock.assert_called_once_with("projects/p-1/libraries/lib-uuid-1/paths")
+    entry = desired[("vulnerability", "CVE-1|log4j-core")]
+    assert entry["paths"] == []
