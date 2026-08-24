@@ -19,7 +19,8 @@ from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
 from source3 import (library_url, license_policy_name, license_link_report,
                      merge_component_index,
                      merge_license_index, normalise_findings, normalise_libraries,
-                     normalise_library_components, normalise_library_licenses, normalise_licenses,
+                     normalise_library_components, normalise_library_licenses,
+                     normalise_library_paths, normalise_licenses,
                      normalise_projects, normalise_root_libraries, normalise_violations,
                      render_inputs, root_remediation, select_projects, severity_floor)
 import warnings
@@ -68,6 +69,11 @@ updated_wi = []
 # happens to render the same title (see FINDING 1 in the strict-title review) can be detected
 # instead of silently dropped by the `exist_id not in updated_wi` guard below.
 wi_claim_keyid = {}
+# Memoises fetch_v2_library_paths by (project_uuid, library_uuid) for the run. In per-CVE mode
+# every CVE of one library would otherwise issue the same dependency-paths call -- "forever"'s 51
+# findings on one library must cost ONE HTTP round trip, not 51. A failure is cached too, so a
+# PAT lacking permission for this endpoint is not retried on every finding.
+library_paths_cache = {}
 run_failed = False
 
 
@@ -2081,9 +2087,10 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     reports a project's complete current state, so there are no windows, no watermarks and no
     retry queue: a project that fails this run is simply read again in full on the next one.
     """
-    global exist_wis, global_errors, run_failed, synced_projects
+    global exist_wis, global_errors, run_failed, synced_projects, library_paths_cache
     run_failed = False
     synced_projects = []
+    library_paths_cache = {}
     floor = run_severity_floor()
     logger.info(f"Severity floor: MEND_SEVERITY '{conf.severity}' -> {floor}. The SAME floor "
                 f"decides which findings earn a work item and which findings hold one open.")
@@ -2285,6 +2292,80 @@ def fetch_v3_root_libraries(project_uuid: str):
     return normalise_root_libraries(rows), ok
 
 
+def fetch_v2_library_paths(project_uuid: str, library_uuid: str) -> list:
+    """One library's root->leaf dependency chains -> [[name, ...], ...], memoised for the run.
+
+    GET /projects/{projectUuid}/libraries/{libraryUuid}/paths on the Mend 2.0 API -- confirmed
+    live to be unpaged, so this is ONE call and must never be routed through fetch_v3_pages.
+
+    Decorative, like fetch_v3_root_libraries: a failure logs a WARNING (not an error) naming the
+    project and library and returns [], and is deliberately NOT folded into fetch_v3_desired's
+    closure interlock (Global Constraint 2). Dependency paths can only ADD a line to a
+    description; they can never remove a key from `desired`, so a failed call here must never
+    block closure.
+
+    Missing project_uuid or library_uuid returns [] without calling -- a direct dependency or an
+    entry with no library_uuid has nothing to look up.
+
+    Memoised in the module-level `library_paths_cache`, keyed (project_uuid, library_uuid): in
+    per-CVE mode every CVE finding against one library would otherwise issue the identical call.
+    A FAILURE is cached too, not just a success -- a PAT that lacks permission for this endpoint
+    would otherwise retry on every finding in the project for no better result; an empty list is
+    a valid, stable cached answer for the rest of the run.
+    """
+    if not project_uuid or not library_uuid:
+        return []
+    cache_key = (project_uuid, library_uuid)
+    if cache_key in library_paths_cache:
+        return library_paths_cache[cache_key]
+    payload, errorcode = call_ws_api_v2(f"projects/{project_uuid}/libraries/{library_uuid}/paths")
+    if errorcode != 0:
+        logger.warning(f"[{fn()}] Could not read dependency paths for library {library_uuid} "
+                       f"in project {project_uuid}. This work item's description will omit its "
+                       f"dependency path this run; closure is NOT affected -- see "
+                       f"fetch_v2_library_paths.")
+        result = []
+    else:
+        result = normalise_library_paths(payload)
+    library_paths_cache[cache_key] = result
+    return result
+
+
+def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
+    """Fill in entry["paths"] for every `desired` entry that has earned a dependency-path call.
+
+    Called from fetch_v3_desired after `desired` is fully assembled. Per entry:
+      - `render_inputs(entry)` resolves library_uuid and dependency_type -- called again here
+        (it already runs at render time) deliberately, so the fetch and the render can never
+        disagree about which library an item is about; it is pure and cheap.
+      - Direct dependencies get no call and no line (Global Constraint 3): only
+        dependency_type.strip().lower() == "transitive" qualifies. The comparison is
+        case-insensitive because _dependency_type yields "Direct"/"Transitive" from
+        dependencyContexts but falls through to component.dependencyType, whose 3.0 enum is
+        DIRECT/TRANSITIVE.
+      - A vulnerability entry is skipped unless `per_cve` is True (Global Constraint 4):
+        MEND_DEPENDENCY=true root-grouping descriptions are out of scope. License entries are
+        fetched in both modes.
+      - An entry with no library_uuid is skipped -- there is nothing to look up.
+    Every other entry gets entry["paths"] = fetch_v2_library_paths(project_uuid, library_uuid),
+    which is itself memoised, so calling this once per project costs one HTTP call per distinct
+    (project, library) pair, not one per entry.
+    """
+    for entry in desired.values():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("kind") == "vulnerability" and not per_cve:
+            continue
+        inputs = render_inputs(entry)
+        dependency_type = (inputs.get("dependency_type") or "").strip().lower()
+        if dependency_type != "transitive":
+            continue
+        library_uuid = inputs.get("library_uuid") or ""
+        if not library_uuid:
+            continue
+        entry["paths"] = fetch_v2_library_paths(project_uuid, library_uuid)
+
+
 def fetch_v3_desired(project_uuid: str, floor: float):
     """One project's desired end state: {(kind, library): entry}.
 
@@ -2330,7 +2411,8 @@ def fetch_v3_desired(project_uuid: str, floor: float):
     components = merge_component_index(lib_components, dd_components)
     licenses = merge_license_index(lib_licenses, dd_licenses)
 
-    vuln_entries, unscored = normalise_findings(findings, floor, per_cve=per_cve_mode())
+    per_cve = per_cve_mode()
+    vuln_entries, unscored = normalise_findings(findings, floor, per_cve=per_cve)
     lic_entries = normalise_violations(violations)
 
     if unscored:
@@ -2371,6 +2453,10 @@ def fetch_v3_desired(project_uuid: str, floor: float):
         # those lines rather than showing empty labels.
         entry["component"] = components.get(lib, {})
         desired[("license", lib)] = entry
+    # Decorative, like the root-remediation index below: dependency paths can only add a line to
+    # a description, never remove a key from `desired`, so a failed /paths call must never touch
+    # `ok` (Global Constraint 2). See attach_library_paths and fetch_v2_library_paths.
+    attach_library_paths(project_uuid, desired, per_cve)
     # roots_ok is deliberately absent from this chain -- see the docstring. It cannot shrink
     # `desired`, so it cannot cause a false closure, and gating on it would stop closure org-wide
     # if the rootLibrary endpoint is unavailable.
