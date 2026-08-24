@@ -74,6 +74,16 @@ wi_claim_keyid = {}
 # findings on one library must cost ONE HTTP round trip, not 51. A failure is cached too, so a
 # PAT lacking permission for this endpoint is not retried on every finding.
 library_paths_cache = {}
+# Circuit breaker for fetch_v2_library_paths. The per-(project, library) cache above stops a
+# single library from being retried, but does nothing across libraries or projects: a PAT that
+# lacks 2.0 permission fails EVERY distinct library, and call_ws_api_v2 treats 401/403 as an
+# expired JWT, so each failure also costs a re-login POST and invalidates the JWT that 3.0 calls
+# share. On a 107-project org that is thousands of wasted calls plus degraded 3.0 traffic. Five
+# consecutive failures is enough to distinguish "this PAT/endpoint is broken for the whole run"
+# from an ordinary transient blip, without giving up on the very first hiccup.
+LIBRARY_PATHS_BREAKER_THRESHOLD = 5
+library_paths_consecutive_failures = 0
+library_paths_breaker_tripped = False
 run_failed = False
 
 
@@ -287,9 +297,10 @@ def _post_v2_login():
 
 
 def mend_v2_token() -> str:
-    # Cached for the process. The JWT is valid for 10 minutes and all 2.0 use in this tool
-    # is one burst at the start of a run, so expiry is handled by a single retry in
-    # call_ws_api_v2 rather than by refresh-token plumbing.
+    # Cached for the process. The JWT is valid for 10 minutes. 2.0 use is NOT one burst at the
+    # start of a run -- fetch_v2_library_paths issues 2.0 calls spread across the whole run, one
+    # per distinct (project, library) pair as per-CVE/license entries are rendered -- so expiry
+    # is handled by a single retry in call_ws_api_v2 rather than by refresh-token plumbing.
     global mend_v2_session
     if mend_v2_session:
         return try_or_error(lambda: mend_v2_session["retVal"]["jwtToken"], "")
@@ -1482,10 +1493,16 @@ def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False,
         if inputs["paths"]:
             block += "<br><b>Dependency Hierarchy: </b><br>" + \
                      generate_html_nested_list(inputs["paths"], leaf_label=leaf_label)
-        elif inputs["dependency_type"].strip().lower() == "transitive" and inputs["parents"]:
-            # The failed-call path: attach_library_paths only sets "paths" for a TRANSITIVE
-            # library with a known uuid, and a call can still fail. Information already held
-            # (parents, from the 1.4-era finding walk) must not vanish because of that.
+        elif inputs["dependency_type"].strip().lower() != "direct" and inputs["parents"]:
+            # The fallback fires whenever the type is NOT direct -- "transitive" (a failed
+            # /paths call: attach_library_paths only sets "paths" for a transitive library with
+            # a known uuid, and a call can still fail) or "" (unknown: source3._dependency_type/
+            # _direct_flag return "" when Mend publishes neither dependencyContexts[0].isDirect
+            # nor component.dependencyType -- "unknown" is not "Direct", and the user's ruling is
+            # that only Direct dependencies get no line). attach_library_paths' fetch gate stays
+            # keyed on "transitive" specifically, so an unknown-type item is never fetched and
+            # falls straight to here -- exactly today's (pre-2.0) rendering, not a lost line.
+            # Information already held (parents, from the 1.4-era finding walk) must not vanish.
             block += "<br><b>Dependency Hierarchy: </b><br>" + \
                      generate_html_bulleted_list(items=inputs["parents"])
         # Else: a direct dependency gets no call and no line (Global Constraint 3) -- the
@@ -2143,10 +2160,13 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     reports a project's complete current state, so there are no windows, no watermarks and no
     retry queue: a project that fails this run is simply read again in full on the next one.
     """
-    global exist_wis, global_errors, run_failed, synced_projects, library_paths_cache
+    global exist_wis, global_errors, run_failed, synced_projects, library_paths_cache, \
+        library_paths_consecutive_failures, library_paths_breaker_tripped
     run_failed = False
     synced_projects = []
     library_paths_cache = {}
+    library_paths_consecutive_failures = 0
+    library_paths_breaker_tripped = False
     floor = run_severity_floor()
     logger.info(f"Severity floor: MEND_SEVERITY '{conf.severity}' -> {floor}. The SAME floor "
                 f"decides which findings earn a work item and which findings hold one open.")
@@ -2368,12 +2388,23 @@ def fetch_v2_library_paths(project_uuid: str, library_uuid: str) -> list:
     A FAILURE is cached too, not just a success -- a PAT that lacks permission for this endpoint
     would otherwise retry on every finding in the project for no better result; an empty list is
     a valid, stable cached answer for the rest of the run.
+
+    Also guarded by a run-scoped circuit breaker (`library_paths_breaker_tripped`): once
+    `LIBRARY_PATHS_BREAKER_THRESHOLD` calls fail consecutively -- across ANY libraries or
+    projects, not just one cache key -- every subsequent call in this run returns [] without
+    even attempting the HTTP call. A single success resets the consecutive-failure count. The
+    trip is logged once, at ERROR, so an operator reading pipeline output understands why every
+    later description in the run is missing its dependency hierarchy. Like the cache, this never
+    touches fetch_v3_desired's `ok` closure interlock -- see attach_library_paths.
     """
+    global library_paths_consecutive_failures, library_paths_breaker_tripped
     if not project_uuid or not library_uuid:
         return []
     cache_key = (project_uuid, library_uuid)
     if cache_key in library_paths_cache:
-        return library_paths_cache[cache_key]
+        return list(library_paths_cache[cache_key])
+    if library_paths_breaker_tripped:
+        return []
     payload, errorcode = call_ws_api_v2(f"projects/{project_uuid}/libraries/{library_uuid}/paths")
     if errorcode != 0:
         logger.warning(f"[{fn()}] Could not read dependency paths for library {library_uuid} "
@@ -2381,10 +2412,20 @@ def fetch_v2_library_paths(project_uuid: str, library_uuid: str) -> list:
                        f"dependency path this run; closure is NOT affected -- see "
                        f"fetch_v2_library_paths.")
         result = []
+        library_paths_consecutive_failures += 1
+        if library_paths_consecutive_failures >= LIBRARY_PATHS_BREAKER_THRESHOLD:
+            library_paths_breaker_tripped = True
+            logger.error(f"[{fn()}] Dependency-path lookups failed "
+                        f"{LIBRARY_PATHS_BREAKER_THRESHOLD} times in a row (most recently for "
+                        f"library {library_uuid} in project {project_uuid}). Giving up on "
+                        f"/paths for the rest of this run -- likely cause: the configured PAT "
+                        f"lacks Mend 2.0 permission. Every remaining work item's description "
+                        f"this run will omit its dependency hierarchy; closure is NOT affected.")
     else:
+        library_paths_consecutive_failures = 0
         result = normalise_library_paths(payload)
     library_paths_cache[cache_key] = result
-    return result
+    return list(result)
 
 
 def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):

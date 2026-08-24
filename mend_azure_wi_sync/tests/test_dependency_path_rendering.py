@@ -143,6 +143,32 @@ def test_direct_dependency_with_stale_parents_still_omits_the_line():
     assert "Dependency Hierarchy" not in block
 
 
+def test_unknown_dependency_type_with_parents_renders_the_flat_fallback():
+    # source3._dependency_type / _direct_flag return "" -- not "Direct" -- when Mend publishes
+    # neither dependencyContexts[0].isDirect nor component.dependencyType. attach_library_paths'
+    # fetch gate stays keyed on "transitive" so this item was never fetched, but it must still
+    # keep exactly today's rendering (the flat parents fallback), not silently lose the line.
+    inputs = _inputs(paths=[], dependency_type="", parents=["app > express"])
+    block = core.library_block_v3(inputs, with_hierarchy=True)
+    assert "<b>Dependency Hierarchy: </b>" in block
+    assert "<ul>\n  <li>app &gt; express</li>\n</ul>" in block
+
+
+def test_direct_dependency_with_parents_still_omits_the_line():
+    # Guards the "not direct" rewrite of step 2's condition: a genuinely Direct dependency must
+    # never fall into the fallback just because parents happen to be populated.
+    inputs = _inputs(paths=[], dependency_type="Direct", parents=["app > fastify"])
+    block = core.library_block_v3(inputs, with_hierarchy=True)
+    assert "Dependency Hierarchy" not in block
+
+
+def test_transitive_with_parents_and_no_paths_is_unchanged_by_the_rewrite():
+    inputs = _inputs(paths=[], dependency_type="Transitive", parents=["app > express"])
+    block = core.library_block_v3(inputs, with_hierarchy=True)
+    assert "<b>Dependency Hierarchy: </b>" in block
+    assert "<ul>\n  <li>app &gt; express</li>\n</ul>" in block
+
+
 def test_with_hierarchy_false_never_renders_the_line_even_with_paths():
     inputs = _inputs(paths=[["app", "fastify"]], dependency_type="Transitive")
     block = core.library_block_v3(inputs, with_hierarchy=False)

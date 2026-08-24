@@ -1,6 +1,20 @@
 from unittest import mock
 
+import pytest
+
 from mend_azure_wi_sync import core
+
+
+@pytest.fixture(autouse=True)
+def _reset_library_paths_breaker_state():
+    # The circuit breaker is run-scoped module state, same as library_paths_cache. Without an
+    # autouse reset, a test that trips it (or leaves failures short of the threshold) would leak
+    # into every test that runs after it in this file.
+    core.library_paths_consecutive_failures = 0
+    core.library_paths_breaker_tripped = False
+    yield
+    core.library_paths_consecutive_failures = 0
+    core.library_paths_breaker_tripped = False
 
 
 def _conf(dependency="true"):
@@ -284,6 +298,78 @@ def test_fetch_v2_library_paths_caches_a_failure_too():
         second = core.fetch_v2_library_paths("proj-1", "lib-1")
     assert first == second == []
     api.assert_called_once()
+
+
+def _reset_library_paths_breaker():
+    core.library_paths_consecutive_failures = 0
+    core.library_paths_breaker_tripped = False
+
+
+def test_breaker_trips_after_threshold_consecutive_failures():
+    _reset_library_paths_cache()
+    _reset_library_paths_breaker()
+    with mock.patch.object(core, "call_ws_api_v2", return_value=({}, 2)) as api, \
+         mock.patch.object(core, "logger") as logger:
+        for i in range(core.LIBRARY_PATHS_BREAKER_THRESHOLD):
+            assert core.fetch_v2_library_paths("proj-1", f"lib-{i}") == []
+    assert api.call_count == core.LIBRARY_PATHS_BREAKER_THRESHOLD
+    assert core.library_paths_breaker_tripped is True
+    # Logged once, clearly enough an operator understands hierarchies are degraded this run.
+    assert logger.error.call_count == 1
+
+
+def test_breaker_stops_all_http_calls_once_tripped():
+    _reset_library_paths_cache()
+    _reset_library_paths_breaker()
+    with mock.patch.object(core, "call_ws_api_v2", return_value=({}, 2)) as api:
+        for i in range(core.LIBRARY_PATHS_BREAKER_THRESHOLD):
+            core.fetch_v2_library_paths("proj-1", f"lib-{i}")
+        assert core.library_paths_breaker_tripped is True
+        api.reset_mock()
+        # A brand-new (project, library) pair -- not in the cache -- must still make no call.
+        result = core.fetch_v2_library_paths("proj-1", "never-seen-before")
+    assert result == []
+    api.assert_not_called()
+
+
+def test_a_success_before_the_threshold_resets_the_failure_count():
+    _reset_library_paths_cache()
+    _reset_library_paths_breaker()
+    responses = [({}, 2), ({}, 2), (_PATHS_PAYLOAD, 0)]
+    with mock.patch.object(core, "call_ws_api_v2", side_effect=responses):
+        core.fetch_v2_library_paths("proj-1", "lib-1")
+        core.fetch_v2_library_paths("proj-1", "lib-2")
+        core.fetch_v2_library_paths("proj-1", "lib-3")
+    assert core.library_paths_consecutive_failures == 0
+    assert core.library_paths_breaker_tripped is False
+    # Confirm it takes a fresh full run of failures to trip after the reset, not just one more.
+    _reset_library_paths_cache()
+    with mock.patch.object(core, "call_ws_api_v2", return_value=({}, 2)) as api:
+        for _ in range(core.LIBRARY_PATHS_BREAKER_THRESHOLD - 1):
+            core.fetch_v2_library_paths("proj-1", f"lib-x{_}")
+    assert core.library_paths_breaker_tripped is False
+    assert api.call_count == core.LIBRARY_PATHS_BREAKER_THRESHOLD - 1
+
+
+def test_the_ok_interlock_stays_true_while_the_breaker_is_tripped():
+    """The breaker must never touch fetch_v3_desired's `ok` closure interlock -- decorative
+    dependency paths can never gate closure, tripped or not."""
+    def fake_pages(api, params=None, limit=1000, method="GET"):
+        if _is_root_path(api):
+            return [], True
+        if "findings/security" in api:
+            return [_transitive_finding(cve=f"CVE-{i}", uuid=f"lib-uuid-{i}")
+                    for i in range(core.LIBRARY_PATHS_BREAKER_THRESHOLD + 1)], True
+        return [_violation()], True
+
+    _reset_library_paths_cache()
+    _reset_library_paths_breaker()
+    with mock.patch.object(core, "conf", _conf(dependency="false")), \
+         mock.patch.object(core, "fetch_v3_pages", fake_pages), \
+         mock.patch.object(core, "call_ws_api_v2", return_value=({"error": "nope"}, 2)):
+        desired, ok = core.fetch_v3_desired("p-1", 7.0)
+    assert ok is True
+    assert core.library_paths_breaker_tripped is True
 
 
 def _entry(kind="vulnerability", dependency_type="Transitive", library_uuid="lib-1",
