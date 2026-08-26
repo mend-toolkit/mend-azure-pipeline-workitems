@@ -1,4 +1,3 @@
-import inspect
 import json
 import logging
 import os
@@ -105,11 +104,6 @@ LIBRARY_PATHS_TIMEOUT = 30
 run_failed = False
 
 
-def fn():
-    fn_stack = inspect.stack()[1]
-    return f'{fn_stack.function}:{fn_stack.lineno}'
-
-
 def ex():
     e_type, e_msg, tb = sys.exc_info()
     return f'{tb.tb_frame.f_code.co_name}:{tb.tb_lineno}'
@@ -201,12 +195,12 @@ def iter_azure_projects():
                                      data={}, header="application/json",
                                      cmd_type=f"?$top={azure_project_page}&$skip={skip}&")
         if errocode != 0:
-            logger.error(f"[{fn()}] Could not list Azure DevOps projects: {r}")
+            logger.error(f"Could not list Azure DevOps projects: {r}")
             yield None
             return
         page = try_or_error(lambda: r["value"], None)
         if page is None:
-            logger.error(f"[{fn()}] Unexpected project list payload: {r}")
+            logger.error(f"Unexpected project list payload: {r}")
             yield None
             return
         yield page
@@ -279,7 +273,7 @@ def verify_setting(raw=None):
     if "/" in text or "\\" in text:
         # Looks like somebody expected a CA bundle here. Verifying anyway is the safe outcome, but
         # doing it silently would leave them believing they had configured a trust store.
-        logger.warning(f"[{fn()}] MEND_SSLVERIFY is a true/false switch and does not take a "
+        logger.warning(f"MEND_SSLVERIFY is a true/false switch and does not take a "
                        f"path, so '{text}' is ignored and certificates ARE being verified. To "
                        f"supply a CA bundle for a TLS-inspecting proxy, set REQUESTS_CA_BUNDLE "
                        f"to that path instead -- requests reads it directly.")
@@ -324,7 +318,7 @@ def mend_v2_token() -> str:
         return try_or_error(lambda: mend_v2_session["retVal"]["jwtToken"], "")
     payload, errorcode = _post_v2_login()
     if errorcode != 0:
-        logger.error(f"[{fn()}] Mend API 2.0 login failed: {payload}")
+        logger.error(f"Mend API 2.0 login failed: {payload}")
         return ""
     token = try_or_error(lambda: payload["retVal"]["jwtToken"], "")
     if token:
@@ -418,7 +412,7 @@ def call_ws_api_v2(api: str, params: dict = None):
         mend_v2_session = None
         payload, errorcode = _get_v2(url, mend_v2_token(), params)
     if errorcode != 0:
-        logger.error(f"[{fn()}] Mend 2.0 call to '{api}' failed: {payload}")
+        logger.error(f"Mend 2.0 call to '{api}' failed: {payload}")
         errorcode = 2
     return payload, errorcode
 
@@ -444,7 +438,7 @@ def call_ws_api_v3(api: str, params: dict = None, method: str = "GET", body: dic
             mend_v2_session = None
             payload, errorcode = _get_v2(url, mend_v2_token(), params)
     if errorcode != 0:
-        logger.error(f"[{fn()}] Mend 3.0 call to '{api}' failed: {payload}")
+        logger.error(f"Mend 3.0 call to '{api}' failed: {payload}")
         errorcode = 2
     return payload, errorcode
 
@@ -472,7 +466,7 @@ def _v3_total_items_ok(api: str, items: list, payload: dict) -> bool:
     except (TypeError, ValueError):
         return True
     if total != len(items):
-        logger.error(f"[{fn()}] Mend 3.0 call to '{api}' collected {len(items)} item(s) but "
+        logger.error(f"Mend 3.0 call to '{api}' collected {len(items)} item(s) but "
                      f"totalItems reported {total}; treating the read as truncated and "
                      f"skipping closures.")
         return False
@@ -509,7 +503,7 @@ def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000, method: str
             return items, False
         rows = try_or_error(lambda: payload["response"], None)
         if not isinstance(rows, list):
-            logger.error(f"[{fn()}] Mend 3.0 call to '{api}' returned no 'response' list: {payload}")
+            logger.error(f"Mend 3.0 call to '{api}' returned no 'response' list: {payload}")
             return items, False
         items.extend(rows)
         if not rows:
@@ -521,11 +515,11 @@ def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000, method: str
         if cursor is None:
             return items, _v3_total_items_ok(api, items, payload)
         if cursor in seen_cursors:
-            logger.error(f"[{fn()}] Mend 3.0 call to '{api}' returned a repeated cursor; "
+            logger.error(f"Mend 3.0 call to '{api}' returned a repeated cursor; "
                          f"treating the read as failed rather than looping to the page cap.")
             return items, False
         seen_cursors.add(cursor)
-    logger.error(f"[{fn()}] Mend 3.0 call to '{api}' exceeded {MAX_V3_PAGES} pages; "
+    logger.error(f"Mend 3.0 call to '{api}' exceeded {MAX_V3_PAGES} pages; "
                  f"treating the read as failed rather than trusting a truncated list.")
     return items, False
 
@@ -584,7 +578,7 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                     exit(-1)
             try:
                 msg = res['message']
-                logger.error(f"[{fn()}] Error: {msg}")
+                logger.error(f"Error: {msg}")
                 errorcode = 1
             except:
                 pass
@@ -596,12 +590,12 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                 msg = try_or_error(lambda: re.search(r"<title>(.*?)</title>", res_.text), "")
                 msg_text = f'Status code: {res_.status_code}'
                 msg_text = f'{msg_text} - {msg.group(1)}' if msg else f'{msg_text} - {try_or_error(lambda: json.loads(res_.text)["message"], "")}'
-                res = {f"[{fn()}] {msg_text}"}
+                res = {f"{msg_text}"}
             elif res_.status_code == 401:
-                res = {f"[{fn()}]  Non-valid authentication credentials or PAT does not have enough permissions."
+                res = {f" Non-valid authentication credentials or PAT does not have enough permissions."
                        f"Check it according to READ.ME file."}
             else:
-                res = {f"[{fn()}] Azure API call failed": "No message text was returned."}
+                res = {f"Azure API call failed": "No message text was returned."}
     except requests.exceptions.SSLError as err:
         errorcode = 2
         logger.error(f"[{ex()}] {ssl_error_hint('the Azure DevOps host', err)}")
@@ -641,7 +635,7 @@ def get_exist_wi():
             response, err = call_azure_api(api_type="POST", api="wit/workitemsbatch", version="6.0",
                                            data=payload, project=conf.azure_project, header="application/json")
             if err != 0:
-                logger.error(f"[{fn()}] Work item batch hydration failed: {response}")
+                logger.error(f"Work item batch hydration failed: {response}")
                 return None
             # System.State is carried so reconciliation can tell an open item from a closed one
             # without a second round trip; a closed item that looked absent would be recreated
@@ -673,7 +667,7 @@ def get_exist_wi():
                                          header="application/json",
                                          cmd_type=f"?$top={max_wiql_page}&")
             if errocode != 0:
-                logger.error(f"[{fn()}] Could not read existing work items for "
+                logger.error(f"Could not read existing work items for "
                              f"'{conf.azure_project}': {r}")
                 return None
             page = [x["id"] for x in r["workItems"]]
@@ -813,7 +807,7 @@ def actual_work_items(project_name: str):
             keep, drop = sorted([previous, candidate],
                                 key=lambda item: try_or_error(lambda: int(item["id"]),
                                                               float("inf")))
-            logger.warning(f"[{fn()}] Two work items share the key {key} in project "
+            logger.warning(f"Two work items share the key {key} in project "
                            f"{project_name}: {previous.get('id')} and {candidate.get('id')}. "
                            f"Reconciling against {keep.get('id')} (the lowest id); "
                            f"{drop.get('id')} is left untouched -- resolve the duplicate by hand.")
@@ -840,14 +834,14 @@ def _patch_state(work_item_id, state: str, verb: str):
             if unsupported:
                 # Not an error yet: the caller has another candidate to try. DEBUG, so a Scrum
                 # board's one rejected attempt per project does not read as a failure.
-                logger.debug(f"[{fn()}] Work item {work_item_id}: state '{state}' is not valid for "
+                logger.debug(f"Work item {work_item_id}: state '{state}' is not valid for "
                              f"this project's process; trying the next known state.")
             else:
-                logger.error(f"[{fn()}] Could not {verb} work item {work_item_id} to state "
+                logger.error(f"Could not {verb} work item {work_item_id} to state "
                              f"'{state}': {response}. This one item is left as it was; the run "
                              f"continues.")
             return False, unsupported
-        logger.info(f"[{fn()}] Work item {work_item_id} {verb}d ({state})")
+        logger.debug(f"Work item {work_item_id} {verb}d ({state})")
         return True, False
     except Exception as err:
         logger.error(f"[{ex()}] Could not {verb} work item {work_item_id}: {err}")
@@ -957,7 +951,7 @@ def _apply_state(work_item_id, states, verb: str, env_var: str) -> bool:
             return False
     # The Azure PROJECT is in the message deliberately: at 107 projects, "work item 8118" alone
     # makes an operator go and look up which board they need to reconfigure.
-    logger.error(f"[{fn()}] Could not {verb} work item {work_item_id} in Azure project "
+    logger.error(f"Could not {verb} work item {work_item_id} in Azure project "
                  f"'{getattr(conf, 'azure_project', '')}' (work item type "
                  f"'{getattr(conf, 'azure_type', '')}'): Azure rejected every state this process "
                  f"is known to use ({', '.join(candidates)}). If this board runs a derived process "
@@ -1043,17 +1037,17 @@ def library_paths_pool_size() -> int:
         try:
             parsed = int(raw)
         except (TypeError, ValueError):
-            logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} is not a whole number; "
+            logger.warning(f"MEND_DEPPATHS_CONCURRENCY={raw!r} is not a whole number; "
                            f"using the default of {LIBRARY_PATHS_POOL_SIZE}.")
             parsed = None
         if parsed is None:
             value = LIBRARY_PATHS_POOL_SIZE
         elif parsed <= 0:
-            logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} must be a positive "
+            logger.warning(f"MEND_DEPPATHS_CONCURRENCY={raw!r} must be a positive "
                            f"integer; using the default of {LIBRARY_PATHS_POOL_SIZE}.")
             value = LIBRARY_PATHS_POOL_SIZE
         elif parsed > LIBRARY_PATHS_POOL_SIZE_MAX:
-            logger.warning(f"[{fn()}] MEND_DEPPATHS_CONCURRENCY={raw!r} exceeds the maximum of "
+            logger.warning(f"MEND_DEPPATHS_CONCURRENCY={raw!r} exceeds the maximum of "
                            f"{LIBRARY_PATHS_POOL_SIZE_MAX}; clamping to it.")
             value = LIBRARY_PATHS_POOL_SIZE_MAX
         else:
@@ -1116,7 +1110,7 @@ def reconcile_project(project, floor=None, desired=None, ok=None):
         desired, ok = fetch_v3_desired(project.get("uuid", ""), floor)
 
     if not ok:
-        logger.warning(f"[{fn()}] The Mend read for project {project_name} was incomplete. "
+        logger.warning(f"The Mend read for project {project_name} was incomplete. "
                        f"Closures are SKIPPED for this project -- a partial read looks exactly "
                        f"like a project whose findings were all remediated, and closing on it "
                        f"would be a mass-closure. Reopens and the rest of the run continue.")
@@ -1128,7 +1122,7 @@ def reconcile_project(project, floor=None, desired=None, ok=None):
     # Both sides non-empty with zero overlap is not a project that was fully remediated -- that
     # case has an EMPTY `desired`, and its closures must still run.
     if desired and actual and not (set(desired) & set(actual)):
-        logger.error(f"[{fn()}] Suspected key-space mismatch in project {project_name}: "
+        logger.error(f"Suspected key-space mismatch in project {project_name}: "
                      f"{len(desired)} Mend finding(s) and {len(actual)} work item(s), and NOT "
                      f"ONE key in common. Closures are SKIPPED for this project. Example Mend "
                      f"keys: {sorted(map(str, desired))[:2]}. Example work item keys: "
@@ -1154,7 +1148,7 @@ def reconcile_project(project, floor=None, desired=None, ok=None):
         elif verb == SKIP:
             skipped += 1
 
-    logger.info(f"[{fn()}] Reconciled {project_name}: {created} to create, {updated} to update "
+    logger.info(f"Reconciled {project_name}: {created} to create, {updated} to update "
                 f"(neither is executed on this path), {closed} closed, {reopened} reopened, "
                 f"{skipped} already closed and skipped.")
     return created, updated, closed, reopened, skipped
@@ -1171,7 +1165,7 @@ def reconcile_after_sync():
     global conf, global_errors
     conf = startup() if not conf else conf
     conf.update_properties()
-    logger.info(f"[{fn()}] Reconciliation starting for {len(synced_projects)} synced "
+    logger.info(f"Reconciliation starting for {len(synced_projects)} synced "
                 f"project(s): work items whose Mend finding is gone move to MEND_CLOSEDSTATE, "
                 f"and items whose finding came back move to MEND_REOPENSTATE.")
 
@@ -1179,7 +1173,7 @@ def reconcile_after_sync():
     try:
         projects, ok = fetch_v3_projects()
         if not ok:
-            logger.error(f"[{fn()}] Could not read the Mend project list. NOTHING is closed this "
+            logger.error(f"Could not read the Mend project list. NOTHING is closed this "
                          f"run: a partial list makes a project we simply failed to read look "
                          f"exactly like one whose findings are all gone.")
             return
@@ -1194,7 +1188,7 @@ def reconcile_after_sync():
             project = lookup.get(str(product_project).casefold())
             if not project:
                 unmatched += 1
-                logger.warning(f"[{fn()}] Mend project '{product_project}' was synced this run "
+                logger.warning(f"Mend project '{product_project}' was synced this run "
                                f"but is not in the Mend 3.0 project list. It is SKIPPED -- "
                                f"guessing which 3.0 project it is could close work items "
                                f"belonging to a different project.")
@@ -1215,7 +1209,7 @@ def reconcile_after_sync():
             finally:
                 conf.azure_project = original_azure_project
 
-        logger.info(f"[{fn()}] Reconciliation summary: {closed} work item(s) closed, "
+        logger.info(f"Reconciliation summary: {closed} work item(s) closed, "
                     f"{reopened} reopened, {skipped} already closed and skipped; "
                     f"{matched} project(s) reconciled, {unmatched} unmatched and skipped.")
     except Exception as err:
@@ -1887,10 +1881,10 @@ def restore_wi_state(exist_id: int, prior_state: str, patch_result) -> str:
             data=[{"op": "replace", "path": "/fields/System.State", "value": prior_state}],
             project=conf.azure_project)
         if err_r != 0:
-            logger.warning(f"[{fn()}] Work item {exist_id} was reset from '{prior_state}' to "
+            logger.warning(f"Work item {exist_id} was reset from '{prior_state}' to "
                            f"'{current}' on update and could not be restored.")
             return current
-        logger.info(f"[{fn()}] Work item {exist_id} state restored to '{prior_state}' after the "
+        logger.info(f"Work item {exist_id} state restored to '{prior_state}' after the "
                     f"update (Azure DevOps had reset it to '{current}').")
         return prior_state
     except Exception as err:
@@ -1940,7 +1934,7 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
         # Two Mend projects routed to one Azure project can both hold the same library. The
         # second write would overwrite the first with its own project's content; skip it and
         # say so rather than letting the work item flip contents run to run.
-        logger.warning(f"[{fn()}] Work item {exist_id} ('{title}') was already written this "
+        logger.warning(f"Work item {exist_id} ('{title}') was already written this "
                        f"run; skipping the duplicate write for {project_name}.")
         return "skipped"
 
@@ -1983,19 +1977,19 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
         # The unchanged-check and the state restore BOTH depend on this GET, and both are skipped
         # when it fails. Logged loudly because the symptom -- every work item rewritten every run
         # -- is identical to the content genuinely differing, and the two need different fixes.
-        logger.warning(f"[{fn()}] Work item {exist_id} ('{title}') could not be read back from "
+        logger.warning(f"Work item {exist_id} ('{title}') could not be read back from "
                        f"Azure (errorcode {err_}), so this run cannot tell whether its content "
                        f"changed. Updating it unconditionally.")
     if azure_operation == "replace" and err_ == 0:
         changed = wi_content_diff(data, try_or_error(lambda: wi_data["fields"], {}) or {})
         if not changed:
-            logger.debug(f"[{fn()}] Work item {exist_id} ('{title}') is unchanged; skipping the "
+            logger.debug(f"Work item {exist_id} ('{title}') is unchanged; skipping the "
                          f"update so an Azure DevOps process rule cannot reset its state.")
             updated_wi.append(exist_id)
             return "unchanged"
         # Why this item is being rewritten. Without it, "everything updates every run" is
         # indistinguishable from "the skip is not wired up", which cost a live debugging round.
-        logger.debug(f"[{fn()}] Work item {exist_id} ('{title}') differs from Azure in "
+        logger.debug(f"Work item {exist_id} ('{title}') differs from Azure in "
                      f"{len(changed)} field(s), so it is being updated: {', '.join(changed)}")
         azure_fields = try_or_error(lambda: wi_data["fields"], {}) or {}
         for op_ in data:
@@ -2003,7 +1997,7 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
             if name_ in changed and name_ in azure_fields:
                 delta = canonical_divergence(op_.get("value"), azure_fields[name_])
                 if delta:
-                    logger.debug(f"[{fn()}]   {name_} {delta}")
+                    logger.debug(f"  {name_} {delta}")
 
     try:
         if azure_operation == "add":
@@ -2035,18 +2029,23 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
                     "tags": ",".join(tags),
                     "state": wi_state}}})
                 updated_wi.append(claimed_id)
-            logger.info(f"{conf.azure_type} {try_or_error(lambda: r['id'], claimed_id)} {status_op}")
+            logger.debug(f"{conf.azure_type} {try_or_error(lambda: r['id'], claimed_id)} {status_op}")
             return status_op
         if errcode == 1:
             logger.warning(f"{conf.azure_type} creation/update failed: "
                            f"{try_or_error(lambda: r['message'], r)}")
         else:
-            logger.error(f"[{fn()}] {try_or_error(lambda: r.pop(), r)}")
+            logger.error(f"{try_or_error(lambda: r.pop(), r)}")
         return "failed"
     except Exception as err:
         logger.error(f"[{ex()}] Work item creation/update failed: {err}")
         global_errors += 1
         return "failed"
+
+
+# One progress line per this many entries. Low enough that a long project keeps proving it
+# is alive, high enough that a normal one prints nothing between its header and its summary.
+PROGRESS_EVERY = 20
 
 
 def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
@@ -2061,7 +2060,16 @@ def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
     project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
     reachability_on = reachability_enabled()
     created = updated = failed = unchanged = 0
-    for (kind, key), entry in (desired or {}).items():
+    # Counted per kind so the summary can say which half of the backlog moved. A run that
+    # creates 40 license work items and touches no vulnerability at all is a very different
+    # event from the reverse, and a single set of totals cannot tell them apart.
+    tally = {k: dict(created=0, updated=0, unchanged=0, failed=0)
+             for k in ("vulnerability", "license")}
+    entries = list((desired or {}).items())
+    total = len(entries)
+    logger.info(f"Processing {project_name} work items ({total} total)")
+    processed = 0
+    for (kind, key), entry in entries:
         # The KEY is the work item's identity ("{cve}|{lib}" in per-CVE mode); the LIBRARY is what
         # the renderers need. They are the same string only in dependency mode, so the library is
         # read off the entry rather than taken apart from the key.
@@ -2089,12 +2097,25 @@ def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
                     failed += 1
                 elif outcome == "unchanged":
                     unchanged += 1
+                if outcome in tally.get(kind, {}):
+                    tally[kind][outcome] += 1
         except Exception as err:
             failed += 1
+            tally.get(kind, {})["failed"] = tally.get(kind, {}).get("failed", 0) + 1
             logger.error(f"[{ex()}] Work item creation failed for "
                          f"{kind} '{key}' in {project_name}: {err}")
-    logger.info(f"[{fn()}] {project_name}: {created} work item(s) created, {updated} updated, "
-                f"{unchanged} unchanged and left alone, {failed} failed.")
+        processed += 1
+        # The last entry is deliberately excluded: "20/20 processed" immediately above a
+        # summary saying the same thing is noise, not progress.
+        if processed % PROGRESS_EVERY == 0 and processed != total:
+            logger.info(f"{project_name}: {processed}/{total} processed")
+    logger.info(f"{project_name}: {total} work item(s) processed.")
+    for kind, label in (("vulnerability", "Vulnerability"), ("license", "License")):
+        counts = tally[kind]
+        if not any(counts.values()):
+            continue
+        logger.info(f"  {label}: {counts['created']} created, {counts['updated']} updated, "
+                    f"{counts['unchanged']} unchanged, {counts['failed']} failed")
     return created, updated, failed
 
 
@@ -2124,7 +2145,8 @@ def error_count() -> int:
     return global_errors
 
 
-def sync_project_v3(project, floor: float, custom_flds: list, wi_type: str) -> bool:
+def sync_project_v3(project, floor: float, custom_flds: list, wi_type: str,
+                    position: str = "") -> bool:
     """Create/update AND reconcile ONE Mend project, from ONE 3.0 read at ONE severity floor.
 
     The whole point of doing both here: `desired` and `ok` are fetched once and handed to both
@@ -2140,6 +2162,11 @@ def sync_project_v3(project, floor: float, custom_flds: list, wi_type: str) -> b
     """
     global global_errors, synced_projects
     project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
+    # Logged BEFORE the read, not after. fetch_v3_desired is the longest silence in a run --
+    # findings, libraries, licenses and up to MEND_DEPPATHS_CONCURRENCY dependency-path calls --
+    # and with routing on there is no startup probe ahead of it either, so without this line a
+    # large project looks like a stalled pipeline.
+    logger.info(f"{'[' + position + '] ' if position else ''}Reading {project_name} from Mend")
     try:
         desired, ok = fetch_v3_desired(project.get("uuid", ""), floor)
         create_wi_v3(project, desired, custom_flds, wi_type)
@@ -2332,8 +2359,9 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
                 f"'{conf.azure_project}'. Skipping to avoid creating duplicates and to avoid "
                 f"closing work items we cannot see.")
     synced = 0
-    for project in selected:
-        if sync_project_v3(project, floor, custom_flds, wi_type):
+    for index, project in enumerate(selected, 1):
+        if sync_project_v3(project, floor, custom_flds, wi_type,
+                           position=f"{index}/{len(selected)}"):
             synced += 1
     return f"{synced} project(s) processed" if selected else "Nothing to create/update"
 
@@ -2415,7 +2443,7 @@ def fetch_v3_projects():
     # in use is GET; this is the one exception.
     rows, ok = fetch_v3_pages(f"orgs/{org_uuid()}/projects/summaries", method="POST")
     if not ok:
-        logger.error(f"[{fn()}] Could not read Mend projects for org {org_uuid()}. "
+        logger.error(f"Could not read Mend projects for org {org_uuid()}. "
                      f"Nothing is synced this run -- acting on a partial project list could "
                      f"close work items for projects we simply failed to read.")
     return normalise_projects(rows), ok
@@ -2434,7 +2462,7 @@ def fetch_v3_licenses(project_uuid: str):
     """
     rows, ok = fetch_v3_pages(f"projects/{project_uuid}/dependencies/libraries/licenses")
     if not ok:
-        logger.error(f"[{fn()}] Could not read library licenses for project {project_uuid}. "
+        logger.error(f"Could not read library licenses for project {project_uuid}. "
                      f"Callers must not treat the absence of license data here as \"this "
                      f"library has no licenses\".")
     return normalise_licenses(rows), normalise_library_components(rows), ok
@@ -2456,7 +2484,7 @@ def fetch_v3_libraries(project_uuid: str):
     """
     rows, ok = fetch_v3_pages(f"projects/{project_uuid}/dependencies/libraries")
     if not ok:
-        logger.error(f"[{fn()}] Could not read the library list for project {project_uuid}. "
+        logger.error(f"Could not read the library list for project {project_uuid}. "
                      f"Descriptions this run may omit library paths, versions and license "
                      f"reference files that Mend does in fact know.")
     return normalise_libraries(rows), normalise_library_licenses(rows), ok
@@ -2477,7 +2505,7 @@ def fetch_v3_root_libraries(project_uuid: str):
         # -- see that function's docstring. This read cannot shrink `desired`, so a failure here
         # cannot turn a real closure into a false one; blocking closure on it would mean one
         # unavailable endpoint stops every project in the org from ever closing anything.
-        logger.warning(f"[{fn()}] Could not read root library remediation for project "
+        logger.warning(f"Could not read root library remediation for project "
                        f"{project_uuid}. Work items this run may omit Recommended Fix and "
                        f"Recommended Major Version that Mend does in fact publish. Closure is "
                        f"NOT being blocked by this: the root index supplies description lines "
@@ -2524,7 +2552,7 @@ def fetch_v2_library_paths(project_uuid: str, library_uuid: str) -> list:
         return []
     payload, errorcode = call_ws_api_v2(f"projects/{project_uuid}/libraries/{library_uuid}/paths")
     if errorcode != 0:
-        logger.warning(f"[{fn()}] Could not read dependency paths for library {library_uuid} "
+        logger.warning(f"Could not read dependency paths for library {library_uuid} "
                        f"in project {project_uuid}. This work item's description will omit its "
                        f"dependency path this run; closure is NOT affected -- see "
                        f"fetch_v2_library_paths.")
@@ -2532,7 +2560,7 @@ def fetch_v2_library_paths(project_uuid: str, library_uuid: str) -> list:
         library_paths_consecutive_failures += 1
         if library_paths_consecutive_failures >= LIBRARY_PATHS_BREAKER_THRESHOLD:
             library_paths_breaker_tripped = True
-            logger.error(f"[{fn()}] Dependency-path lookups failed "
+            logger.error(f"Dependency-path lookups failed "
                         f"{LIBRARY_PATHS_BREAKER_THRESHOLD} times in a row (most recently for "
                         f"library {library_uuid} in project {project_uuid}). Giving up on "
                         f"/paths for the rest of this run -- likely cause: the configured PAT "
@@ -2722,7 +2750,7 @@ def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
         payload, errorcode = results[library_uuid]
         cache_key = (project_uuid, library_uuid)
         if errorcode != 0:
-            logger.warning(f"[{fn()}] Could not read dependency paths for library "
+            logger.warning(f"Could not read dependency paths for library "
                            f"{library_uuid} in project {project_uuid}. This work item's "
                            f"description will omit its dependency path this run; closure is "
                            f"NOT affected -- see fetch_v2_library_paths.")
@@ -2733,7 +2761,7 @@ def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
                     library_paths_consecutive_failures >= LIBRARY_PATHS_BREAKER_THRESHOLD:
                 library_paths_breaker_tripped = True
                 already_tripped_here = True
-                logger.error(f"[{fn()}] Dependency-path lookups failed "
+                logger.error(f"Dependency-path lookups failed "
                             f"{LIBRARY_PATHS_BREAKER_THRESHOLD} times in a row (most recently "
                             f"for library {library_uuid} in project {project_uuid}). Giving up "
                             f"on /paths for the rest of this run -- likely cause: the "
@@ -2750,7 +2778,7 @@ def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
         for entry in entries:
             entry["paths"] = paths
 
-    logger.debug(f"[{fn()}] project {project_uuid}: {len(results)} /paths call(s) made, "
+    logger.debug(f"project {project_uuid}: {len(results)} /paths call(s) made, "
                 f"{cache_hits} served from cache, {failed} failed, "
                 f"{time.monotonic() - start:.2f}s elapsed.")
 
@@ -2806,7 +2834,7 @@ def fetch_v3_desired(project_uuid: str, floor: float):
 
     if unscored:
         # Spec 5.1 requires this to be an explicit rule, not an accident of a missing key.
-        logger.info(f"[{fn()}] {unscored} unscored vulnerability finding(s) in project "
+        logger.info(f"{unscored} unscored vulnerability finding(s) in project "
                     f"{project_uuid} were INCLUDED: they cannot be compared to MEND_SEVERITY, "
                     f"and a real finding vanishing because Mend has not scored it yet is the "
                     f"worse failure.")
@@ -2817,7 +2845,7 @@ def fetch_v3_desired(project_uuid: str, floor: float):
     link_report = license_link_report(licenses, components)
     # Deliberately DEBUG-only, not a warning: Joshua confirmed the missing license URLs are a
     # Mend-side data gap, not something a run should nag about every time.
-    logger.debug(f"[{fn()}] Project {project_uuid} license links -- "
+    logger.debug(f"Project {project_uuid} license links -- "
                  f"{len(link_report['license_url'])} from a license URL, "
                  f"{len(link_report['library_page'])} from the library's Mend page, "
                  f"{len(link_report['no_link'])} with none: {link_report}")
