@@ -2183,7 +2183,8 @@ def run_sync_routed(projects: list, custom_flds: list, wi_type: str, floor: floa
 
     `projects` are 3.0 project dicts that already survived select_projects, so MEND_*TOKEN
     narrowing has happened and there are no scope-excluded / out-of-scope outcomes left to
-    preset -- routing.py only decides no-target / schema-fault / branch-filtered / unknown.
+    preset -- routing.py only decides no-target / missing-branch-tag / branch-filtered /
+    unknown-target.
 
     `custom_flds` and `wi_type` are accepted for signature symmetry with run_sync and are
     UNUSED: both are per Azure project, so they are read from each destination below. main()

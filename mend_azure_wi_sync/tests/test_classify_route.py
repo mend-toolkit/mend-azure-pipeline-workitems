@@ -25,12 +25,12 @@ def test_destination_that_does_not_exist_is_unknown_target():
     assert classify(route, KNOWN, PATTERNS) == "unknown-target"
 
 
-def test_missing_branch_tag_is_a_loud_schema_fault():
+def test_missing_branch_tag_is_loud():
     """A destination with no branch means the scan template is missing a field. If that
     is the shared template, it is missing for all 400 repos — it must not be quiet."""
     route = Route(azure_project="Platform", repo="api")
-    assert classify(route, KNOWN, PATTERNS) == "schema-fault"
-    assert "schema-fault" in LOUD_OUTCOMES
+    assert classify(route, KNOWN, PATTERNS) == "missing-branch-tag"
+    assert "missing-branch-tag" in LOUD_OUTCOMES
 
 
 def test_no_target_takes_precedence_over_everything():
@@ -39,9 +39,9 @@ def test_no_target_takes_precedence_over_everything():
     assert classify(Route(), KNOWN, PATTERNS) == "no-target"
 
 
-def test_schema_fault_takes_precedence_over_unknown_target():
+def test_a_missing_branch_tag_takes_precedence_over_unknown_target():
     route = Route(azure_project="Typo", repo="api")
-    assert classify(route, KNOWN, PATTERNS) == "schema-fault"
+    assert classify(route, KNOWN, PATTERNS) == "missing-branch-tag"
 
 
 def test_branch_filtering_takes_precedence_over_unknown_target():

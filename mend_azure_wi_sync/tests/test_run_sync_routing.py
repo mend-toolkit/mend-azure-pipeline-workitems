@@ -157,7 +157,7 @@ def test_run_is_not_fatal_when_every_outcome_is_a_deliberate_skip():
 
 
 def test_run_is_still_fatal_when_zero_routed_outcomes_are_genuine():
-    """no-target/schema-fault are real misconfigurations, not deliberate skips, so a run made
+    """no-target/missing-branch-tag are real misconfigurations, not deliberate skips, so a run made
     up entirely of those and zero routed targets must still trip the fatal path."""
     conf = _conf()
     with mock.patch.object(core, "get_exist_wi", return_value=[]), \
