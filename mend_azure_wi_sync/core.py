@@ -2256,6 +2256,10 @@ def run_sync_routed(projects: list, custom_flds: list, wi_type: str, floor: floa
                          f"exist, the PAT may lack visibility into them.")
 
         synced = 0
+        # Counted across destinations, not within one: an operator watching the log wants to
+        # know how far through the RUN it is, not how far through one Azure project.
+        routed_total = sum(len(targets[t]) for t in targets)
+        routed_index = 0
         for azure_project in sorted(targets):
             # Each Azure project is its own failure boundary: one bad target must not cost the
             # other 106.
@@ -2290,7 +2294,9 @@ def run_sync_routed(projects: list, custom_flds: list, wi_type: str, floor: floa
                 continue
             for uuid, route in targets[azure_project]:
                 conf.reponame = route.repo
-                if sync_project_v3(by_uuid[uuid], floor, fields_here, wi_type_here):
+                routed_index += 1
+                if sync_project_v3(by_uuid[uuid], floor, fields_here, wi_type_here,
+                                   position=f"{routed_index}/{routed_total}"):
                     synced += 1
         return f"{report}; {synced} Mend project(s) synced"
     finally:

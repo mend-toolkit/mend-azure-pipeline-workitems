@@ -73,7 +73,7 @@ def test_creation_and_closure_both_run_against_the_projects_own_azure_target():
     conf = _conf()
     seen = []
 
-    def _sync(project, floor, custom_flds, wi_type):
+    def _sync(project, floor, custom_flds, wi_type, position=""):
         seen.append((project["uuid"], conf.azure_project))
         return True
 
@@ -114,7 +114,7 @@ def test_untagged_project_is_never_synced():
     synced = []
     with mock.patch.object(core, "get_exist_wi", return_value=[]), \
          mock.patch.object(core, "sync_project_v3",
-                           side_effect=lambda p, *a: synced.append(p["uuid"]) or True):
+                           side_effect=lambda p, *a, **kw: synced.append(p["uuid"]) or True):
         _patches(conf)
         try:
             core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -130,7 +130,7 @@ def test_excluded_project_never_reaches_routing():
     synced = []
     with mock.patch.object(core, "get_exist_wi", return_value=[]), \
          mock.patch.object(core, "sync_project_v3",
-                           side_effect=lambda p, *a: synced.append(p["uuid"]) or True):
+                           side_effect=lambda p, *a, **kw: synced.append(p["uuid"]) or True):
         _patches(conf)
         try:
             result = core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
@@ -180,8 +180,8 @@ def test_case_insensitive_tag_routes_to_the_canonical_azure_project_casing():
     seen_azure_project = []
     with mock.patch.object(core, "get_exist_wi", return_value=[]), \
          mock.patch.object(core, "sync_project_v3",
-                           side_effect=lambda *a: seen_azure_project.append(conf.azure_project)
-                           or True):
+                           side_effect=lambda *a, **kw: seen_azure_project.append(
+                               conf.azure_project) or True):
         _patches(conf, projects=[_project("p-lower", "api", _tags("platform"))],
                  known={"Platform"})
         try:
@@ -213,7 +213,7 @@ def test_a_failed_target_does_not_stop_the_others():
     synced = []
     with mock.patch.object(core, "get_exist_wi", side_effect=[None, []]), \
          mock.patch.object(core, "sync_project_v3",
-                           side_effect=lambda p, *a: synced.append(
+                           side_effect=lambda p, *a, **kw: synced.append(
                                (p["uuid"], conf.azure_project)) or True):
         _patches(conf)
         try:
