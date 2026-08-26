@@ -4,19 +4,19 @@ from mend_azure_wi_sync import core
 
 
 def _conf(**kw):
-    base = dict(email="", org_uuid="", ws_org_token="tok-abc", proxy={})
+    base = dict(email="", org_uuid="", proxy={})
     base.update(kw)
     return mock.MagicMock(**base)
 
 
-def test_org_uuid_falls_back_to_the_api_key():
-    """The 1.4 org token and the 3.0 org UUID are plausibly the same value, so an operator
-    who never sets MEND_ORGUUID must still get a working 3.0 client."""
+def test_org_uuid_has_no_fallback():
+    """MEND_APIKEY is gone, so there is nothing left to fall back to. check_patterns is what
+    stops a run with no MEND_ORGUUID -- see test_check_patterns_requires_the_org_uuid."""
     with mock.patch.object(core, "conf", _conf(org_uuid="")):
-        assert core.org_uuid() == "tok-abc"
+        assert core.org_uuid() == ""
 
 
-def test_an_explicit_org_uuid_wins():
+def test_org_uuid_reads_the_configured_value():
     with mock.patch.object(core, "conf", _conf(org_uuid="uuid-xyz")):
         assert core.org_uuid() == "uuid-xyz"
 
@@ -34,5 +34,16 @@ def test_config_carries_the_two_new_fields():
 
 def test_env_aliases_exist_for_both():
     from mend_azure_wi_sync.config import varenvs
-    assert varenvs.wsemail.value == ("WS_EMAIL", "MEND_EMAIL")
-    assert varenvs.wsorguuid.value == ("WS_ORGUUID", "MEND_ORGUUID")
+    assert varenvs.wsemail.value == ("MEND_EMAIL",)
+    assert varenvs.wsorguuid.value == ("MEND_ORGUUID",)
+
+
+def test_the_api_key_is_gone_from_config_entirely():
+    """MEND_APIKEY was the org identifier and the login orgToken. Both now read
+    MEND_ORGUUID, so neither the variable nor the Config field survives -- and
+    $MEND_APIKEY no longer resolves in MEND_CUSTOMFIELDS."""
+    from mend_azure_wi_sync.config import Config, varenvs
+    assert not hasattr(varenvs, "wsapikey")
+    assert "ws_org_token" not in Config.__dataclass_fields__
+    for member in varenvs:
+        assert not any(str(v).startswith("WS_") for v in member.value), member.name

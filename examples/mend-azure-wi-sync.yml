@@ -34,7 +34,10 @@ steps:
     # Documentation: https://github.com/mend-toolkit/azure-wi-sync/tree/main#azure-pipeline-variables
     MEND_URL: $(MEND_URL)
     MEND_USERKEY: $(MEND_USERKEY)
-    MEND_APIKEY: $(MEND_APIKEY)
+    # MEND_ORGUUID is the UUID of your Mend organization. It replaced MEND_APIKEY, which is no
+    # longer read: the API key and the organization UUID were the same identifier, and keeping
+    # both meant a pipeline that set only MEND_ORGUUID failed at startup.
+    MEND_ORGUUID: $(MEND_ORGUUID)
     # MEND_EMAIL is REQUIRED: the email of the Mend user whose MEND_USERKEY this is. It logs in
     # against Mend API 2.0 to obtain the JWT that authenticates every Mend API 3.0 call, which
     # is how this integration now reads everything. Without it the run cannot authenticate.
@@ -77,5 +80,3 @@ steps:
     # NOTE: uncomment the line only once the matching pipeline variable exists. Azure leaves
     # an undefined variable as the literal string "$(MEND_REACHABILITY)", which normalizes to
     # "false" -- the feature then stays off with nothing logged as an error.
-    # MEND_ORGUUID defaults to MEND_APIKEY; set it only if they differ for your org.
-    # MEND_ORGUUID: $(MEND_ORGUUID)

@@ -68,7 +68,7 @@ See [Azure Pipeline Variables](#azure-pipeline-variables) for details.
 ## Azure DevOps Setup
 1. Create a [Personal Access Token (PAT)](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate) with the scopes and permissions listed in [Prerequisites](#prerequisites)
 2. Create a new Azure pipeline from the example file [examples/mend-azure-wi-sync.yml](./examples/mend-azure-wi-sync.yml)
-3. Set the pipeline variables. At minimum: `MEND_URL`, `MEND_USERKEY`, `MEND_APIKEY`, `MEND_EMAIL` and `MEND_AZUREPAT`, plus the scope variables you picked in [Planning Your Work Items Setup](#planning-your-work-items-setup)
+3. Set the pipeline variables. At minimum: `MEND_URL`, `MEND_USERKEY`, `MEND_ORGUUID`, `MEND_EMAIL` and `MEND_AZUREPAT`, plus the scope variables you picked in [Planning Your Work Items Setup](#planning-your-work-items-setup)
 <br />
 
 ## Mend SCA Setup
@@ -92,7 +92,7 @@ are likely to fill them in.
 | `MEND_URL` | string | N/A | Mend server URL |
 | `MEND_EMAIL` | string | N/A | Email address of the Mend user whose `MEND_USERKEY` this is. Used to log in and obtain the token that authenticates every Mend call |
 | `MEND_USERKEY` | secret | N/A | Your Mend user key |
-| `MEND_APIKEY` | secret | N/A | Mend organization API key |
+| `MEND_ORGUUID` | string | N/A | UUID of your Mend organization. Identifies the organization on every Mend API call |
 | `MEND_AZUREURI` | string | N/A | Azure DevOps organization URI, for example `https://dev.azure.com/MyOrganization`. Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services) `$(System.CollectionUri)` |
 | `MEND_AZUREPAT` | secret | N/A | Azure DevOps [Personal Access Token](https://docs.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate?view=azure-devops&tabs=Windows) |
 | `MEND_AZUREPROJECT` | string | N/A | Azure Team Project name. Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services) `$(System.TeamProject)`. Under `MEND_ROUTING` it is not the destination, but is still required: it is the project whose Work Item type definition is read at startup |
@@ -140,7 +140,6 @@ one's findings to the Azure project named by its tag.
 |---|---|---|---|
 | `MEND_PROXY` | string | Empty | Proxy URL, in the format `<proxy_ip>:<proxy_port>`. For a proxy requiring basic authentication, use `<username>:<password>@<proxy_ip>:<proxy_port>`. Without an `http://` or `https://` prefix, `http://` is assumed |
 | `MEND_SSLVERIFY` | boolean | `true` | TLS certificate verification for the Mend and Azure DevOps calls. Set `false` to unblock a run where verification fails. To supply a CA bundle for a self-hosted agent behind a TLS-inspecting proxy, set the standard `REQUESTS_CA_BUNDLE` environment variable to its path; this variable does not take a path |
-| `MEND_ORGUUID` | string | `MEND_APIKEY` | Organization UUID used by the Mend API |
 
 <br />
 
@@ -372,7 +371,7 @@ A complete pipeline fragment: a full custom Work Item type populated from a sing
   env:
     MEND_URL: $(MEND_URL)
     MEND_USERKEY: $(MEND_USERKEY)
-    MEND_APIKEY: $(MEND_APIKEY)
+    MEND_ORGUUID: $(MEND_ORGUUID)
     MEND_EMAIL: $(MEND_EMAIL)
     MEND_AZUREPAT: $(MEND_AZUREPAT)
     MEND_AZUREURI: $(System.CollectionUri)

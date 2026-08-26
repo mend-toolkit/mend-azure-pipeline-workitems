@@ -120,8 +120,8 @@ def check_patterns():
     res = []
     if not (re.match(uuid_pattern, conf.ws_user_key) or re.match(token_pattern, conf.ws_user_key)):
         res.append("MEND_USERKEY")
-    if not (re.match(uuid_pattern, conf.ws_org_token) or re.match(token_pattern, conf.ws_org_token)):
-        res.append("MEND_APIKEY")
+    if not (re.match(uuid_pattern, conf.org_uuid) or re.match(token_pattern, conf.org_uuid)):
+        res.append("MEND_ORGUUID (the organization UUID from the Mend platform)")
     if conf.wsproducttoken:
         prods = conf.wsproducttoken.split(",")
         for prod_ in prods:
@@ -295,7 +295,10 @@ def _post_v2_login():
     # mend_api_url(), NOT conf.ws_url: 2.0/3.0 live on api-saas.mend.io while conf.ws_url is
     # the SCA app host. See the spec's servers block.
     url = f"{mend_api_url()}/api/v2.0/login"
-    body = {"email": conf.email, "userKey": conf.ws_user_key, "orgToken": conf.ws_org_token}
+    # orgToken takes MEND_ORGUUID: the 2.0 spec's LoginModelDTO documents the field as
+    # "org UUID ... or API Key", so the UUID is an accepted value and MEND_APIKEY is no
+    # longer read anywhere.
+    body = {"email": conf.email, "userKey": conf.ws_user_key, "orgToken": org_uuid()}
     try:
         res_ = requests.post(url, json=body, verify=verify_setting(), proxies=conf.proxy,
                              headers={"Content-Type": "application/json"})
@@ -2422,14 +2425,15 @@ def load_wi_json():
 
 
 def org_uuid() -> str:
-    """The org identifier for 3.0's org-scoped paths.
+    """The org identifier for 3.0's org-scoped paths, and the login's orgToken.
 
-    Defaults to MEND_APIKEY: the 1.4 org token and the 3.0 organization UUID are both the org's
-    identifier from Mend's Administration screen and are plausibly the same value (spec gate G7,
-    unverified against a live org). Defaulting means nobody sets MEND_ORGUUID unless they differ.
-    Every 3.0 caller goes through here -- never read conf.org_uuid directly.
+    MEND_ORGUUID is required and validated by check_patterns, so this never falls back. It
+    used to default to MEND_APIKEY, which is now removed entirely: the two were the same
+    org identifier from Mend's Administration screen, and carrying both meant a pipeline
+    setting only MEND_ORGUUID failed at startup. Every caller goes through here -- never
+    read conf.org_uuid directly.
     """
-    return (conf.org_uuid or conf.ws_org_token or "").strip()
+    return (conf.org_uuid or "").strip()
 
 
 def fetch_v3_projects():
@@ -2908,7 +2912,6 @@ def startup():
     global conf
     conf = Config(
         ws_user_key=varenvs.get_env("wsuserkey").strip(),
-        ws_org_token=varenvs.get_env("wsapikey").strip(),
         ws_url=varenvs.get_env("wsurl").strip(),
         wsproducttoken=varenvs.get_env("wsproduct").strip(),
         wsprojecttoken=varenvs.get_env("wsproject").strip(),

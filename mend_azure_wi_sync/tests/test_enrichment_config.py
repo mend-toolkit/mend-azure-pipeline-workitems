@@ -18,11 +18,11 @@ def test_mend_epss_and_mend_alert_are_gone():
     assert not hasattr(core, "epss_enabled")
 
 
-def test_reachability_reads_both_aliases():
+def test_reachability_reads_the_mend_alias_and_no_longer_the_ws_one():
     with mock.patch.dict(os.environ, {"MEND_REACHABILITY": "true"}, clear=True):
         assert varenvs.get_env("wsreachability") == "true"
     with mock.patch.dict(os.environ, {"WS_REACHABILITY": "true"}, clear=True):
-        assert varenvs.get_env("wsreachability") == "true"
+        assert varenvs.get_env("wsreachability") == ""
 
 
 def test_unexpanded_placeholder_and_empty_both_default_reachability_to_false():

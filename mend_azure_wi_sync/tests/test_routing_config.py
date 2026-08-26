@@ -10,11 +10,11 @@ def test_routing_defaults_to_empty_when_unset():
         assert varenvs.get_env("wsrouting") == ""
 
 
-def test_routing_reads_both_aliases():
+def test_routing_reads_the_mend_alias_and_no_longer_the_ws_one():
     with mock.patch.dict(os.environ, {"MEND_ROUTING": "true"}, clear=True):
         assert varenvs.get_env("wsrouting") == "true"
     with mock.patch.dict(os.environ, {"WS_ROUTING": "true"}, clear=True):
-        assert varenvs.get_env("wsrouting") == "true"
+        assert varenvs.get_env("wsrouting") == ""
 
 
 def test_branches_reads_mend_alias():
@@ -32,14 +32,14 @@ def _valid_conf(**overrides):
     (core.py:69), so a bare MagicMock raises TypeError before any assertion can run.
     """
     from mend_azure_wi_sync.config import Config
-    fields = dict(ws_user_key=VALID, ws_org_token=VALID, ws_url="https://saas.mend.io",
+    fields = dict(ws_user_key=VALID, ws_url="https://saas.mend.io",
                   azure_uri="https://dev.azure.com/org/", azure_project="Platform",
                   azure_pat=VALID, utc_delta=0, wsproducttoken="",
                   wsprojecttoken="", wsexcludetoken="", azure_area="", azure_type="Task",
                   azure_custom="", dependency="true", reponame="", description="ReproSteps",
                   priority="false", proxy="", routing="false",
                   branches="main,master", reachability="false",
-                  email="qa@example.com", org_uuid="", severity="high",
+                  email="qa@example.com", org_uuid=VALID, severity="high",
                   closed_state="Closed", reopen_state="New")
     fields.update(overrides)
     return Config(**fields)
@@ -92,3 +92,19 @@ def test_check_patterns_rejects_a_whitespace_only_mend_email():
 def test_check_patterns_accepts_a_present_mend_email():
     with mock.patch.object(core, "conf", _valid_conf(email="user@example.com")):
         assert not any("MEND_EMAIL" in el for el in core.check_patterns())
+
+
+def test_check_patterns_requires_the_org_uuid():
+    """MEND_ORGUUID replaced MEND_APIKEY as the required org identifier. It is read on every
+    3.0 path and as the login's orgToken, so an unset value must abort the run rather than
+    produce `orgs//projects/summaries`."""
+    for raw in ("", "   ", "not-a-uuid"):
+        with mock.patch.object(core, "conf", _valid_conf(org_uuid=raw)):
+            assert any("MEND_ORGUUID" in el for el in core.check_patterns()), raw
+
+
+def test_check_patterns_accepts_a_uuid_or_a_token_shaped_org_uuid():
+    uuid = "123e4567-e89b-12d3-a456-426655440000"
+    for raw in (uuid, VALID):
+        with mock.patch.object(core, "conf", _valid_conf(org_uuid=raw)):
+            assert not any("MEND_ORGUUID" in el for el in core.check_patterns()), raw

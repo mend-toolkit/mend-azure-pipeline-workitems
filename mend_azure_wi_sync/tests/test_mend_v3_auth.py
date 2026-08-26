@@ -5,7 +5,7 @@ from mend_azure_wi_sync import core
 
 def _conf():
     return mock.MagicMock(email="a@b.com", ws_url="saas.mend.io", ws_user_key="uk-1",
-                          ws_org_token="tok-abc", org_uuid="", proxy={})
+                          org_uuid="org-1", proxy={})
 
 
 def _reset():
@@ -115,7 +115,7 @@ def test_login_targets_the_derived_host_not_the_sca_host():
     _reset()
     conf = mock.MagicMock(email="a@b.com",
                           ws_url="https://saas.mend.io", ws_user_key="uk-1",
-                          ws_org_token="tok-abc", proxy={})
+                          org_uuid="org-1", proxy={})
     seen = {}
 
     class FakeResponse:
@@ -196,3 +196,25 @@ def test_a_persistent_failure_reports_errorcode_2():
          mock.patch.object(core, "_get_v2", return_value=({"message": "nope"}, 500)):
         payload, errorcode = core.call_ws_api_v3("orgs/o-1/projects")
     assert errorcode == 2
+
+
+def test_the_login_body_carries_the_org_uuid_as_the_org_token():
+    """MEND_APIKEY used to supply orgToken. The 2.0 spec documents the field as "org UUID ...
+    or API Key", so it now carries MEND_ORGUUID and nothing reads an API key."""
+    _reset()
+    seen = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"retVal": {"jwtToken": "jwt-1"}}'
+
+    def fake_post(url, **kwargs):
+        seen["body"] = kwargs["json"]
+        return FakeResponse()
+
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core.requests, "post", fake_post):
+        core.mend_v2_token()
+
+    assert seen["body"]["orgToken"] == "org-1"
+    assert seen["body"] == {"email": "a@b.com", "userKey": "uk-1", "orgToken": "org-1"}

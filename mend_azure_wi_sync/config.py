@@ -29,34 +29,33 @@ class DescAzure(Enum):
 
 
 class varenvs(Enum):  # Lit of Env.variables
-    wsuserkey = ("WS_USERKEY", "MEND_USERKEY")
-    wsapikey = ("MEND_APIKEY","WS_APIKEY","WS_TOKEN")
-    wsurl = ("WS_WSS_URL","MEND_WSS_URL","WS_URL","MEND_URL")
-    wsproduct = ("WS_PRODUCTTOKEN", "MEND_PRODUCTTOKEN")
-    wsproject = ("WS_PROJECTTOKEN", "MEND_PROJECTTOKEN")
-    wsazureuri = ("WS_AZUREURI","MEND_AZUREURI")
-    wsazurepat = ("WS_AZUREPAT","MEND_AZUREPAT")
-    wsazureproject = ("WS_AZUREPROJECT","MEND_AZUREPROJECT")
-    wsexcludetoken = ("WS_EXCLUDETOKEN","MEND_EXCLUDETOKEN")
-    wsazurearea = ("WS_AZUREAREA","MEND_AZUREAREA")
-    wsazuretype = ("WS_AZURETYPE","MEND_AZURETYPE")
-    wscustomfields = ("WS_CUSTOMFIELDS","MEND_CUSTOMFIELDS")
-    wsdependency = ("WS_DEPENDENCY","MEND_DEPENDENCY")
-    wsreponame = ("WS_REPONAME","MEND_REPONAME")
-    azuredesc = ("WS_DESCRIPTION","MEND_DESCRIPTION")
-    azurepriority = ("WS_CALCULATEPRIORITY", "MEND_CALCULATEPRIORITY")
+    wsuserkey = ("MEND_USERKEY",)
+    wsurl = ("MEND_WSS_URL", "MEND_URL")
+    wsproduct = ("MEND_PRODUCTTOKEN",)
+    wsproject = ("MEND_PROJECTTOKEN",)
+    wsazureuri = ("MEND_AZUREURI",)
+    wsazurepat = ("MEND_AZUREPAT",)
+    wsazureproject = ("MEND_AZUREPROJECT",)
+    wsexcludetoken = ("MEND_EXCLUDETOKEN",)
+    wsazurearea = ("MEND_AZUREAREA",)
+    wsazuretype = ("MEND_AZURETYPE",)
+    wscustomfields = ("MEND_CUSTOMFIELDS",)
+    wsdependency = ("MEND_DEPENDENCY",)
+    wsreponame = ("MEND_REPONAME",)
+    azuredesc = ("MEND_DESCRIPTION",)
+    azurepriority = ("MEND_CALCULATEPRIORITY",)
     proxy = ("PROXY", "MEND_PROXY")
-    wsrouting = ("WS_ROUTING", "MEND_ROUTING")
-    wsbranches = ("WS_BRANCHES", "MEND_BRANCHES")
-    wsreachability = ("WS_REACHABILITY", "MEND_REACHABILITY")
-    wsemail = ("WS_EMAIL", "MEND_EMAIL")
-    wsorguuid = ("WS_ORGUUID", "MEND_ORGUUID")
-    wsseverity = ("WS_SEVERITY", "MEND_SEVERITY")
-    wsclosedstate = ("WS_CLOSEDSTATE", "MEND_CLOSEDSTATE")
-    wsreopenstate = ("WS_REOPENSTATE", "MEND_REOPENSTATE")
-    wssslverify = ("WS_SSLVERIFY", "MEND_SSLVERIFY")
-    wsdeppaths = ("WS_DEPPATHS", "MEND_DEPPATHS")
-    wsdeppathsconcurrency = ("WS_DEPPATHS_CONCURRENCY", "MEND_DEPPATHS_CONCURRENCY")
+    wsrouting = ("MEND_ROUTING",)
+    wsbranches = ("MEND_BRANCHES",)
+    wsreachability = ("MEND_REACHABILITY",)
+    wsemail = ("MEND_EMAIL",)
+    wsorguuid = ("MEND_ORGUUID",)
+    wsseverity = ("MEND_SEVERITY",)
+    wsclosedstate = ("MEND_CLOSEDSTATE",)
+    wsreopenstate = ("MEND_REOPENSTATE",)
+    wssslverify = ("MEND_SSLVERIFY",)
+    wsdeppaths = ("MEND_DEPPATHS",)
+    wsdeppathsconcurrency = ("MEND_DEPPATHS_CONCURRENCY",)
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -102,7 +101,6 @@ class Tags(Enum):
 @dataclass
 class Config:
     ws_user_key: str
-    ws_org_token: str
     ws_url: str
     azure_uri: str
     azure_project: str
@@ -140,7 +138,6 @@ class Config:
     def conf_json(self):
         return {
             "wsuserkey": self.ws_user_key,
-            "wsorgtoken": self.ws_org_token,
             "wsurl": self.ws_url,
             "wsazureuri": self.azure_uri,
             "wsazureproject": self.azure_project,

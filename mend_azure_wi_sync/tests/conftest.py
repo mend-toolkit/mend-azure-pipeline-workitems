@@ -18,23 +18,23 @@ sys.modules.setdefault("core", _core)
 
 
 def pytest_addoption(parser):
-    parser.addoption("--wsurl", action="store", default=os.environ.get("WS_APIKEY",'https://saas.whitesourcesoftware.com'))
-    parser.addoption("--apikey", action="store", default=os.environ.get("WS_APIKEY"))
-    parser.addoption("--wsuserkey", action="store", default=os.environ.get("WS_USERKEY"))
+    parser.addoption("--wsurl", action="store", default=os.environ.get("MEND_URL",'https://saas.whitesourcesoftware.com'))
+    parser.addoption("--orguuid", action="store", default=os.environ.get("MEND_ORGUUID"))
+    parser.addoption("--wsuserkey", action="store", default=os.environ.get("MEND_USERKEY"))
     parser.addoption("--utcdelta", action="store", default='0')
     parser.addoption("--azuretype", action="store", default='Task')
-    parser.addoption("--azureuri", action="store", default=os.environ.get("WS_AZUREURI",'https://dev.azure.com/ps-mend/'))
-    parser.addoption("--azurepat", action="store", default=os.environ.get("WS_AZUREPAT",'azurepat'))
+    parser.addoption("--azureuri", action="store", default=os.environ.get("MEND_AZUREURI",'https://dev.azure.com/ps-mend/'))
+    parser.addoption("--azurepat", action="store", default=os.environ.get("MEND_AZUREPAT",'azurepat'))
     parser.addoption("--azurearea", action="store", default='')
     parser.addoption("--reset", action="store", default="False")
-    parser.addoption("--azureproject", action="store", default=os.environ.get("WS_AZUREPROJECT",'AzureTestProject'))
-    parser.addoption("--wsprojecttoken", action="store", default=os.environ.get("WS_PROJECTTOKEN"))
-    parser.addoption("--wsproducttoken", action="store", default=os.environ.get("WS_PRODUCTTOKEN"))
+    parser.addoption("--azureproject", action="store", default=os.environ.get("MEND_AZUREPROJECT",'AzureTestProject'))
+    parser.addoption("--wsprojecttoken", action="store", default=os.environ.get("MEND_PROJECTTOKEN"))
+    parser.addoption("--wsproducttoken", action="store", default=os.environ.get("MEND_PRODUCTTOKEN"))
 
 
 def pytest_configure(config):
     global args
-    args = Namespace(ws_org_token=config.getoption("apikey"), ws_user_key=config.getoption("wsuserkey"),
+    args = Namespace(org_uuid=config.getoption("orguuid"), ws_user_key=config.getoption("wsuserkey"),
                      reset=config.getoption("reset"),
                      ws_prj=config.getoption("wsprojecttoken"),utc_delta=config.getoption("utcdelta"),
                      ws_prd=config.getoption("wsproducttoken"),ws_url=config.getoption("wsurl"),

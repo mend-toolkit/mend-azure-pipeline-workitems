@@ -5,8 +5,8 @@ from mend_azure_wi_sync.config import Config, varenvs
 
 
 def test_env_aliases_exist():
-    assert varenvs.wsclosedstate.value == ("WS_CLOSEDSTATE", "MEND_CLOSEDSTATE")
-    assert varenvs.wsreopenstate.value == ("WS_REOPENSTATE", "MEND_REOPENSTATE")
+    assert varenvs.wsclosedstate.value == ("MEND_CLOSEDSTATE",)
+    assert varenvs.wsreopenstate.value == ("MEND_REOPENSTATE",)
 
 
 def test_config_carries_both_fields():
