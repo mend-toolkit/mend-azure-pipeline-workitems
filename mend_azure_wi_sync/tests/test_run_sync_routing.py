@@ -24,11 +24,19 @@ PROJECTS = [_project("p-a", "api", _tags("Platform")),
             _project("p-c", "untagged", {})]
 
 
-def _patches(conf, projects=PROJECTS, known={"Platform", "Tools"}):
+def _fields():
+    return [{"referenceName": "System.Title", "name": "Title", "defaultValue": None}]
+
+
+def _patches(conf, projects=PROJECTS, known={"Platform", "Tools"}, probe=None):
     """Start the common patches; every test using this must call mock.patch.stopall()."""
+    # probe_wi_type is a real Azure read per destination, so routing tests stub it. A test
+    # that cares about the probe itself passes its own.
     for p in (mock.patch.object(core, "conf", conf),
               mock.patch.object(core, "fetch_v3_projects", return_value=(projects, True)),
-              mock.patch.object(core, "list_azure_projects", return_value=known)):
+              mock.patch.object(core, "list_azure_projects", return_value=known),
+              probe or mock.patch.object(core, "probe_wi_type",
+                                         return_value=("Task", _fields()))):
         p.start()
 
 
@@ -245,3 +253,91 @@ def test_conf_azure_project_is_restored_even_when_a_target_raises():
         finally:
             mock.patch.stopall()
     assert conf.azure_project == "Bookkeeping"
+
+
+def test_the_work_item_type_is_probed_once_per_destination():
+    """MEND_AZUREPROJECT is not the destination under routing, so its process cannot speak for
+    the others: a destination on a different process exposes different custom fields."""
+    conf = _conf()
+    probe = mock.Mock(return_value=("Task", _fields()))
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "sync_project_v3", return_value=True):
+        _patches(conf, probe=mock.patch.object(core, "probe_wi_type", probe))
+        try:
+            core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    assert [c.args[0] for c in probe.call_args_list] == ["Platform", "Tools"]
+
+
+def test_each_destinations_own_fields_reach_its_work_items():
+    """The startup field list must not leak across destinations -- passing Platform's
+    Custom.X to Tools is a PATCH Azure rejects per work item."""
+    conf = _conf()
+    per_project = {"Platform": [{"referenceName": "Custom.Platform", "name": "P",
+                                 "defaultValue": None}],
+                   "Tools": [{"referenceName": "Custom.Tools", "name": "T",
+                              "defaultValue": None}]}
+    seen = []
+
+    def _sync(project, floor, custom_flds, wi_type, position=""):
+        seen.append((conf.azure_project, [f["referenceName"] for f in custom_flds]))
+        return True
+
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "sync_project_v3", _sync):
+        _patches(conf, probe=mock.patch.object(
+            core, "probe_wi_type", side_effect=lambda prj: ("Task", per_project[prj])))
+        try:
+            core.run_sync(st_date="", end_date="",
+                          custom_flds=[{"referenceName": "Custom.Startup", "name": "S",
+                                        "defaultValue": None}], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    assert seen == [("Platform", ["Custom.Platform"]), ("Tools", ["Custom.Tools"])]
+
+
+def test_a_destination_without_the_work_item_type_is_skipped_and_the_run_fails():
+    """Every routing destination must carry MEND_AZURETYPE. One that does not is a failure
+    boundary of its own: the other destinations still sync, and the run reports failure so the
+    log cannot end in 'completed successfully'."""
+    conf = _conf()
+    synced = []
+
+    def _probe(project):
+        return ("SCA Issue", None) if project == "Platform" else ("SCA Issue", _fields())
+
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "sync_project_v3",
+                           side_effect=lambda p, f, c, w, position="": synced.append(conf.azure_project) or True):
+        _patches(conf, probe=mock.patch.object(core, "probe_wi_type", side_effect=_probe))
+        try:
+            core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    assert synced == ["Tools"]
+    assert core.sync_had_fatal_error()
+
+
+def test_custom_fields_are_applied_to_every_destinations_field_list():
+    conf = _conf()
+    conf.azure_custom = "Severity::$MEND_SEVERITY"
+    seen = []
+
+    def _probe(project):
+        return ("Task", [{"referenceName": "Custom.Severity", "name": "Severity",
+                          "defaultValue": None}])
+
+    with mock.patch.object(core, "get_exist_wi", return_value=[]), \
+         mock.patch.object(core, "sync_project_v3",
+                           side_effect=lambda p, f, c, w, position="": seen.append(c[0]["defaultValue"]) or True):
+        _patches(conf, probe=mock.patch.object(core, "probe_wi_type", side_effect=_probe))
+        try:
+            core.run_sync(st_date="", end_date="", custom_flds=[], wi_type="Task")
+        finally:
+            mock.patch.stopall()
+
+    assert seen == ["$MEND_SEVERITY", "$MEND_SEVERITY"]

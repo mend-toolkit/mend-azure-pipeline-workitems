@@ -147,7 +147,12 @@ def check_patterns():
                 res.append("MEND_AZUREAREA")
                 break
     if not conf.azure_project:
-        res.append("MEND_AZUREPROJECT")
+        # Under routing every destination comes from a Mend project tag, and the work item
+        # type is now probed per destination -- so there is nothing left for this variable to
+        # do and it is no longer required. It is still honoured when set (harmlessly ignored)
+        # and still required without routing, where it IS the destination.
+        if conf.routing.lower() != "true":
+            res.append("MEND_AZUREPROJECT")
     elif "/" in conf.azure_project:
         # Azure reads "{project}/{team}" and returns HTTP 500 — this is almost always a
         # $(System.TeamProject)-style value that picked up a team suffix by mistake.
@@ -2192,6 +2197,10 @@ def run_sync_routed(projects: list, custom_flds: list, wi_type: str, floor: floa
     `projects` are 3.0 project dicts that already survived select_projects, so MEND_*TOKEN
     narrowing has happened and there are no scope-excluded / out-of-scope outcomes left to
     preset -- routing.py only decides no-target / schema-fault / branch-filtered / unknown.
+
+    `custom_flds` and `wi_type` are accepted for signature symmetry with run_sync and are
+    UNUSED: both are per Azure project, so they are read from each destination below. main()
+    does not even run the startup probe when routing is on.
     """
     global exist_wis, global_errors, run_failed
     # conf.azure_project, conf.reponame and conf.azure_area are all re-pointed per target
@@ -2200,6 +2209,10 @@ def run_sync_routed(projects: list, custom_flds: list, wi_type: str, floor: floa
     original_azure_project = conf.azure_project
     original_reponame = conf.reponame
     original_azure_area = conf.azure_area
+    if original_azure_project:
+        logger.info(f"MEND_AZUREPROJECT ('{original_azure_project}') is not used under "
+                    f"MEND_ROUTING: every destination comes from the Mend project's tags, and "
+                    f"the work item type is read from each destination.")
     try:
         known = list_azure_projects()
         if known is None:
@@ -2260,6 +2273,21 @@ def run_sync_routed(projects: list, custom_flds: list, wi_type: str, floor: floa
             # other 106.
             conf.azure_project = azure_project
             conf.azure_area = original_azure_area
+            # The work item type and its fields are read from THIS destination, not from
+            # MEND_AZUREPROJECT. A destination on a different process exposes different custom
+            # fields, and one probe applied to all of them meant a Custom.X that exists only in
+            # the probed project was still sent here -- rejected by Azure per work item.
+            # MEND_AZURETYPE stays global: every destination must carry that type.
+            wi_type_here, fields_here = probe_wi_type(azure_project)
+            if fields_here is None:
+                global_errors += 1
+                run_failed = True
+                logger.error(f"Skipping Azure project '{azure_project}': it has no work item "
+                             f"type '{wi_type_here}' (MEND_AZURETYPE). Every routing "
+                             f"destination must carry that type. Nothing is created or closed "
+                             f"for the Mend project(s) routed to it.")
+                continue
+            fields_here = apply_custom_fields(fields_here)
             # exist_wis is per AZURE project and MUST be re-read whenever the target changes,
             # or every title is matched against another project's work items - which both
             # duplicates work items and, now that closure is live, closes the wrong ones.
@@ -2274,7 +2302,7 @@ def run_sync_routed(projects: list, custom_flds: list, wi_type: str, floor: floa
                 continue
             for uuid, route in targets[azure_project]:
                 conf.reponame = route.repo
-                if sync_project_v3(by_uuid[uuid], floor, custom_flds, wi_type):
+                if sync_project_v3(by_uuid[uuid], floor, fields_here, wi_type_here):
                     synced += 1
         return f"{report}; {synced} Mend project(s) synced"
     finally:
@@ -2314,6 +2342,7 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     library_paths_consecutive_failures = 0
     library_paths_breaker_tripped = False
     reset_library_paths_pool_size_cache()
+    reset_field_meta_cache()
     floor = run_severity_floor()
     logger.info(f"Severity floor: MEND_SEVERITY '{conf.severity}' -> {floor}. The SAME floor "
                 f"decides which findings earn a work item and which findings hold one open.")
@@ -2381,47 +2410,109 @@ def get_deleted_items():
     return del_lst
 
 
+# {referenceName: the wit/fields payload, or None if the read failed}. Field definitions are
+# ORGANIZATION-level in Azure DevOps -- the same referenceName is the same field, with the same
+# type and the same isLocked/isPicklist/readOnly flags, in every project of the organization.
+# Caching them across destinations is what makes the per-destination probe affordable under
+# routing: one call per DISTINCT field for the whole run instead of one per field per project
+# (~60 fields x 107 projects). Cleared per run by run_sync.
+field_meta_cache = {}
+
+
+def reset_field_meta_cache():
+    global field_meta_cache
+    field_meta_cache = {}
+
+
+def field_is_editable(reference_name: str, project: str) -> bool:
+    """Is this field one we may write a string/html/double value into?
+
+    Read through field_meta_cache. A field whose definition cannot be read returns False:
+    previously the loop in load_wi_json left `is_add` at the PREVIOUS field's verdict, which
+    silently carried one field's editability onto the next. Custom and alwaysRequired fields
+    are kept by probe_wi_type regardless of this answer, so False only ever drops a field we
+    could not prove writable.
+    """
+    if reference_name not in field_meta_cache:
+        flds, err = call_azure_api(api_type="GET", api=f"wit/fields/{reference_name}",
+                                   project=project, data={}, version="7.0",
+                                   header="application/json")
+        field_meta_cache[reference_name] = flds if err == 0 else None
+    flds = field_meta_cache[reference_name]
+    if not flds:
+        return False
+    return try_or_error(
+        lambda: flds["type"].lower() in ("string", "html", "double")
+        and not flds["isLocked"] and not flds["isPicklist"] and not flds["readOnly"], False)
+
+
+def probe_wi_type(project: str):
+    """MEND_AZURETYPE's definition, and its usable fields, as ONE Azure project reports it.
+
+    Returns (wi_type, fields), or (wi_type, None) when that project's process does not carry
+    the type. The caller decides how bad that is: at startup it is fatal (see load_wi_json),
+    while under routing it is one destination out of many and the rest of the run continues.
+
+    The type name itself is global (MEND_AZURETYPE) -- only the field list is per project,
+    because a destination on a different process can expose different custom fields.
+    """
+    load_el = conf.azure_type if conf.azure_type else "Task"
+    r, errcode = call_azure_api(api_type="GET", api="wit/workitemtypes/", project=project, data={},
+                                version="7.0", header="application/json")
+    if errcode != 0:
+        logger.error(f"Could not read the work item types of Azure project '{project}'{r}")
+        return load_el, None
+    for el_ in try_or_error(lambda: r["value"], []):
+        if el_["name"].lower() != load_el.lower():
+            continue
+        fields = []
+        for el_fld_ in el_["fields"]:
+            if "Custom." in el_fld_["referenceName"] or el_fld_["alwaysRequired"] \
+                    or field_is_editable(el_fld_["referenceName"], project):
+                fields.append(
+                    {"referenceName": el_fld_["referenceName"],
+                     "name": el_fld_["name"],
+                     "defaultValue": el_fld_["defaultValue"],
+                     }
+                )
+        return load_el, fields
+    return load_el, None
+
+
+def apply_custom_fields(wi_fields: list) -> list:
+    """Stuff MEND_CUSTOMFIELDS values into the matching field descriptors as defaultValue.
+
+    Lives here rather than in main() because the routed path probes each destination
+    separately and has to do this to every field list it gets back, not just the first one.
+    Resolution of those values happens later, in analyze_fields / mend_val.
+    """
+    if not conf.azure_custom:
+        return wi_fields
+    for c_fld_ in conf.azure_custom.split(";"):
+        field_name_from_param = c_fld_.split("::")
+        fld_ref = f"Custom.{field_name_from_param[0]}"
+        for w_field_ in wi_fields or []:
+            if fld_ref == w_field_["referenceName"] or field_name_from_param[0] == w_field_["name"]:
+                w_field_["defaultValue"] = try_or_error(lambda: field_name_from_param[1],
+                                                        w_field_["defaultValue"])
+                break
+    return wi_fields
+
+
 def load_wi_json():
+    """The startup probe: MEND_AZUREPROJECT's definition of MEND_AZURETYPE.
+
+    Only the non-routed path uses this. Under MEND_ROUTING the probe happens per destination
+    inside run_sync_routed, because MEND_AZUREPROJECT is not where the work items go.
+    """
     global conf
     conf = startup() if not conf else conf
     conf.update_properties()
-    load_el = conf.azure_type if conf.azure_type else "Task"
-    r, errcode = call_azure_api(api_type="GET", api="wit/workitemtypes/", project=conf.azure_project, data={},
-                                version="7.0", header="application/json")
-    wi_list = []
-    is_add = False
-    if errcode == 0:
-        for el_ in r["value"]:
-            if el_["name"].lower() == load_el.lower():
-                fields = []
-                for el_fld_ in el_["fields"]:
-                    flds, err = call_azure_api(api_type="GET", api=f"wit/fields/{el_fld_['referenceName']}", project=conf.azure_project, data={},
-                                    version="7.0", header="application/json")
-                    if err == 0:
-                        is_add = (flds['type'].lower() == "string" or flds['type'].lower() == "html" or flds['type'].lower() == "double") \
-                                 and not flds["isLocked"] and not flds["isPicklist"] and not flds["readOnly"]
-                    if "Custom." in el_fld_["referenceName"] or el_fld_["alwaysRequired"] or is_add:
-                        fields.append(
-                            {"referenceName": el_fld_["referenceName"],
-                             "name": el_fld_["name"],
-                             "defaultValue": el_fld_["defaultValue"],
-                             }
-                        )
-                wi_list.append(
-                    {
-                        "name": el_["name"],
-                        "referenceName": el_["referenceName"],
-                        "fields": fields
-                    })
-                break
-    if not wi_list:
-        logger.error(f"No work item types available for project '{conf.azure_project}'{r}")
+    load_el, fields = probe_wi_type(conf.azure_project)
+    if fields is None:
+        logger.error(f"No work item types available for project '{conf.azure_project}'")
         exit(-1)
-
-    for res_ in wi_list:
-        if res_["name"].lower() == load_el.lower():
-            return load_el, res_["fields"]
-    return load_el, []
+    return load_el, fields
 
 
 def org_uuid() -> str:

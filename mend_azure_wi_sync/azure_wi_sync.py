@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _version import __tool_name__, __version__, __description__
-from core import run_sync, startup, load_wi_json, AGENT_INFO, \
+from core import run_sync, startup, load_wi_json, apply_custom_fields, AGENT_INFO, \
     check_patterns, sync_had_fatal_error, error_count
 
 logger = logging.getLogger(__tool_name__)
@@ -30,21 +30,21 @@ def main():
         [logger.error(el_) for el_ in chp_]
         exit(-1)
     # logger.debug(conf)  # TEMP
-    wi_type, wi_fields = load_wi_json()
-    if not wi_fields:
-        logger.error(f"The Workitem type {conf.azure_type} was not found")
-        exit(-1)
+    if conf.routing.lower() == "true":
+        # No startup probe: MEND_AZUREPROJECT is not a destination under routing and is no
+        # longer required, so there may be no project here to probe. run_sync_routed reads the
+        # work item type from each destination instead, and skips a destination that lacks it.
+        wi_type, wi_fields = conf.azure_type, []
+    else:
+        wi_type, wi_fields = load_wi_json()
+        if not wi_fields:
+            logger.error(f"The Workitem type {conf.azure_type} was not found")
+            exit(-1)
     conf.utc_delta = int((datetime.datetime.utcnow()-datetime.datetime.now()).total_seconds()/3600)  # in hours
     logger.info("Sync process started")
-    if conf.azure_custom:
-        custom_flds = conf.azure_custom.split(";")
-        for c_fld_ in custom_flds:
-            field_name_from_param = c_fld_.split("::")
-            fld_ref = f"Custom.{field_name_from_param[0]}"
-            for w_field_ in wi_fields:
-                if fld_ref == w_field_["referenceName"] or field_name_from_param[0] == w_field_["name"]:
-                    w_field_["defaultValue"] = field_name_from_param[1]
-                    break
+    # Under routing this list is empty and each destination's own field list is filled in by
+    # run_sync_routed, which calls apply_custom_fields itself.
+    wi_fields = apply_custom_fields(wi_fields)
 
     now = datetime.datetime.now() + datetime.timedelta(hours=conf.utc_delta)
     todate = now.strftime("%Y-%m-%d %H:%M:%S")

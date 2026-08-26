@@ -95,7 +95,7 @@ are likely to fill them in.
 | `MEND_ORGUUID` | string | N/A | UUID of your Mend organization. Identifies the organization on every Mend API call |
 | `MEND_AZUREURI` | string | N/A | Azure DevOps organization URI, for example `https://dev.azure.com/MyOrganization`. Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services) `$(System.CollectionUri)` |
 | `MEND_AZUREPAT` | secret | N/A | Azure DevOps [Personal Access Token](https://docs.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate?view=azure-devops&tabs=Windows) |
-| `MEND_AZUREPROJECT` | string | N/A | Azure Team Project name. Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services) `$(System.TeamProject)`. Under `MEND_ROUTING` it is not the destination, but is still required: it is the project whose Work Item type definition is read at startup |
+| `MEND_AZUREPROJECT` | string | N/A | Azure Team Project name. Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services) `$(System.TeamProject)`. **Not required when `MEND_ROUTING: true`**, where every destination comes from the Mend project's tags and the Work Item type is read from each destination. Set without routing, it is the destination |
 
 ### Choosing what to sync
 
@@ -195,6 +195,15 @@ shell syntax and fails with `bad substitution`.
 
 >**_IMPORTANT_**: Use `$(Build.SourceBranch)`, **not** `$(Build.SourceBranchName)`. `SourceBranchName` returns only the last path segment, so `refs/heads/release/1.2` becomes `1.2` and cannot match a `MEND_BRANCHES` pattern like `release/*`. The integration strips the `refs/heads/` prefix itself.
 
+**Every destination must have `MEND_AZURETYPE` available.** The Work Item type and its
+fields are read from each destination separately, so a destination on a different
+[process](https://learn.microsoft.com/en-us/azure/devops/boards/work-items/guidance/choose-process?view=azure-devops&tabs=agile-process)
+still gets the right fields. A destination whose process does not carry the type is skipped
+with an error naming it, the other destinations are unaffected, and the run reports failure.
+
+`MEND_AZUREPROJECT` is not used under routing and is not required. Set it only for a
+non-routed run.
+
 >**_IMPORTANT_**: With `MEND_ROUTING: true`, a run that cannot read the Mend project tags does **no work at all**. It logs `Aborted: could not read Mend project tags.` and reports a failed run, rather than syncing some projects and skipping others.
 <br />
 
@@ -253,7 +262,7 @@ failed run costs nothing but the delay.
 
 ## Custom Field Mapping
 
-When `MEND_AZURETYPE` names a [custom Work Item type](https://learn.microsoft.com/en-us/azure/devops/boards/work-items/about-work-items?view=azure-devops&tabs=agile-process#customize-a-work-item-type), the integration reads its definition from the [Azure API](https://learn.microsoft.com/en-us/rest/api/azure/devops/wit/work-item-types/get) automatically. `MEND_CUSTOMFIELDS` then populates that type's fields from the Mend entry that produced the Work Item.
+When `MEND_AZURETYPE` names a [custom Work Item type](https://learn.microsoft.com/en-us/azure/devops/boards/work-items/about-work-items?view=azure-devops&tabs=agile-process#customize-a-work-item-type), the integration reads its definition from the [Azure API](https://learn.microsoft.com/en-us/rest/api/azure/devops/wit/work-item-types/get) automatically, once per Azure project it writes to. `MEND_CUSTOMFIELDS` then populates that type's fields from the Mend entry that produced the Work Item.
 
 ### Syntax
 

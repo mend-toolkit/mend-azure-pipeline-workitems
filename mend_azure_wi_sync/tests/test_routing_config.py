@@ -108,3 +108,21 @@ def test_check_patterns_accepts_a_uuid_or_a_token_shaped_org_uuid():
     for raw in (uuid, VALID):
         with mock.patch.object(core, "conf", _valid_conf(org_uuid=raw)):
             assert not any("MEND_ORGUUID" in el for el in core.check_patterns()), raw
+
+
+def test_azureproject_is_not_required_under_routing():
+    """Under MEND_ROUTING every destination comes from a Mend project tag and the work item
+    type is probed per destination, so there is nothing left for the variable to do."""
+    with mock.patch.object(core, "conf", _valid_conf(routing="true", azure_project="")):
+        assert not any("MEND_AZUREPROJECT" in el for el in core.check_patterns())
+
+
+def test_azureproject_is_still_required_without_routing():
+    with mock.patch.object(core, "conf", _valid_conf(routing="false", azure_project="")):
+        assert any("MEND_AZUREPROJECT" in el for el in core.check_patterns())
+
+
+def test_a_slash_is_still_rejected_under_routing_when_the_variable_is_set():
+    with mock.patch.object(core, "conf", _valid_conf(routing="true",
+                                                     azure_project="Platform/Team")):
+        assert any("MEND_AZUREPROJECT" in el for el in core.check_patterns())
