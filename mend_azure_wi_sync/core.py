@@ -190,7 +190,8 @@ azure_project_page = 100
 
 def iter_azure_projects():
     # Azure DevOps pages _apis/projects. The previous unpaginated call silently hid every
-    # project past the first page, which at 107 projects broke get_lastrun/set_lastrun.
+    # project past the first page, which at 107 projects made those destinations invisible to
+    # routing (and, before the sync state moved onto Mend tags, to get_lastrun/set_lastrun).
     # Yields pages; on failure it yields a terminal `None` sentinel (already logged) before
     # returning, so a consumer can tell "a later page failed" from "no more pages" instead of
     # silently treating a partial sweep as complete.
@@ -212,20 +213,6 @@ def iter_azure_projects():
         if len(page) < azure_project_page:
             return
         skip += azure_project_page
-
-
-def get_azure_prj_id(prj_name: str):
-    res = ""
-    try:
-        for page in iter_azure_projects():
-            if page is None:
-                continue
-            for prj_ in page:
-                if prj_["name"] == prj_name:
-                    return prj_["id"]
-    except Exception as err:
-        pass
-    return res
 
 
 def reachability_enabled() -> bool:
