@@ -1,11 +1,6 @@
 """Diff Mend's current state against Azure DevOps, producing one action per work item.
 
 Pure module -- it decides, it does not call. All HTTP stays in core.py.
-
-The tool's job is to make Azure match Mend's CURRENT state. Until the 3.0 move that was
-impossible: 1.4's policy API is a delta ("what was raised between these timestamps"), so a work
-item's absence from a window meant nothing and nothing could ever be closed. 3.0 publishes
-findingInfo.status explicitly, so absence from `desired` is now a statement about now.
 """
 
 CREATE = "create"
@@ -16,16 +11,10 @@ SKIP = "skip"
 
 
 def _is_closed(state, closed_state) -> bool:
-    """Is this work item already in a closed state?
+    """True when `state` is one of the closed state names.
 
-    `closed_state` is one name or a collection of them. A collection is the normal case now:
-    Azure's out-of-box processes call it "Closed" (Agile, CMMI) or "Done" (Scrum, Basic), and an
-    unset MEND_CLOSEDSTATE has to work on all four. Matching against every candidate also FIXES a
-    latent bug -- with a single "Closed" configured, a Scrum board's Done item was not recognised
-    as closed, so every run tried to close it again and a returning finding never reopened it.
-
-    Case-insensitive: Azure returns state names as the process defines them, and a case mismatch
-    would turn a skip into a close, then a reopen, then a close -- an item flapping every run.
+    `closed_state` is one name or a collection of them. Comparison is case-insensitive and ignores
+    surrounding whitespace. An empty or missing state is not closed.
     """
     current = str(state or "").strip().casefold()
     if not current:
@@ -35,20 +24,16 @@ def _is_closed(state, closed_state) -> bool:
 
 
 def plan_actions(desired, actual, closed_state):
-    """One action per work item key. Keys are (kind, identity-key) -- the identity being the
-    library in MEND_DEPENDENCY=true mode and "{cve}|{library}" in per-CVE mode, since that mode
-    puts one CVE on each work item. This module never inspects a key; it only matches the two
-    sides, which is why the change of shape leaves it untouched.
+    """One action per work item key, for every key in `desired` or `actual`, each appearing exactly
+    once. Keys are (kind, identity-key); see identity.py. Keys are matched, never inspected.
 
-    Every key in `desired` or `actual` appears exactly once in the result: a key that was both
-    created and closed would fight itself on every run.
+        in desired, absent from actual       -> CREATE
+        in desired, present and closed       -> REOPEN
+        in desired, present and open         -> UPDATE
+        absent from desired, open            -> CLOSE
+        absent from desired, already closed  -> SKIP
 
-    SKIP exists for one reason and it is load-bearing. An item that is already closed and should
-    stay closed gets NO API call at all -- not a redundant close. If an Azure process rule
-    reactivates a Closed work item whenever it is PATCHed (observed by Joshua, cause unconfirmed),
-    then any call against a closed item reopens it and the item oscillates forever. Making no call
-    is correct whether or not that rule exists, which is what lets this design ship without the
-    answer.
+    SKIP means no API call is made for that work item.
     """
     desired = desired if isinstance(desired, dict) else {}
     actual = actual if isinstance(actual, dict) else {}
@@ -67,7 +52,7 @@ def plan_actions(desired, actual, closed_state):
         if key in desired:
             continue
         if _is_closed(current.get("state"), closed_state):
-            # Already closed and still gone: nothing to do, and deliberately no API call.
+            # Already closed and absent from desired: no API call.
             actions.append({"action": SKIP, "key": key, "id": current.get("id"), "entry": None})
         else:
             actions.append({"action": CLOSE, "key": key, "id": current.get("id"), "entry": None})

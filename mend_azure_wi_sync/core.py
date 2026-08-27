@@ -86,18 +86,16 @@ LIBRARY_PATHS_BREAKER_THRESHOLD = 5
 library_paths_consecutive_failures = 0
 library_paths_breaker_tripped = False
 # Default width of the ThreadPoolExecutor the batch /paths fetch fans out over (see
-# _fetch_paths_batch). Mend confirmed no rate limit, so this is a latency/throughput knob, not a
-# politeness one -- 16 was chosen so the 383-library project that stalled for minutes in serial
-# finishes in low tens of seconds instead. MEND_DEPPATHS_CONCURRENCY (library_paths_pool_size)
-# overrides it; this constant is also the fallback that a bad override resolves to.
+# _fetch_paths_batch). Mend imposes no rate limit here, so this is a latency/throughput knob.
+# MEND_DEPPATHS_CONCURRENCY (library_paths_pool_size) overrides it, and this constant is also the
+# fallback a bad override resolves to.
 LIBRARY_PATHS_POOL_SIZE = 16
-# Clamp for MEND_DEPPATHS_CONCURRENCY. 4x the default is already generous headroom for a bigger
-# org than the one that triggered this fix, without letting a pasted "5000" spin up thousands of
-# threads against a host that has no rate limit but still finite real capacity.
+# Clamp for MEND_DEPPATHS_CONCURRENCY: generous headroom for a large org, without letting a
+# pasted "5000" spin up thousands of threads against a host with finite real capacity.
 LIBRARY_PATHS_POOL_SIZE_MAX = 64
-# Per-call timeout (seconds) for the batch /paths fetch ONLY (Task 2) -- deliberately not shared
-# with call_ws_api_v2/v3's unbounded _get_v2 callers, which is a separate, wider decision left for
-# later. 30s is generous next to this endpoint's observed sub-second-to-a-few-second latency, but
+# Per-call timeout (seconds) for the batch /paths fetch only. It is deliberately not shared with
+# call_ws_api_v2/v3's unbounded _get_v2 callers. 30s is generous next to this endpoint's observed
+# sub-second-to-a-few-second latency, but
 # short enough that one stuck socket cannot recreate the multi-minute hang this change fixes --
 # with a 16-wide pool a handful of hangs would otherwise stack up to real wall-clock damage.
 LIBRARY_PATHS_TIMEOUT = 30
@@ -147,10 +145,9 @@ def check_patterns():
                 res.append("MEND_AZUREAREA")
                 break
     if not conf.azure_project:
-        # Under routing every destination comes from a Mend project tag, and the work item
-        # type is now probed per destination -- so there is nothing left for this variable to
-        # do and it is no longer required. It is still honoured when set (harmlessly ignored)
-        # and still required without routing, where it IS the destination.
+        # Under routing every destination comes from a Mend project tag and the work item type
+        # is probed per destination, so this variable is not required. It is honoured when set,
+        # and required without routing, where it is the destination.
         if conf.routing.lower() != "true":
             res.append("MEND_AZUREPROJECT")
     elif "/" in conf.azure_project:
@@ -322,11 +319,10 @@ def mend_v2_token() -> str:
 
 
 def _get_v2(url: str, token: str, params: dict, timeout: float = None):
-    # timeout is optional and defaults to None (today's behaviour: no timeout at all) so every
-    # existing caller (call_ws_api_v2, call_ws_api_v3, the 2.0 login) is byte-for-byte unaffected.
-    # Only the batch /paths fetch (_fetch_paths_batch, Task 2) passes one -- a tool-wide timeout
-    # is a separate, wider decision left for later. `timeout is not None` doubles as "this call
-    # came from a ThreadPoolExecutor worker": warnings.catch_warnings(record=True) below swaps
+    # timeout defaults to None, meaning no timeout: call_ws_api_v2, call_ws_api_v3 and the 2.0
+    # login all pass nothing. Only the batch /paths fetch (_fetch_paths_batch) passes a value, so
+    # `timeout is not None` doubles as "this call came from a ThreadPoolExecutor worker":
+    # warnings.catch_warnings(record=True) below swaps
     # process-wide state (the filter list via simplefilter, and warnings.showwarning) on
     # __enter__/__exit__, which is not thread-safe -- with several workers concurrently
     # entering/exiting, one thread's __exit__ can restore another's saved state and leak an
@@ -413,9 +409,8 @@ def call_ws_api_v2(api: str, params: dict = None):
 
 
 def call_ws_api_v3(api: str, params: dict = None, method: str = "GET", body: dict = None):
-    # Same (payload, errorcode) convention as call_ws_api_v2. Mend 3.0 accepts the JWT
-    # minted by the 2.0 login, so there is deliberately no separate 3.0 login path — but
-    # 3.0 lives on the same API host as 2.0, not on the 1.4 SCA app host.
+    # Same (payload, errorcode) convention as call_ws_api_v2. Mend 3.0 accepts the JWT minted by
+    # the 2.0 login, so there is no separate 3.0 login path, and 3.0 lives on the same API host.
     #
     # method exists because the spec declares /projects/summaries as POST-only while every
     # other 3.0 endpoint in use is GET; cursor/limit still travel as query params either way
@@ -447,11 +442,10 @@ MAX_V3_PAGES = 1000
 def _v3_total_items_ok(api: str, items: list, payload: dict) -> bool:
     """Cross-check the collected item count against the server's `additionalData.totalItems`.
 
-    totalItems is the only server-side evidence available that a walk was complete, so a genuine,
-    parseable disagreement means the read was truncated (e.g. an empty page that still carried a
-    cursor, or an empty first page from a mis-scoped org/project UUID). totalItems may be a
-    string, may be missing, or may be malformed -- none of that is grounds to fail an otherwise
-    legitimate read, so absence or a parse failure always falls back to True.
+    totalItems is the only server-side evidence that a walk was complete, so a parseable
+    disagreement means the read was truncated (an empty page that still carried a cursor, or an
+    empty first page from a mis-scoped org or project UUID). totalItems may be a string, missing
+    or malformed, and absence or a parse failure always falls back to True.
     """
     raw_total = try_or_error(lambda: payload["additionalData"]["totalItems"], None)
     if raw_total is None:
@@ -473,14 +467,13 @@ def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000, method: str
 
     Returns (items, ok). `ok` is False if ANY page failed, was malformed, the page cap was hit, a
     cursor repeated, or the collected count disagrees with the server's totalItems -- and it is
-    load-bearing: reconciliation closes work items that are absent from a fetch, so a caller MUST
-    treat ok=False as "I know nothing about this project" rather than as a shorter list. Returning
-    the partial items alongside ok=False is deliberate: they are useful for creating and updating,
+    load-bearing: reconciliation closes work items absent from a fetch, so a caller must treat
+    ok=False as "I know nothing about this project" rather than as a shorter list. The partial
+    items are returned alongside ok=False because they are still usable for creating and updating,
     which cannot do harm, while closure must be skipped entirely.
 
-    method defaults to GET, unchanged for the two existing GET callers (findings/security,
-    violations). Pass method="POST" for an endpoint like /projects/summaries that the spec
-    declares POST-only; cursor/limit still ride as query params on the POST, per spec.
+    method defaults to GET. Pass method="POST" for an endpoint like /projects/summaries that the
+    spec declares POST-only; cursor/limit still ride as query params on the POST.
     """
     items = []
     cursor = None
@@ -604,8 +597,8 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
 
 def mend_tag_predicate() -> str:
     # Every work item this tool creates carries exactly one policy tag from the Tags enum.
-    # OR-ing them narrows the WIQL query from the customer's entire backlog down to items
-    # this integration owns. See the plan's note on how that invariant is maintained.
+    # OR-ing them narrows the WIQL query from the whole Azure DevOps backlog down to items
+    # this integration owns.
     return " OR ".join([f'[System.Tags] CONTAINS "{t}"' for t in Tags.all_tags()])
 
 
@@ -813,12 +806,11 @@ def actual_work_items(project_name: str):
 def _patch_state(work_item_id, state: str, verb: str):
     """PATCH System.State and NOTHING else. Returns (ok, unsupported_state).
 
-    `unsupported_state` tells the caller this exact failure was Azure rejecting the state NAME, so
+    `unsupported_state` tells the caller the failure was Azure rejecting the state name, so
     another candidate is worth trying -- see _apply_state. Every other failure is final.
 
-    Deliberately not a description rewrite: this path has no enrichment join, so rewriting the
-    description would blank the EPSS and reachability columns (observed live), and a closed work
-    item is a record worth preserving exactly as the operator last saw it.
+    Patches the state only, never the description: this path has no enrichment join, so rewriting
+    the description would blank the EPSS and reachability columns.
     """
     data = [{"op": "replace", "path": "/fields/System.State", "value": state}]
     try:
@@ -843,10 +835,10 @@ def _patch_state(work_item_id, state: str, verb: str):
         return False, False
 
 
-# The closed/reopen states of Azure DevOps's four out-of-box processes. Work item 8118 failed live
-# with "The field 'State' contains the value 'Closed' that is not in the list of supported values"
-# because MEND_CLOSEDSTATE was one global string and this customer runs two boards on different
-# processes.
+# The closed/reopen states of Azure DevOps's four out-of-box processes. One global
+# MEND_CLOSEDSTATE cannot serve an organization running two boards on different processes, which
+# Azure rejects with "The field 'State' contains the value 'Closed' that is not in the list of
+# supported values".
 #
 #   | Process | States                                | Closed | Reopen   |
 #   | Agile   | New / Active / Resolved / Closed      | Closed | New      |
@@ -864,14 +856,14 @@ REOPEN_STATE_CANDIDATES = ("New", "To Do", "Proposed")
 
 # {(azure_project, verb): the state Azure accepted}. A Scrum board pays ONE rejected PATCH on its
 # first closed item and none afterwards; without it, every closed item in every run pays one.
-# Keyed by PROJECT because MEND_ROUTING sends different Mend projects to different Azure projects,
-# which can sit on different processes -- one global answer would apply Scrum's state to an Agile
+# Keyed by project because MEND_ROUTING sends different Mend projects to different Azure projects,
+# which can sit on different processes; one global answer would apply Scrum's state to an Agile
 # board.
 STATE_RESOLVED = {}
 
-# The ONE error that means "wrong state NAME, try another". A refused TRANSITION or a missing
-# required field is a 400 too, and retrying those would issue a second bad write against a work
-# item whose state name was perfectly legal.
+# The one error meaning "wrong state name, try another". A refused transition or a missing
+# required field is also a 400, and retrying those would issue a second bad write against a work
+# item whose state name is legal.
 _UNSUPPORTED_STATE = re.compile(r"not in the list of supported values", re.IGNORECASE)
 
 
@@ -985,8 +977,8 @@ def dep_paths_enabled() -> bool:
 
     Only an explicit false-y value ("false"/"no"/"0", case-insensitive) turns it off. Unset,
     blank, or an unexpanded Azure placeholder ("$(MEND_DEPPATHS)") all mean "fetch them" --
-    exactly the behaviour before this variable existed, so a typo can never silently disable a
-    feature nobody asked to turn off (same reasoning as verify_setting for MEND_SSLVERIFY).
+    anything other than an explicit false value, so a typo cannot silently disable the feature
+    (the same rule verify_setting applies to MEND_SSLVERIFY).
     """
     raw = str(getattr(conf, "dep_paths", "") or "").strip().lower()
     return raw not in ("false", "no", "0")
@@ -1071,18 +1063,17 @@ def reconcile_project(project, floor=None, desired=None, ok=None):
     create_wi_v3's job, and sync_project_v3 runs the two halves in order off ONE 3.0 read at ONE
     severity floor. This function is only the closure half.
 
-    The closure interlock (spec 6.1): on ok=False from fetch_v3_desired NOTHING is closed. An
-    incomplete read is indistinguishable from a project whose findings were all remediated, and
-    acting on that at this customer's scale is a mass-closure event. REOPEN still runs -- it
-    cannot destroy anything.
+    The closure interlock: on ok=False from fetch_v3_desired nothing is closed. An incomplete read
+    is indistinguishable from a project whose findings were all remediated, and acting on that at
+    scale is a mass-closure event. REOPEN still runs, since it cannot destroy anything.
 
     SKIP makes no API call at all: see reconcile.plan_actions.
 
-    MEND_SEVERITY is LIVE here. `floor` defaults to run_severity_floor() -- the same accessor
-    the creation path reads -- and sync_project_v3 passes the floor it created with, together
-    with the very `desired`/`ok` pair it created from, so creation and closure decide on one
-    snapshot filtered at one threshold. A floor here that differs from the creation floor makes
-    every work item between the two thresholds created, closed and re-created every run.
+    `floor` defaults to run_severity_floor(), the same accessor the creation path reads.
+    sync_project_v3 passes the floor it created with, together with the `desired`/`ok` pair it
+    created from, so creation and closure decide on one snapshot at one threshold. A differing
+    floor here would make every work item between the two thresholds created, closed and
+    re-created every run.
     """
     project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
     # Candidate LISTS, not single states: Azure's four out-of-box processes disagree about what
@@ -1110,12 +1101,11 @@ def reconcile_project(project, floor=None, desired=None, ok=None):
                        f"like a project whose findings were all remediated, and closing on it "
                        f"would be a mass-closure. Reopens and the rest of the run continue.")
 
-    # Key-space interlock. `actual` keys come from work item TITLES (1.4 builds them from
-    # library.filename); `desired` keys come from 3.0 component.name / originName. Those two
-    # spellings have never been verified byte-identical. If they differ at all, every `actual`
-    # key misses and EVERY work item in the project is closed, then re-created by 1.4 next run.
-    # Both sides non-empty with zero overlap is not a project that was fully remediated -- that
-    # case has an EMPTY `desired`, and its closures must still run.
+    # Key-space interlock. `actual` keys are decoded from work item titles; `desired` keys come
+    # from 3.0 component.name / originName. If those two spellings differ at all, every `actual`
+    # key misses and every work item in the project would be closed. Both sides non-empty with
+    # zero overlap is not a fully remediated project: that case has an empty `desired`, and its
+    # closures must still run.
     if desired and actual and not (set(desired) & set(actual)):
         logger.error(f"Suspected key-space mismatch in project {project_name}: "
                      f"{len(desired)} Mend finding(s) and {len(actual)} work item(s), and NOT "
@@ -1215,10 +1205,8 @@ def reconcile_after_sync():
         conf.azure_project = original_azure_project
 
 
-# The work item rendering helpers below were nested inside the deleted 1.4 create_wi. They were
-# lifted to module level UNCHANGED so the 3.0 creation path (create_wi_v3) reuses the exact same
-# renderers rather than reimplementing them -- two implementations of a shipped work item
-# description would drift.
+# The work item rendering helpers below are module level so create_wi_v3 reuses one set of
+# renderers; two implementations of a work item description would drift.
 
 
 def set_priority(value: float):
@@ -1264,11 +1252,9 @@ def analyze_fields(fld: dict, prj: list):
                 if t.startswith("$"):
                     dict_env_val = conf.conf_json()
                     env_val = t[1:].strip()
-                    # Must be reset per '&'-delimited part. Without it, a part naming an
-                    # unknown or RETIRED variable ($MEND_EMAIL, until it was deleted with
-                    # the 2.0 transport) leaks the PREVIOUS part's var_name and duplicates
-                    # its value -- which can be $MEND_USERKEY. "" resolves to "" via
-                    # try_or_error, which is what an unmatched part has always produced.
+                    # Reset per '&'-delimited part: a part naming an unknown variable would
+                    # otherwise leak the previous part's var_name and duplicate its value, which
+                    # can be $MEND_USERKEY. An unmatched part resolves to "".
                     var_name = ""
                     for var_ in varenvs:
                         if env_val in var_.value:
@@ -1385,12 +1371,12 @@ def _nested_list_node(path, index, leaf_label, indent):
 
 
 def generate_html_nested_list(paths, leaf_label="") -> str:
-    """Root->leaf dependency chains (Task 1/2's `paths`) -> nested <ul>/<li> HTML.
+    """Root->leaf dependency chains (an entry's `paths`) -> nested <ul>/<li> HTML.
 
     One <ul> per path, one <li> nested inside the previous for each hop -- a six-hop chain
     that generate_html_bulleted_list would collapse to one flat bullet instead shows every
-    hop. Several paths render as sibling <ul> blocks, concatenated in retval order (Global
-    Constraint 1: never sorted). Every node name is data from Mend and goes through esc();
+    hop. Several paths render as sibling <ul> blocks, concatenated in retval order, never sorted.
+    Every node name is data from Mend and goes through esc();
     " (Root Library)" / " ({leaf_label})" are literal text, not escaped.
 
     [] or None yields "" -- there is nothing to render, not an empty <ul>.
@@ -1413,8 +1399,8 @@ def get_field_ref(fld_name, cstm_flds):
 
 
 def build_wi_tags(project_tag: str, policy_tag: str, routing: str, reponame: str) -> list:
-    # Repo identity is a work item tag because the client declined Area Path. Taking the
-    # values as arguments keeps this testable without constructing a whole Config.
+    # Repo identity is carried as a work item tag, not an Area Path. Taking the values as
+    # arguments keeps this testable without constructing a whole Config.
     tags = [project_tag, policy_tag]
     if routing.lower() == "true" and reponame:
         tags.append(reponame)
@@ -1425,13 +1411,11 @@ def build_wi_tags(project_tag: str, policy_tag: str, routing: str, reponame: str
 def build_enrich_html_v3(row: dict, reachability_on: bool) -> str:
     """The enrichment lines spliced into a 3.0 CVE section.
 
-    ASYMMETRY, DELIBERATE. EPSS and Exploit Code Maturity render UNCONDITIONALLY here: the
-    MEND_EPSS gate existed because 1.4 had to pay an extra getProjectAlertsByType call per
-    project to learn them, so an org that did not want the columns should not pay for them. On
-    3.0 both values arrive inline with the finding at no cost, so gating them only buys an
-    operator a missing column.
+    EPSS and Exploit Code Maturity render unconditionally and have no variable: both values
+    arrive inline with the 3.0 finding at no extra call, so gating them would only buy an operator
+    a missing column.
 
-    MEND_REACHABILITY stays a gate. Reachability is blank for an org that has not enabled
+    MEND_REACHABILITY gates the Reachability line: it is blank for an org that has not enabled
     reachability analysis, and the toggle spares them a column of dashes.
     """
     html = ""
@@ -1478,23 +1462,18 @@ def remediation_block_v3(remediation: dict) -> str:
 
 
 def build_license_html_v3(licenses: list, policy_name: str, library_url: str = "") -> str:
-    """The <details> License Details block, same shape the 1.4 path renders it in.
+    """The <details> License Details block.
 
     `licenses` is the list source3.normalise_licenses builds and fetch_v3_desired attaches to
     every entry ({"name", "url", "reference_file"}).
 
-    License Reference File comes from LicenseReferenceDTO.liabilityReference, which is the ONLY
-    field 3.0 offers for it -- there is no second source to fall back to. So when Mend reports
-    none, the line is omitted rather than rendered as an empty link.
+    License Reference File comes from LicenseReferenceDTO.liabilityReference, the only field 3.0
+    offers for it, so when Mend reports none the line is omitted rather than rendered as an empty
+    link.
 
-    THE LICENSE NAME IS A LINK, as it was in 1.4, and `library_url` is why it still can be. 1.4
-    linked it to getProjectLicenses -> licenses[].url, an opensource.org-style license page. In
-    3.0 that value survives only as LicenseDTO.profile.links[], and LicenseDTO is referenced by
-    SourceFileLibraryDTO alone -- which no path in references/3.0 (2).json returns, so it is
-    unreachable. The reachable license URL is LicenseReferenceDTO.textUrl, and it is preferred.
-    When Mend publishes none, the name links to the LIBRARY's Mend page instead: a section whose
-    only content is dead text tells an operator nothing, and that page is where Mend shows this
-    license and the file that evidenced it. Plain text is the last resort, not the default.
+    The license name is a link. LicenseReferenceDTO.textUrl is preferred; when Mend publishes none
+    the name links to `library_url`, the library's Mend page, which is where Mend shows this
+    license and the file that evidenced it. Plain text is the last resort.
     """
     lic_data = ""
     for lic_ in licenses or []:
@@ -1538,13 +1517,12 @@ def labelled_line(label: str, value: str) -> str:
 
 
 def vuln_section_v3(row: dict, inputs: dict, reachability_on: bool) -> str:
-    """One CVE's <details> body, mirroring the 1.4 per-CVE section field for field.
+    """One CVE's <details> body.
 
-    The library and paths come from the ROW -- the actually vulnerable library and ITS OWN paths
-    -- and fall back to `inputs` (the work item header) only where the row carries none. Under
-    root grouping the header describes the ROOT, so reading it here made every section on an
-    eight-library root item claim "Vulnerable Library: express-4.16.4.tgz" and show one path.
-    In per-CVE mode the row's library IS the header's, so nothing changes there.
+    The library and paths come from the row -- the vulnerable library and its own paths -- and
+    fall back to `inputs` (the work item header) only where the row carries none. Under root
+    grouping the header describes the root, so each section must read its own row. In per-CVE mode
+    the row's library is the header's.
     """
     library = row.get("library") or inputs["library"]
     dependency_file = row.get("dependency_file") or inputs["dependency_file"]
@@ -1572,9 +1550,8 @@ def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False,
     (source3.normalise_library_components); on a vulnerability work item, from the finding.
 
     `leaf_label` is threaded through to generate_html_nested_list: "Vulnerable Library" on a
-    vulnerability item, "" on a license item, where the leaf is not vulnerable and must not
-    say so. The root-grouping call site keeps with_hierarchy=False (Global Constraint 4, out of
-    scope for Task 4), so leaf_label is moot there.
+    vulnerability item, "" on a license item, where the leaf is not vulnerable. The root-grouping
+    call site passes with_hierarchy=False, so leaf_label is unused there.
     """
     # "Root Library" in dependency mode: the item is about the direct dependency an operator can
     # upgrade, not about the transitive library the CVE is in.
@@ -1582,9 +1559,8 @@ def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False,
         "<br>" + esc(inputs["description"]) + \
         labelled_line("Path to dependency file: ", esc(inputs["dependency_file"])) + \
         labelled_line("Path to library:", esc(inputs["library_path"]))
-    # The 1.4 shape repeated the name as "Vulnerable Library". Under root grouping that is both
-    # redundant (it is the line above) and FALSE: the root is the library to upgrade, not the
-    # vulnerable one. Kept verbatim everywhere else so those descriptions do not churn.
+    # A root item omits the "Vulnerable Library" line: the root is the library to upgrade, not
+    # the vulnerable one, and the name is already on the line above.
     if not root:
         block += "<br><b>Vulnerable Library: </b>" + esc(inputs["library"])
     if with_hierarchy:
@@ -1592,19 +1568,15 @@ def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False,
             block += "<br><b>Dependency Hierarchy: </b><br>" + \
                      generate_html_nested_list(inputs["paths"], leaf_label=leaf_label)
         elif inputs["dependency_type"].strip().lower() != "direct" and inputs["parents"]:
-            # The fallback fires whenever the type is NOT direct -- "transitive" (a failed
-            # /paths call: attach_library_paths only sets "paths" for a transitive library with
-            # a known uuid, and a call can still fail) or "" (unknown: source3._dependency_type/
-            # _direct_flag return "" when Mend publishes neither dependencyContexts[0].isDirect
-            # nor component.dependencyType -- "unknown" is not "Direct", and the user's ruling is
-            # that only Direct dependencies get no line). attach_library_paths' fetch gate stays
-            # keyed on "transitive" specifically, so an unknown-type item is never fetched and
-            # falls straight to here -- exactly today's (pre-2.0) rendering, not a lost line.
-            # Information already held (parents, from the 1.4-era finding walk) must not vanish.
+            # The fallback fires whenever the type is not direct: "transitive" (a /paths call
+            # that failed, since attach_library_paths only sets "paths" for a transitive library
+            # with a known uuid) or "" (unknown, when Mend publishes neither
+            # dependencyContexts[0].isDirect nor component.dependencyType). Only a Direct
+            # dependency gets no line, so an unknown-type item renders its parents here.
             block += "<br><b>Dependency Hierarchy: </b><br>" + \
                      generate_html_bulleted_list(items=inputs["parents"])
-        # Else: a direct dependency gets no call and no line (Global Constraint 3) -- the
-        # whole line, heading included, is omitted per the labelled_line house rule.
+        # Else: a direct dependency gets no call and no line. The whole line, heading included,
+        # is omitted per the labelled_line house rule.
     home = esc(inputs["home_page"])
     if home:
         block += f"<br><b> Library home page: </b><a href='{home}'>{home}</a>"
@@ -1618,10 +1590,10 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
     Rendering is split out of create_wi_v3 so the HTML and, far more importantly, the TITLES can
     be tested without an Azure DevOps double.
 
-    TITLES ARE A CONTRACT, not cosmetics. Every title here must round-trip through
-    classify_title back to the (kind, library) key it was built for, because Plan 4's closure
-    reads Azure by title and closes on the key it decodes. A title that does not round-trip
-    either strands a work item open forever or closes somebody else's.
+    Titles are a contract. Every title here must round-trip through classify_title back to the
+    (kind, library) key it was built for, because closure reads Azure by title and closes on the
+    key it decodes. A title that does not round-trip either strands a work item open forever or
+    closes somebody else's.
 
     "exact" says how the item is matched against what Azure already holds. Only a LICENCE title
     is matched exactly -- it has no moving parts. A dependency-mode title carries a finding count
@@ -1709,20 +1681,18 @@ def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool)
 STATE_FIELDS = ("System.State", "System.Reason")
 
 
-# A tag, and ONLY a tag. "<[^>]*>" also matches a bare "<" in CONTENT and eats everything up to
-# the next ">" with it: enrichment.EPSS_BELOW_ONE is the literal "<1%", and Mend descriptions say
-# things like "<=1.2.5 is vulnerable to ...". Azure stores those escaped and this tool sends them
-# raw, so the loose pattern deleted a different amount of real text on each side and every work
-# item carrying an EPSS score differed forever. Requiring a letter or "/" after the "<" is what
-# separates markup from prose -- an unavoidably heuristic line, and the cost of getting it wrong
-# is a stray "<b" in prose read as markup, which is the harmless direction.
+# A tag, and only a tag. "<[^>]*>" would also match a bare "<" in content and eat everything up
+# to the next ">": enrichment.EPSS_BELOW_ONE is the literal "<1%", and Mend descriptions say things
+# like "<=1.2.5 is vulnerable to ...". Azure stores those escaped while this tool sends them raw, so
+# a loose pattern strips a different amount of real text from each side. Requiring a letter or "/"
+# after the "<" separates markup from prose; it is heuristic, and the failure direction is a stray
+# "<b" in prose read as markup.
 _TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>|<!--.*?-->", re.DOTALL)
 _URL_RE = re.compile(r"""\b(?:href|src)\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
 # An anchor with no visible text. vuln_section_v3's "Origin:" line renders one (a URL and no
-# label, inherited from the 1.4 shape), and Azure DevOps drops empty elements when it sanitises
-# stored HTML -- so its href never comes back. Its URL is invisible to an operator, so it is not
-# content: dropped from BOTH sides before URLs are collected, rather than making every work item
-# differ forever.
+# label), and Azure DevOps drops empty elements when it sanitises stored HTML, so its href never
+# comes back. Its URL is invisible to an operator, so it is dropped from both sides before URLs
+# are collected.
 _EMPTY_ANCHOR_RE = re.compile(r"<a\b[^>]*>\s*</a>", re.IGNORECASE)
 
 
@@ -1892,9 +1862,8 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
     """Create or update ONE work item from a rendered 3.0 item. Returns "created", "updated"
     or "failed".
 
-    Matching, the wrong-type DELETE-and-recreate, and the exist_wis cache refresh are all
-    identical to the deleted 1.4 path's -- both must agree on which work item a title
-    identifies, or the changeover in Task 4 orphans every item the 1.4 path created.
+    Matches by title through check_wi_id, DELETEs and recreates an item whose type differs from
+    `wi_type`, and refreshes the exist_wis cache so a later call in the same run sees the result.
     """
     global global_errors, exist_wis, updated_wi
     title = item["title"]
@@ -1998,8 +1967,7 @@ def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: 
         if azure_operation == "add":
             if lib_url:
                 # The operator's one click from the work item to the library in Mend.
-                # Deliberately NO attributes.comment -- that carried "{projectToken},{issueUuid}"
-                # for the reverse sync, which no longer exists and nothing reads.
+                # No attributes.comment: nothing reads one.
                 data.append({"op": "add", "path": "/relations/-",
                              "value": {"rel": "Hyperlink", "url": lib_url}})
             r, errcode = call_azure_api(api_type="POST", api=f"wit/workitems/${wi_type}",
@@ -2046,9 +2014,7 @@ PROGRESS_EVERY = 20
 def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
     """Create and update Azure work items from one project's 3.0 `desired` state.
 
-    Returns (created, updated, failed). It renders the SAME work items the deleted 1.4 path
-    rendered -- same renderers, same title matching, same tags -- so a backlog created by that
-    path is picked up rather than duplicated.
+    Returns (created, updated, failed).
     """
     global conf
     conf = startup() if not conf else conf
@@ -2165,9 +2131,8 @@ def sync_project_v3(project, floor: float, custom_flds: list, wi_type: str,
     try:
         desired, ok = fetch_v3_desired(project.get("uuid", ""), floor)
         create_wi_v3(project, desired, custom_flds, wi_type)
-        # Kept for continuity: (project id, "Application/Project", the Azure project it was
-        # written to). reconcile_after_sync -- no longer called by main(), since closure now
-        # runs inline here -- is its only remaining reader.
+        # (project id, "Application/Project", the Azure project written to). Read only by
+        # reconcile_after_sync, which main() does not call: closure runs inline below.
         synced_projects.append((project.get("uuid", ""), project_name, conf.azure_project))
         reconcile_project(project, floor=floor, desired=desired, ok=ok)
         return True
@@ -2342,9 +2307,8 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
                 f"decides which findings earn a work item and which findings hold one open.")
     logger.info(f"Selection mode: "
                 f"{'tag-based routing' if conf.routing.lower() == 'true' else 'token list'}")
-    # Logged before routing returns: without it a pipeline log cannot answer "did enrichment
-    # run?", and 'off' is reached silently by an unexpanded $(MEND_EPSS) /
-    # $(MEND_REACHABILITY) as well as by an explicit false.
+    # Logged before routing returns, so a pipeline log can answer "did enrichment run?". 'off' is
+    # reached silently by an unexpanded $(MEND_REACHABILITY) as well as by an explicit false.
     logger.info(f"Enrichment: EPSS and Exploit Code Maturity always render; "
                 f"Reachability {'on' if reachability_enabled() else 'off'} (MEND_REACHABILITY)")
 
@@ -2359,9 +2323,8 @@ def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
     include, exclude, source = selection_tokens()
     selected, unresolved = select_projects(projects, include, exclude)
     if unresolved:
-        # NEVER sync a partial selection. These variables now take 3.0 UUIDs, so a leftover 1.4
-        # token selects nothing, which reads as "no work to do" - and with closure live that
-        # reads as "everything was remediated".
+        # Never sync a partial selection. These variables take 3.0 UUIDs, and an unrecognised
+        # value selects nothing, which would read as "no work to do" and close everything.
         global_errors += 1
         run_failed = True
         for value in unresolved:
@@ -2421,11 +2384,9 @@ def reset_field_meta_cache():
 def field_is_editable(reference_name: str, project: str) -> bool:
     """Is this field one we may write a string/html/double value into?
 
-    Read through field_meta_cache. A field whose definition cannot be read returns False:
-    previously the loop in load_wi_json left `is_add` at the PREVIOUS field's verdict, which
-    silently carried one field's editability onto the next. Custom and alwaysRequired fields
-    are kept by probe_wi_type regardless of this answer, so False only ever drops a field we
-    could not prove writable.
+    Read through field_meta_cache. A field whose definition cannot be read returns False. Custom
+    and alwaysRequired fields are kept by probe_wi_type regardless of this answer, so False only
+    drops a field that could not be proven writable.
     """
     if reference_name not in field_meta_cache:
         flds, err = call_azure_api(api_type="GET", api=f"wit/fields/{reference_name}",
@@ -2512,11 +2473,8 @@ def load_wi_json():
 def org_uuid() -> str:
     """The org identifier for 3.0's org-scoped paths, and the login's orgToken.
 
-    MEND_ORGUUID is required and validated by check_patterns, so this never falls back. It
-    used to default to MEND_APIKEY, which is now removed entirely: the two were the same
-    org identifier from Mend's Administration screen, and carrying both meant a pipeline
-    setting only MEND_ORGUUID failed at startup. Every caller goes through here -- never
-    read conf.org_uuid directly.
+    MEND_ORGUUID is required and validated by check_patterns, so this never falls back. Every
+    caller goes through here; never read conf.org_uuid directly.
     """
     return (conf.org_uuid or "").strip()
 
@@ -2560,11 +2518,9 @@ def fetch_v3_licenses(project_uuid: str):
 def fetch_v3_libraries(project_uuid: str):
     """One project's library list -> (components, licenses, ok).
 
-    This is the 1.4-EQUIVALENT source for the description's paths, description, home page and
-    license reference files. 1.4 read them from getProjectLibraryLocations and getProjectLicenses,
-    both keyed by library and both consulted for every work item regardless of violation type;
-    GET /projects/{projectUuid}/dependencies/libraries (LibraryDTOV3) is their 3.0 counterpart and
-    carries locations[] and licenses[].licenseReferences[] in the same shapes. See
+    The primary source for the description's paths, description, home page and license reference
+    files: GET /projects/{projectUuid}/dependencies/libraries (LibraryDTOV3), which carries
+    locations[] and licenses[].licenseReferences[]. See
     source3.normalise_libraries / normalise_library_licenses.
 
     A failed read returns ok=False and the caller must fold it into fetch_v3_desired's interlock:
@@ -2610,9 +2566,8 @@ def fetch_v2_library_paths(project_uuid: str, library_uuid: str) -> list:
 
     Decorative, like fetch_v3_root_libraries: a failure logs a WARNING (not an error) naming the
     project and library and returns [], and is deliberately NOT folded into fetch_v3_desired's
-    closure interlock (Global Constraint 2). Dependency paths can only ADD a line to a
-    description; they can never remove a key from `desired`, so a failed call here must never
-    block closure.
+    closure interlock. Dependency paths can only add a line to a description and can never remove
+    a key from `desired`, so a failed call here must never block closure.
 
     Missing project_uuid or library_uuid returns [] without calling -- a direct dependency or an
     entry with no library_uuid has nothing to look up.
@@ -2773,14 +2728,13 @@ def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
       - `render_inputs(entry)` resolves library_uuid and dependency_type -- called again here
         (it already runs at render time) deliberately, so the fetch and the render can never
         disagree about which library an item is about; it is pure and cheap.
-      - Direct dependencies get no call and no line (Global Constraint 3): only
+      - Direct dependencies get no call and no line: only
         dependency_type.strip().lower() == "transitive" qualifies. The comparison is
         case-insensitive because _dependency_type yields "Direct"/"Transitive" from
         dependencyContexts but falls through to component.dependencyType, whose 3.0 enum is
         DIRECT/TRANSITIVE.
-      - A vulnerability entry is skipped unless `per_cve` is True (Global Constraint 4):
-        MEND_DEPENDENCY=true root-grouping descriptions are out of scope. License entries are
-        fetched in both modes.
+      - A vulnerability entry is skipped unless `per_cve` is True; MEND_DEPENDENCY=true
+        root-grouping descriptions render no hierarchy. License entries are fetched in both modes.
       - An entry with no library_uuid is skipped -- there is nothing to look up.
     2. Batch fetch (_fetch_paths_batch) of only the uuids not already in library_paths_cache,
        WAVE by wave, stopping early once its own local simulation predicts the breaker will
@@ -2875,9 +2829,9 @@ def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
 def fetch_v3_desired(project_uuid: str, floor: float):
     """One project's desired end state: {(kind, library): entry}.
 
-    `ok` is the closure interlock from spec 6.1 -- reconciliation closes work items absent from
-    `desired`, so a partial read must never be mistaken for a shrunken one. A caller seeing
-    ok=False may still create and update (which cannot destroy anything) but must NOT close.
+    `ok` is the closure interlock: reconciliation closes work items absent from `desired`, so a
+    partial read must never be mistaken for a shrunken one. A caller seeing ok=False may still
+    create and update, which cannot destroy anything, but must not close.
 
     FOUR of the five reads gate it, and they are exactly the reads that can make `desired`
     SMALLER than the truth: the security findings and the violations BUILD `desired`, and the
@@ -2912,8 +2866,8 @@ def fetch_v3_desired(project_uuid: str, floor: float):
     dd_licenses, dd_components, licenses_ok = fetch_v3_licenses(project_uuid)
     lib_components, lib_licenses, libraries_ok = fetch_v3_libraries(project_uuid)
     roots, roots_ok = fetch_v3_root_libraries(project_uuid)
-    # The libraries call is the 1.4-equivalent projection and wins; due diligence fills only the
-    # fields it leaves blank. Neither is complete on its own -- see source3.merge_component_index.
+    # The libraries call is the primary projection and wins; due diligence fills only the fields
+    # it leaves blank. Neither is complete on its own -- see source3.merge_component_index.
     components = merge_component_index(lib_components, dd_components)
     licenses = merge_license_index(lib_licenses, dd_licenses)
 
@@ -2922,7 +2876,7 @@ def fetch_v3_desired(project_uuid: str, floor: float):
     lic_entries = normalise_violations(violations)
 
     if unscored:
-        # Spec 5.1 requires this to be an explicit rule, not an accident of a missing key.
+        # Logged explicitly, so an included unscored finding is never a silent side effect.
         logger.info(f"{unscored} unscored vulnerability finding(s) in project "
                     f"{project_uuid} were INCLUDED: they cannot be compared to MEND_SEVERITY, "
                     f"and a real finding vanishing because Mend has not scored it yet is the "
@@ -2932,7 +2886,7 @@ def fetch_v3_desired(project_uuid: str, floor: float):
     # in 3.0, so a license rendering without a link is a DATA fact, not a code fact -- and it has
     # to be visible without a live debugging round.
     link_report = license_link_report(licenses, components)
-    # Deliberately DEBUG-only, not a warning: Joshua confirmed the missing license URLs are a
+    # Deliberately DEBUG-only, not a warning: the missing license URLs were confirmed to be a
     # Mend-side data gap, not something a run should nag about every time.
     logger.debug(f"Project {project_uuid} license links -- "
                  f"{len(link_report['license_url'])} from a license URL, "
@@ -2961,7 +2915,7 @@ def fetch_v3_desired(project_uuid: str, floor: float):
         desired[("license", lib)] = entry
     # Decorative, like the root-remediation index below: dependency paths can only add a line to
     # a description, never remove a key from `desired`, so a failed /paths call must never touch
-    # `ok` (Global Constraint 2). See attach_library_paths and fetch_v2_library_paths.
+    # `ok`. See attach_library_paths and fetch_v2_library_paths.
     attach_library_paths(project_uuid, desired, per_cve)
     # roots_ok is deliberately absent from this chain -- see the docstring. It cannot shrink
     # `desired`, so it cannot cause a false closure, and gating on it would stop closure org-wide
@@ -2980,9 +2934,9 @@ def mend_api_url() -> str:
     """The 2.0/3.0 API host, derived from MEND_URL's host prefixed with 'api-'.
 
     `conf.ws_url` (MEND_URL) is the SCA app host; the API host is always derivable from it
-    by prefixing the hostname with 'api-' (e.g. saas.mend.io -> api-saas.mend.io), per
-    product owner confirmation. Idempotent: a host already carrying the 'api-' prefix is
-    left alone. Empty `conf.ws_url` yields "" rather than "https://api-".
+    by prefixing the hostname with 'api-' (e.g. saas.mend.io -> api-saas.mend.io); this is
+    confirmed Mend platform behaviour. Idempotent: a host already carrying the 'api-' prefix
+    is left alone. Empty `conf.ws_url` yields "" rather than "https://api-".
     """
     if not conf.ws_url:
         return ""

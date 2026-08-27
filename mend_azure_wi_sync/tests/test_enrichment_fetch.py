@@ -24,9 +24,9 @@ def test_the_2_0_and_3_0_transports_are_gone():
     """Guards an earlier deletion. These names existing again means the consolidation
     regressed.
 
-    call_ws_api_v3 is deliberately excluded from this list: Plan 2 Task 2 restored it (the
-    product owner reversed the single-transport goal), so its presence is no longer a
-    regression. See test_mend_v3_auth.py for its coverage.
+    call_ws_api_v3 is deliberately excluded from this list: it was restored when the
+    single-transport goal was reversed, so its presence is no longer a regression. See
+    test_mend_v3_auth.py for its coverage.
     """
     for gone in ("fetch_project_enrichment", "resolve_project_uuids",
                  "prepare_enrichment", "project_uuid_map", "enrichment_disabled",

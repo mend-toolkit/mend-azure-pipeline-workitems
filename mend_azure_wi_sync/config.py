@@ -15,12 +15,11 @@ class DescAzure(Enum):
 
     @classmethod
     def get_name_by_value(cls, value):
-        # Matched case-sensitively until 2026-08-19, and against a bare string for
-        # ReproSteps — so `value in member.value` was a substring test. MEND_AZURETYPE=BUG
-        # (which Azure DevOps itself accepts, being case-insensitive about type names)
-        # resolved to "", and core.py's `if desc_field:` guard then dropped the description
-        # patch entirely: work items were created with a title, tags and priority but no
-        # description in any field, with nothing logged. Exact, case-insensitive match.
+        """The description field name for an Azure work item type, or "" when unknown.
+
+        Matched exactly and case-insensitively, since Azure DevOps accepts type names in any
+        case (MEND_AZURETYPE=BUG resolves the same as Bug).
+        """
         for member in cls:
             values = member.value if isinstance(member.value, tuple) else (member.value,)
             if any(str(value).casefold() == str(known).casefold() for known in values):
@@ -28,7 +27,7 @@ class DescAzure(Enum):
         return ""
 
 
-class varenvs(Enum):  # Lit of Env.variables
+class varenvs(Enum):  # Accepted env var name(s) per setting, in priority order
     wsuserkey = ("MEND_USERKEY",)
     wsurl = ("MEND_WSS_URL", "MEND_URL")
     wsproduct = ("MEND_PRODUCTTOKEN",)
@@ -125,13 +124,10 @@ class Config:
     severity: str
     closed_state: str
     reopen_state: str
-    # Defaulted, unlike every field above it: "" means verify (see core.verify_setting), so an
-    # existing Config(...) call that predates this variable keeps working AND gets the secure
-    # behaviour rather than having to opt in.
+    # "" means verify: see core.verify_setting.
     ssl_verify: str = ""
-    # Defaulted like ssl_verify above: the accessor (core.dep_paths_enabled /
-    # core.library_paths_pool_size) owns the actual default, not update_properties, so an
-    # existing Config(...) call that predates these two variables keeps working unchanged.
+    # The accessors own these two defaults, not update_properties: see core.dep_paths_enabled
+    # and core.library_paths_pool_size.
     dep_paths: str = ""
     dep_paths_concurrency: str = ""
 
@@ -171,6 +167,12 @@ class Config:
         return vars(self)
 
     def update_properties(self):
+        """Normalize every field in place. Must run immediately after startup().
+
+        Two jobs the rest of the code depends on: an unexpanded Azure Pipelines placeholder
+        (a literal "$(SOMEVAR)") becomes "" so the default below can apply, and `proxy` becomes
+        a requests-style {"http": ..., "https": ...} dict.
+        """
         properties = vars(self)  # Get all properties of the Config object
         for key in properties:
             if key != "utc_delta":
@@ -179,9 +181,8 @@ class Config:
                 elif key == "dependency":
                     value = "True" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "reponame":
-                    # Under routing this is set per Mend project from the scan tag, and
-                    # update_properties runs on every Azure call — backfilling it here would
-                    # overwrite an intentionally empty value with the Azure project name.
+                    # Under routing this is set per Mend project from the scan tag, so an empty
+                    # value is left empty; otherwise it falls back to the Azure project name.
                     value = properties[key] if (properties[key] or self.routing.lower() == "true") \
                         else self.azure_project
                 elif key == "description":

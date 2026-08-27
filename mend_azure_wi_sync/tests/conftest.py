@@ -4,7 +4,7 @@ import sys
 
 from mend_azure_wi_sync import core as _core
 
-# Both import styles are supported by this codebase (see CLAUDE.md "Import quirk"): production
+# Both import styles are supported by this codebase: production
 # runs core.py flatly (`from core import ...`), while this test package imports it via the
 # package path (`from mend_azure_wi_sync import core`). Python treats those as two independent
 # modules with independent globals unless the names are aliased to the same module object, so

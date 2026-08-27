@@ -29,11 +29,10 @@ def main():
         logger.error("Missing or malformed configuration parameters:")
         [logger.error(el_) for el_ in chp_]
         exit(-1)
-    # logger.debug(conf)  # TEMP
     if conf.routing.lower() == "true":
-        # No startup probe: MEND_AZUREPROJECT is not a destination under routing and is no
-        # longer required, so there may be no project here to probe. run_sync_routed reads the
-        # work item type from each destination instead, and skips a destination that lacks it.
+        # No startup probe under routing: MEND_AZUREPROJECT is not a destination and may be
+        # unset. run_sync_routed reads the work item type from each destination instead, and
+        # skips a destination that lacks it.
         wi_type, wi_fields = conf.azure_type, []
     else:
         wi_type, wi_fields = load_wi_json()
@@ -42,17 +41,15 @@ def main():
             exit(-1)
     conf.utc_delta = int((datetime.datetime.utcnow()-datetime.datetime.now()).total_seconds()/3600)  # in hours
     logger.info("Sync process started")
-    # Under routing this list is empty and each destination's own field list is filled in by
-    # run_sync_routed, which calls apply_custom_fields itself.
+    # Under routing this list is empty; run_sync_routed fills in each destination's own field
+    # list and calls apply_custom_fields itself.
     wi_fields = apply_custom_fields(wi_fields)
 
     now = datetime.datetime.now() + datetime.timedelta(hours=conf.utc_delta)
     todate = now.strftime("%Y-%m-%d %H:%M:%S")
-    # No write probe and no exit: no Azure project property is read or written any more.
-    # run_sync now drives everything from Mend 3.0 and reconciles (closes/reopens) each project
-    # inline, right after creating that project's work items and from the same read at the same
-    # severity floor -- so there is no separate reconcile_after_sync() pass here to run at a
-    # different threshold. st_date is unused on the 3.0 path (no windows, no watermarks).
+    # st_date is passed empty and unused: Mend 3.0 reports each project's full current state, so
+    # there are no windows and no watermarks. run_sync closes and reopens each project inline,
+    # from the same read at the same severity floor it created from.
     logger.info(run_sync("", todate, wi_fields, wi_type))
     if sync_had_fatal_error():
         logger.error("The sync did not complete. Mend 3.0 reports each project's full current "

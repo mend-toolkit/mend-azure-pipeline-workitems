@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 sys.path.append(os.path.dirname(__file__))
 
-# Mend tag key -> Route attribute. Project tags are key/value pairs (EntityTagDTO),
-# promoted onto the project from its last CLI scan. Keys are matched lowercase.
+# Mend tag key -> Route attribute. Project tags are key/value pairs (EntityTagDTO), promoted onto
+# the project from its last CLI scan. Keys are matched lowercase.
 TAG_KEYS = {
     "azure-project": "azure_project",
     "azure-repo": "repo",
@@ -25,15 +25,11 @@ class Route:
 
 
 def parse_route(tags) -> Route:
-    """Project tags -> Route. Accepts both shapes Mend returns.
+    """Project tags -> Route.
 
-    1.4 getOrganizationProjectTags gives {key: [value, ...]}; 2.0 /entities gave a list of
-    EntityTagDTO {key, value}. Routing reads the 1.4 sweep now, but the list form is kept
-    because it costs three lines and a caller passing it would otherwise silently route
-    nothing.
-
-    Last value wins for a repeated key. Deliberately simple: a repository moving between
-    Azure projects is out of scope for this client.
+    Accepts either shape Mend returns: {key: [value, ...]} or a list of {key, value} dicts. Keys
+    outside TAG_KEYS are ignored, as are non-string keys and values. Values are stripped, and the
+    last value wins for a repeated key.
     """
     route = Route()
     pairs = []
@@ -55,9 +51,12 @@ def parse_route(tags) -> Route:
 
 
 def branch_allowed(branch_ref: str, patterns: str) -> bool:
-    # The tag carries a full ref (refs/heads/release/1.2) because $(Build.SourceBranchName)
-    # returns only the final path segment and cannot express "release/*". Strip the ref
-    # prefix here so the configured patterns stay readable.
+    """True when `branch_ref` matches any of the comma-separated fnmatch globs in `patterns`.
+
+    `branch_ref` is a full ref (refs/heads/release/1.2); the refs/heads/ prefix is stripped before
+    matching, so the patterns are written against the branch name (release/*). An empty ref never
+    matches.
+    """
     name = (branch_ref or "").strip()
     if not name:
         return False
@@ -72,26 +71,28 @@ def branch_allowed(branch_ref: str, patterns: str) -> bool:
 
 SKIP_OK = "ok"
 SKIP_NO_TARGET = "no-target"
-# Named for what it is, not for the tag payload: the outcome string appears in the run log,
-# and "schema-fault" read as if it were about the (now removed) azure-schema tag, which it
-# never inspected.
 SKIP_MISSING_BRANCH = "missing-branch-tag"
 SKIP_BRANCH = "branch-filtered"
 SKIP_UNKNOWN = "unknown-target"
-SKIP_EXCLUDED = "scope-excluded"     # raised in core.py — MEND_EXCLUDETOKEN, deliberate
-SKIP_OUT_OF_SCOPE = "out-of-scope"   # raised in core.py — outside the product/project narrowing
+SKIP_EXCLUDED = "scope-excluded"     # raised in core.py -- MEND_EXCLUDETOKEN
+SKIP_OUT_OF_SCOPE = "out-of-scope"   # raised in core.py -- outside the product/project narrowing
 
-# Outcomes that should be logged at ERROR. no-target and branch-filtered are the normal
-# state during rollout and must not drown out a real misconfiguration.
+# Outcomes logged at ERROR; every other outcome is logged quietly.
 LOUD_OUTCOMES = (SKIP_MISSING_BRANCH, SKIP_UNKNOWN)
 
 
 def classify(route: Route, known_projects: set, patterns: str) -> str:
+    """One Route -> its routing outcome.
+
+        no azure-project tag                      -> SKIP_NO_TARGET
+        azure-project but no azure-branch tag      -> SKIP_MISSING_BRANCH
+        branch does not match `patterns`           -> SKIP_BRANCH
+        azure-project not in `known_projects`      -> SKIP_UNKNOWN
+        otherwise                                  -> SKIP_OK
+    """
     if not route.is_routable():
         return SKIP_NO_TARGET
     if not route.branch:
-        # Tagged with a destination but no branch: the scan template is missing a field.
-        # Distinct from branch-filtered, which is a policy decision we made on purpose.
         return SKIP_MISSING_BRANCH
     if not branch_allowed(route.branch, patterns):
         return SKIP_BRANCH
@@ -101,9 +102,13 @@ def classify(route: Route, known_projects: set, patterns: str) -> str:
 
 
 def build_table(routes: dict, known_projects: set, patterns: str, preset: dict = None):
-    # routes maps Mend project token -> Route. preset lets core.py inject outcomes it
-    # determined itself (scope-excluded) without routing.py needing config awareness.
-    # Sorted so the run log is diffable.
+    """{Mend project token: Route} -> (targets, outcomes).
+
+    `targets` maps each Azure project to the [(token, route)] routed to it, holding only the
+    SKIP_OK routes. `outcomes` carries every token's outcome. `preset` supplies outcomes core.py
+    determined itself and takes precedence over classify(). Tokens are processed in sorted order,
+    so the run log is diffable.
+    """
     preset = preset or {}
     targets = {}
     outcomes = {}
@@ -117,6 +122,8 @@ def build_table(routes: dict, known_projects: set, patterns: str, preset: dict =
 
 
 def coverage_report(outcomes: dict) -> str:
+    """The outcomes map -> one log line: how many projects routed, and a sorted count per
+    non-SKIP_OK outcome."""
     outcomes = outcomes or {}
     total = len(outcomes)
     routed = len([o for o in outcomes.values() if o == SKIP_OK])
