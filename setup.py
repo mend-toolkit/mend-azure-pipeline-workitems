@@ -13,7 +13,9 @@ setuptools.setup(
     version=__version__,
     author="Mend Professional Services",
     author_email="ps@mend.io",
-    url=f"https://github.com/mend-toolkit/{__tool_name__.replace('_', '-')}",
+    # Spelled out rather than derived from __tool_name__: the repo is named after the pipeline
+    # integration, not the console script, so deriving it produced a 404 on the PyPI page.
+    url="https://github.com/mend-toolkit/mend-azure-pipeline-workitems",
     description=__description__,
     license='LICENSE.txt',
     python_requires='>=3.12',

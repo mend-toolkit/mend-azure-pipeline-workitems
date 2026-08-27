@@ -31,7 +31,7 @@ steps:
   displayName: 'Mend SCA Work Item Sync'
   env:
     # Required parameters
-    # Documentation: https://github.com/mend-toolkit/azure-wi-sync/tree/main#azure-pipeline-variables
+    # Documentation: https://github.com/mend-toolkit/mend-azure-pipeline-workitems#azure-pipeline-variables
     MEND_URL: $(MEND_URL)
     MEND_USERKEY: $(MEND_USERKEY)
     # MEND_ORGUUID is the UUID of your Mend organization. It replaced MEND_APIKEY, which is no
@@ -80,3 +80,18 @@ steps:
     # NOTE: uncomment the line only once the matching pipeline variable exists. Azure leaves
     # an undefined variable as the literal string "$(MEND_REACHABILITY)", which normalizes to
     # "false" -- the feature then stays off with nothing logged as an error.
+    # Root-to-leaf dependency chains in the description (optional). Defaults to true. Set false
+    # to speed up Work Item creation; descriptions then fall back to the flat parents list.
+    # MEND_DEPPATHS: $(MEND_DEPPATHS)
+    # How many dependency-path calls run at once. Defaults to 16. Raise it if a run with many
+    # transitive libraries is slow. Above 64 is clamped; an invalid value falls back to 16.
+    # MEND_DEPPATHS_CONCURRENCY: $(MEND_DEPPATHS_CONCURRENCY)
+    # Network and advanced (optional)
+    # Proxy as <proxy_ip>:<proxy_port>, or <username>:<password>@<proxy_ip>:<proxy_port> for
+    # basic auth. Without an http:// or https:// prefix, http:// is assumed.
+    # MEND_PROXY: $(MEND_PROXY)
+    # TLS certificate verification for the Mend and Azure DevOps calls. Defaults to true. Set
+    # false only to unblock a run where verification fails. To supply a CA bundle for a
+    # self-hosted agent behind a TLS-inspecting proxy, set the standard REQUESTS_CA_BUNDLE
+    # variable to its path instead -- MEND_SSLVERIFY does not take a path.
+    # MEND_SSLVERIFY: $(MEND_SSLVERIFY)
