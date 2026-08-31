@@ -5,10 +5,16 @@
 .ws/
 
 # Excluded Local/User Directories
+# Local agent/working notes. Kept out of the repo deliberately: this is a public,
+# customer-facing repository and these files carry internal and client-specific context.
+.superpowers/
+CLAUDE.md
 _archive/
 _misc/
+docs/
 local/
 log/
+research/
 target/
 
 # Excluded Files - Extensions
@@ -16,7 +22,8 @@ target/
 *.png
 *.tar.gz
 *.url
-.whitesource
+.coverage
+.DS_Store
 .local-params.config
 
 # Excluded Files - Naming Convention
@@ -24,10 +31,13 @@ local-env.*
 /venv/
 /main.py
 /build/
-/.pytest_cache/
+.pytest_cache/
 /dist/
 /*egg-info/
-/__pycache__/
+__pycache__/
+*.pyc
 /.idea/
 
 /out/
+.venv/
+.env.local

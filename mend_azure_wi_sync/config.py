@@ -11,36 +11,50 @@ sys.path.append(file_dir)
 class DescAzure(Enum):
     Description = ("Epic", "Task", "Issue", "User Story", "Feature", "Test Plan", "Change Request",
                    "Test Suite", "Product Backlog Item", "Impediment", "Requirement", "Risk")
-    ReproSteps = ("Bug")
+    ReproSteps = ("Bug",)
 
     @classmethod
     def get_name_by_value(cls, value):
+        """The description field name for an Azure work item type, or "" when unknown.
+
+        Matched exactly and case-insensitively, since Azure DevOps accepts type names in any
+        case (MEND_AZURETYPE=BUG resolves the same as Bug).
+        """
         for member in cls:
-            if value in member.value:
+            values = member.value if isinstance(member.value, tuple) else (member.value,)
+            if any(str(value).casefold() == str(known).casefold() for known in values):
                 return member.name
         return ""
 
 
-class varenvs(Enum):  # Lit of Env.variables
-    wsuserkey = ("WS_USERKEY", "MEND_USERKEY")
-    wsapikey = ("MEND_APIKEY","WS_APIKEY","WS_TOKEN")
-    wsurl = ("WS_WSS_URL","MEND_WSS_URL","WS_URL","MEND_URL")
-    wsproduct = ("WS_PRODUCTTOKEN", "MEND_PRODUCTTOKEN")
-    wsproject = ("WS_PROJECTTOKEN", "MEND_PROJECTTOKEN")
-    wsazureuri = ("WS_AZUREURI","MEND_AZUREURI")
-    wsazurepat = ("WS_AZUREPAT","MEND_AZUREPAT")
-    wsazureproject = ("WS_AZUREPROJECT","MEND_AZUREPROJECT")
-    wsreset = ("WS_RESET","MEND_RESET")
-    wsexcludetoken = ("WS_EXCLUDETOKEN","MEND_EXCLUDETOKEN")
-    wsazurearea = ("WS_AZUREAREA","MEND_AZUREAREA")
-    wsazuretype = ("WS_AZURETYPE","MEND_AZURETYPE")
-    wscustomfields = ("WS_CUSTOMFIELDS","MEND_CUSTOMFIELDS")
-    wsdependency = ("WS_DEPENDENCY","MEND_DEPENDENCY")
-    wsreponame = ("WS_REPONAME","MEND_REPONAME")
-    azuredesc = ("WS_DESCRIPTION","MEND_DESCRIPTION")
-    azurepriority = ("WS_CALCULATEPRIORITY", "MEND_CALCULATEPRIORITY")
-    wsalert = ("WS_ALERT", "MEND_ALERT")
+class varenvs(Enum):  # Accepted env var name(s) per setting, in priority order
+    wsuserkey = ("MEND_USERKEY",)
+    wsurl = ("MEND_WSS_URL", "MEND_URL")
+    wsproduct = ("MEND_PRODUCTTOKEN",)
+    wsproject = ("MEND_PROJECTTOKEN",)
+    wsazureuri = ("MEND_AZUREURI",)
+    wsazurepat = ("MEND_AZUREPAT",)
+    wsazureproject = ("MEND_AZUREPROJECT",)
+    wsexcludetoken = ("MEND_EXCLUDETOKEN",)
+    wsazurearea = ("MEND_AZUREAREA",)
+    wsazuretype = ("MEND_AZURETYPE",)
+    wscustomfields = ("MEND_CUSTOMFIELDS",)
+    wsdependency = ("MEND_DEPENDENCY",)
+    wsreponame = ("MEND_REPONAME",)
+    azuredesc = ("MEND_DESCRIPTION",)
+    azurepriority = ("MEND_CALCULATEPRIORITY",)
     proxy = ("PROXY", "MEND_PROXY")
+    wsrouting = ("MEND_ROUTING",)
+    wsbranches = ("MEND_BRANCHES",)
+    wsreachability = ("MEND_REACHABILITY",)
+    wsemail = ("MEND_EMAIL",)
+    wsorguuid = ("MEND_ORGUUID",)
+    wsseverity = ("MEND_SEVERITY",)
+    wsclosedstate = ("MEND_CLOSEDSTATE",)
+    wsreopenstate = ("MEND_REOPENSTATE",)
+    wssslverify = ("MEND_SSLVERIFY",)
+    wsdeppaths = ("MEND_DEPPATHS",)
+    wsdeppathsconcurrency = ("MEND_DEPPATHS_CONCURRENCY",)
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -72,17 +86,25 @@ class Tags(Enum):
                 break
         return res
 
+    @classmethod
+    def all_tags(cls) -> list:
+        # Several policy match types map to the same tag string; de-duplicate while
+        # preserving declaration order so the generated WIQL is stable.
+        seen = []
+        for el_ in cls:
+            if el_.value[1] not in seen:
+                seen.append(el_.value[1])
+        return seen
+
 
 @dataclass
 class Config:
     ws_user_key: str
-    ws_org_token: str
     ws_url: str
     azure_uri: str
     azure_project: str
     azure_pat: str
     utc_delta: int
-    reset: str
     wsproducttoken: str
     wsprojecttoken: str
     wsexcludetoken: str
@@ -93,13 +115,25 @@ class Config:
     reponame: str
     description: str
     priority: str
-    wsalert: str
     proxy: str
+    routing: str
+    branches: str
+    reachability: str
+    email: str
+    org_uuid: str
+    severity: str
+    closed_state: str
+    reopen_state: str
+    # "" means verify: see core.verify_setting.
+    ssl_verify: str = ""
+    # The accessors own these two defaults, not update_properties: see core.dep_paths_enabled
+    # and core.library_paths_pool_size.
+    dep_paths: str = ""
+    dep_paths_concurrency: str = ""
 
     def conf_json(self):
         return {
             "wsuserkey": self.ws_user_key,
-            "wsorgtoken": self.ws_org_token,
             "wsurl": self.ws_url,
             "wsazureuri": self.azure_uri,
             "wsazureproject": self.azure_project,
@@ -109,21 +143,36 @@ class Config:
             "wsproducttoken": self.wsproducttoken,
             "wsprojecttoken": self.wsprojecttoken,
             "wsexcludetoken": self.wsexcludetoken,
-            "wsreset": self.reset,
             "wsazuretype": self.azure_type,
             "wscustomfields": self.azure_custom,
             "wsdependency" : self.dependency,
             "wsreponame" : self.reponame,
             "azuredesc" : self.description,
             "azurepriority" : self.priority,
-            "wsalert" : self.wsalert,
-            "proxy" : self.proxy
+            "proxy" : self.proxy,
+            "wsrouting": self.routing,
+            "wsbranches": self.branches,
+            "wsreachability": self.reachability,
+            "wsemail": self.email,
+            "wsorguuid": self.org_uuid,
+            "wsseverity": self.severity,
+            "wsclosedstate": self.closed_state,
+            "wsreopenstate": self.reopen_state,
+            "wssslverify": self.ssl_verify,
+            "wsdeppaths": self.dep_paths,
+            "wsdeppathsconcurrency": self.dep_paths_concurrency,
         }
 
     def get_values(self):
         return vars(self)
 
     def update_properties(self):
+        """Normalize every field in place. Must run immediately after startup().
+
+        Two jobs the rest of the code depends on: an unexpanded Azure Pipelines placeholder
+        (a literal "$(SOMEVAR)") becomes "" so the default below can apply, and `proxy` becomes
+        a requests-style {"http": ..., "https": ...} dict.
+        """
         properties = vars(self)  # Get all properties of the Config object
         for key in properties:
             if key != "utc_delta":
@@ -132,9 +181,24 @@ class Config:
                 elif key == "dependency":
                     value = "True" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "reponame":
-                    value = self.azure_project if not properties[key] else properties[key]
+                    # Under routing this is set per Mend project from the scan tag, so an empty
+                    # value is left empty; otherwise it falls back to the Azure project name.
+                    value = properties[key] if (properties[key] or self.routing.lower() == "true") \
+                        else self.azure_project
                 elif key == "description":
                     value = DescAzure.get_name_by_value(self.azure_type) if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "routing":
+                    value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "reachability":
+                    value = "false" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "branches":
+                    value = "main,master" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "severity":
+                    value = "high" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "closed_state":
+                    value = "Closed" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
+                elif key == "reopen_state":
+                    value = "New" if re.match(r"\$\(.+\)$", properties[key]) or not properties[key] else properties[key]
                 elif key == "proxy":
                     if properties[key]:
                         if type(properties[key]) is dict:

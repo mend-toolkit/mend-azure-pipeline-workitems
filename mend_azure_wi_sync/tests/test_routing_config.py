@@ -1,0 +1,128 @@
+import os
+from unittest import mock
+
+from mend_azure_wi_sync import core
+from mend_azure_wi_sync.config import varenvs
+
+
+def test_routing_defaults_to_empty_when_unset():
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert varenvs.get_env("wsrouting") == ""
+
+
+def test_routing_reads_the_mend_alias_and_no_longer_the_ws_one():
+    with mock.patch.dict(os.environ, {"MEND_ROUTING": "true"}, clear=True):
+        assert varenvs.get_env("wsrouting") == "true"
+    with mock.patch.dict(os.environ, {"WS_ROUTING": "true"}, clear=True):
+        assert varenvs.get_env("wsrouting") == ""
+
+
+def test_branches_reads_mend_alias():
+    with mock.patch.dict(os.environ, {"MEND_BRANCHES": "main,release/*"}, clear=True):
+        assert varenvs.get_env("wsbranches") == "main,release/*"
+
+
+VALID = "a" * 64          # satisfies token_pattern in check_patterns
+
+
+def _valid_conf(**overrides):
+    """A real Config with every field check_patterns reads set to a valid value.
+
+    check_patterns dereferences conf.ws_user_key through re.match on its FIRST line
+    (core.py:69), so a bare MagicMock raises TypeError before any assertion can run.
+    """
+    from mend_azure_wi_sync.config import Config
+    fields = dict(ws_user_key=VALID, ws_url="https://saas.mend.io",
+                  azure_uri="https://dev.azure.com/org/", azure_project="Platform",
+                  azure_pat=VALID, utc_delta=0, wsproducttoken="",
+                  wsprojecttoken="", wsexcludetoken="", azure_area="", azure_type="Task",
+                  azure_custom="", dependency="true", reponame="", description="ReproSteps",
+                  priority="false", proxy="", routing="false",
+                  branches="main,master", reachability="false",
+                  email="qa@example.com", org_uuid=VALID, severity="high",
+                  closed_state="Closed", reopen_state="New")
+    fields.update(overrides)
+    return Config(**fields)
+
+def test_check_patterns_rejects_a_mistyped_routing_value():
+    """A typo must fail loudly. Falling through to token selection with empty tokens
+    would sync ~400 Mend projects into one Azure project with no error at all."""
+    with mock.patch.object(core, "conf", _valid_conf(routing="yes")):
+        assert any("ROUTING" in el for el in core.check_patterns())
+
+
+def test_check_patterns_accepts_valid_routing_values():
+    for value in ("true", "false", "TRUE", "False"):
+        with mock.patch.object(core, "conf", _valid_conf(routing=value)):
+            assert not any("ROUTING" in el for el in core.check_patterns())
+
+
+def test_check_patterns_rejects_an_empty_branch_list():
+    """MEND_BRANCHES=mian or an unquoted YAML value sends every project to the QUIET
+    branch-filtered bucket. Validate the setting rather than relying on the report."""
+    with mock.patch.object(core, "conf", _valid_conf(routing="true", branches="")):
+        assert any("BRANCHES" in el for el in core.check_patterns())
+
+
+def test_check_patterns_rejects_a_slash_in_azure_project():
+    """Azure reads 'MyProject/MyTeam' as {project}/{team} and returns HTTP 500. This is
+    almost always a $(System.TeamProject)-style value that picked up a team suffix."""
+    with mock.patch.object(core, "conf", _valid_conf(azure_project="Platform/MyTeam")):
+        assert any("AZUREPROJECT" in el for el in core.check_patterns())
+
+
+def test_check_patterns_accepts_an_azure_project_without_a_slash():
+    with mock.patch.object(core, "conf", _valid_conf(azure_project="Platform")):
+        assert not any("AZUREPROJECT" in el for el in core.check_patterns())
+
+
+def test_check_patterns_rejects_a_missing_mend_email():
+    """MEND_EMAIL is required for the Mend 2.0 login that authenticates 3.0 calls. It did not
+    exist in the previous release, so forgetting it on upgrade is the likely mistake -- and
+    without this check the failure surfaces deep in the 2.0 login with no helpful message."""
+    with mock.patch.object(core, "conf", _valid_conf(email="")):
+        assert any("MEND_EMAIL" in el for el in core.check_patterns())
+
+
+def test_check_patterns_rejects_a_whitespace_only_mend_email():
+    with mock.patch.object(core, "conf", _valid_conf(email="   ")):
+        assert any("MEND_EMAIL" in el for el in core.check_patterns())
+
+
+def test_check_patterns_accepts_a_present_mend_email():
+    with mock.patch.object(core, "conf", _valid_conf(email="user@example.com")):
+        assert not any("MEND_EMAIL" in el for el in core.check_patterns())
+
+
+def test_check_patterns_requires_the_org_uuid():
+    """MEND_ORGUUID replaced MEND_APIKEY as the required org identifier. It is read on every
+    3.0 path and as the login's orgToken, so an unset value must abort the run rather than
+    produce `orgs//projects/summaries`."""
+    for raw in ("", "   ", "not-a-uuid"):
+        with mock.patch.object(core, "conf", _valid_conf(org_uuid=raw)):
+            assert any("MEND_ORGUUID" in el for el in core.check_patterns()), raw
+
+
+def test_check_patterns_accepts_a_uuid_or_a_token_shaped_org_uuid():
+    uuid = "123e4567-e89b-12d3-a456-426655440000"
+    for raw in (uuid, VALID):
+        with mock.patch.object(core, "conf", _valid_conf(org_uuid=raw)):
+            assert not any("MEND_ORGUUID" in el for el in core.check_patterns()), raw
+
+
+def test_azureproject_is_not_required_under_routing():
+    """Under MEND_ROUTING every destination comes from a Mend project tag and the work item
+    type is probed per destination, so there is nothing left for the variable to do."""
+    with mock.patch.object(core, "conf", _valid_conf(routing="true", azure_project="")):
+        assert not any("MEND_AZUREPROJECT" in el for el in core.check_patterns())
+
+
+def test_azureproject_is_still_required_without_routing():
+    with mock.patch.object(core, "conf", _valid_conf(routing="false", azure_project="")):
+        assert any("MEND_AZUREPROJECT" in el for el in core.check_patterns())
+
+
+def test_a_slash_is_still_rejected_under_routing_when_the_variable_is_set():
+    with mock.patch.object(core, "conf", _valid_conf(routing="true",
+                                                     azure_project="Platform/Team")):
+        assert any("MEND_AZUREPROJECT" in el for el in core.check_patterns())

@@ -1,25 +1,40 @@
 from argparse import Namespace
 import os
+import sys
+
+from mend_azure_wi_sync import core as _core
+
+# Both import styles are supported by this codebase: production
+# runs core.py flatly (`from core import ...`), while this test package imports it via the
+# package path (`from mend_azure_wi_sync import core`). Python treats those as two independent
+# modules with independent globals unless the names are aliased to the same module object, so
+# without this, a test that exercises the flat import path (e.g.
+# test_run_sync_guard.py::test_the_flag_is_visible_through_the_flat_import_path) would import a
+# freshly-executed second copy of core.py and never observe state set on the package-imported
+# module. In the real process there is only ever one "core" module — this alias makes the test
+# environment match that reality instead of accidentally exercising a split-brain artifact of
+# running both import styles side by side.
+sys.modules.setdefault("core", _core)
 
 
 def pytest_addoption(parser):
-    parser.addoption("--wsurl", action="store", default=os.environ.get("WS_APIKEY",'https://saas.whitesourcesoftware.com'))
-    parser.addoption("--apikey", action="store", default=os.environ.get("WS_APIKEY"))
-    parser.addoption("--wsuserkey", action="store", default=os.environ.get("WS_USERKEY"))
+    parser.addoption("--wsurl", action="store", default=os.environ.get("MEND_URL",'https://saas.whitesourcesoftware.com'))
+    parser.addoption("--orguuid", action="store", default=os.environ.get("MEND_ORGUUID"))
+    parser.addoption("--wsuserkey", action="store", default=os.environ.get("MEND_USERKEY"))
     parser.addoption("--utcdelta", action="store", default='0')
     parser.addoption("--azuretype", action="store", default='Task')
-    parser.addoption("--azureuri", action="store", default=os.environ.get("WS_AZUREURI",'https://dev.azure.com/ps-mend/'))
-    parser.addoption("--azurepat", action="store", default=os.environ.get("WS_AZUREPAT",'azurepat'))
+    parser.addoption("--azureuri", action="store", default=os.environ.get("MEND_AZUREURI",'https://dev.azure.com/ps-mend/'))
+    parser.addoption("--azurepat", action="store", default=os.environ.get("MEND_AZUREPAT",'azurepat'))
     parser.addoption("--azurearea", action="store", default='')
     parser.addoption("--reset", action="store", default="False")
-    parser.addoption("--azureproject", action="store", default=os.environ.get("WS_AZUREPROJECT",'AzureTestProject'))
-    parser.addoption("--wsprojecttoken", action="store", default=os.environ.get("WS_PROJECTTOKEN"))
-    parser.addoption("--wsproducttoken", action="store", default=os.environ.get("WS_PRODUCTTOKEN"))
+    parser.addoption("--azureproject", action="store", default=os.environ.get("MEND_AZUREPROJECT",'AzureTestProject'))
+    parser.addoption("--wsprojecttoken", action="store", default=os.environ.get("MEND_PROJECTTOKEN"))
+    parser.addoption("--wsproducttoken", action="store", default=os.environ.get("MEND_PRODUCTTOKEN"))
 
 
 def pytest_configure(config):
     global args
-    args = Namespace(ws_org_token=config.getoption("apikey"), ws_user_key=config.getoption("wsuserkey"),
+    args = Namespace(org_uuid=config.getoption("orguuid"), ws_user_key=config.getoption("wsuserkey"),
                      reset=config.getoption("reset"),
                      ws_prj=config.getoption("wsprojecttoken"),utc_delta=config.getoption("utcdelta"),
                      ws_prd=config.getoption("wsproducttoken"),ws_url=config.getoption("wsurl"),
@@ -27,3 +42,28 @@ def pytest_configure(config):
                      azure_prj=config.getoption("azureproject"),azure_area=config.getoption("azurearea"),
                      azure_type=config.getoption("azuretype"))
     return args
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def reset_core_globals():
+    """core.py holds mutable module globals that leak between tests."""
+    from mend_azure_wi_sync import core
+    saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf,
+             core.run_failed, core.synced_projects)
+    core.exist_wis = []
+    core.updated_wi = []
+    core.global_errors = 0
+    core.run_failed = False
+    core.synced_projects = []
+    # library_paths_pool_size() memoises MEND_DEPPATHS_CONCURRENCY for the run (see its
+    # docstring): a test elsewhere that sets conf.dep_paths_concurrency to a specific value would
+    # otherwise leak that resolved number into every test that runs after it, in any file, not
+    # just the ones that know to reset it themselves. Reset here so no file has to remember to.
+    core.reset_library_paths_pool_size_cache()
+    yield
+    (core.exist_wis, core.updated_wi, core.global_errors, core.conf,
+     core.run_failed, core.synced_projects) = saved
+    core.reset_library_paths_pool_size_cache()

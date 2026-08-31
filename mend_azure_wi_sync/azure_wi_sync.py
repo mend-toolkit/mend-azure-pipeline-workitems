@@ -5,8 +5,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _version import __tool_name__, __version__, __description__
-from core import run_sync, update_wi_in_thread, startup, get_lastrun, set_lastrun, load_wi_json, AGENT_INFO, \
-    check_patterns, global_errors
+from core import run_sync, startup, load_wi_json, apply_custom_fields, AGENT_INFO, \
+    check_patterns, sync_had_fatal_error, error_count
 
 logger = logging.getLogger(__tool_name__)
 logging.getLogger('urllib3').setLevel(logging.INFO)
@@ -29,41 +29,39 @@ def main():
         logger.error("Missing or malformed configuration parameters:")
         [logger.error(el_) for el_ in chp_]
         exit(-1)
-    # logger.debug(conf)  # TEMP
-    wi_type, wi_fields = load_wi_json()
-    if not wi_fields:
-        logger.error(f"The Workitem type {conf.azure_type} was not found")
-        exit(-1)
+    if conf.routing.lower() == "true":
+        # No startup probe under routing: MEND_AZUREPROJECT is not a destination and may be
+        # unset. run_sync_routed reads the work item type from each destination instead, and
+        # skips a destination that lacks it.
+        wi_type, wi_fields = conf.azure_type, []
+    else:
+        wi_type, wi_fields = load_wi_json()
+        if not wi_fields:
+            logger.error(f"The Workitem type {conf.azure_type} was not found")
+            exit(-1)
     conf.utc_delta = int((datetime.datetime.utcnow()-datetime.datetime.now()).total_seconds()/3600)  # in hours
-    last_run = get_lastrun(conf.utc_delta, conf.reset)
-    if set_lastrun(lastrun=last_run) == 2:  # Serious error
-        exit(-1)
     logger.info("Sync process started")
-    if conf.reset.lower() != "true":
-        logger.warning("MEND_RESET parameter set to FALSE, only creating work items since last ran scan")
-    if conf.azure_custom:
-        custom_flds = conf.azure_custom.split(";")
-        for c_fld_ in custom_flds:
-            field_name_from_param = c_fld_.split("::")
-            fld_ref = f"Custom.{field_name_from_param[0]}"
-            for w_field_ in wi_fields:
-                if fld_ref == w_field_["referenceName"] or field_name_from_param[0] == w_field_["name"]:
-                    w_field_["defaultValue"] = field_name_from_param[1]
-                    break
+    # Under routing this list is empty; run_sync_routed fills in each destination's own field
+    # list and calls apply_custom_fields itself.
+    wi_fields = apply_custom_fields(wi_fields)
 
     now = datetime.datetime.now() + datetime.timedelta(hours=conf.utc_delta)
     todate = now.strftime("%Y-%m-%d %H:%M:%S")
-    time_sync = (now-datetime.datetime.strptime(last_run, "%Y-%m-%d %H:%M:%S")).total_seconds()/3600  # in hours
-    time_sync = time_sync if time_sync > 1 else 1  # Minimal sync time period is 1 hour
-    logger.info(run_sync((now - datetime.timedelta(hours=time_sync)).strftime("%Y-%m-%d %H:%M:%S"),
-                     todate, wi_fields, wi_type))
-    logger.info(update_wi_in_thread())
-    now = datetime.datetime.now() + datetime.timedelta(hours=conf.utc_delta)
-    set_lastrun(now.strftime("%Y-%m-%d %H:%M:%S"))
-    if global_errors == 0:
+    # st_date is passed empty and unused: Mend 3.0 reports each project's full current state, so
+    # there are no windows and no watermarks. run_sync closes and reopens each project inline,
+    # from the same read at the same severity floor it created from.
+    logger.info(run_sync("", todate, wi_fields, wi_type))
+    if sync_had_fatal_error():
+        logger.error("The sync did not complete. Mend 3.0 reports each project's full current "
+                     "state, so the projects that failed are simply read again in full on the "
+                     "next run.")
+        logger.error("Sync process FAILED. Please look at the log.")
+        exit(1)
+    errors = error_count()
+    if errors == 0:
         logger.info("Sync process completed successfully")
     else:
-        logger.info(f"Sync process finished with {global_errors} errors. Please, looks at the log.")
+        logger.info(f"Sync process finished with {errors} errors. Please, looks at the log.")
 
 
 if __name__ == '__main__':

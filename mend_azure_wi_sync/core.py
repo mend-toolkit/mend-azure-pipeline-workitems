@@ -1,9 +1,10 @@
-import datetime
-import inspect
 import json
 import logging
 import os
-import subprocess
+import time
+# The FUNCTION, not the html module: build_enrich_html_v3 binds a local `html` and would shadow it.
+from concurrent.futures import ThreadPoolExecutor
+from html import escape, unescape
 
 import requests
 import sys
@@ -11,7 +12,20 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from _version import __tool_name__, __version__
 from config import *
+from identity import (cve_key, license_title, matches_cve, matches_library,
+                      parse_cve_title, parse_dependency_title)
+from reconcile import CLOSE, CREATE, REOPEN, SKIP, UPDATE, plan_actions
+from routing import (parse_route, build_table, coverage_report, LOUD_OUTCOMES,
+                     SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_OK, SKIP_UNKNOWN, SKIP_BRANCH)
+from source3 import (library_url, license_policy_name, license_link_report,
+                     merge_component_index,
+                     merge_license_index, normalise_findings, normalise_libraries,
+                     normalise_library_components, normalise_library_licenses,
+                     normalise_library_paths, normalise_licenses,
+                     normalise_projects, normalise_root_libraries, normalise_violations,
+                     render_inputs, root_remediation, select_projects, severity_floor)
 import warnings
+import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 
 log_fmt_debug = "[%(asctime)s] [%(levelname)s] [%(funcName)s:%(lineno)d] %(message)s"
@@ -31,12 +45,17 @@ logger_vsts = logging.getLogger('vsts')
 logger_vsts.setLevel(logging.INFO)
 logger_msrest = logging.getLogger('msrest')
 logger_msrest.setLevel(logging.INFO)
-reset_back_time = 87600  # 10 years in hours
 
 conf = None
 max_wi = 100
+max_wiql_page = 5000  # WIQL rows per page; Azure DevOps hard-caps a single result set at 20000
 WARNING_MSG = False
-API_VERSION = "1.4"
+# Set once, the first time verify_setting() reports verification is OFF. The previous code caught
+# and logged InsecureRequestWarning inside three of the four transports and missed the 2.0 login,
+# which is why one raw connectionpool.py:1099 line still reached the pipeline's stderr on every
+# run. Silencing at source covers every call site, present and future.
+TLS_WARNINGS_SILENCED = False
+mend_v2_session = None
 AGENT_INFO = {"agent": f"{__tool_name__.replace('_', '-')}", "agentVersion": __version__}
 DEFAULT_PRIORITY = 2
 uuid_pattern = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -44,12 +63,43 @@ token_pattern = r"^[0-9a-zA-Z]{64}$"
 azurearea = r"^[0-9a-zA-Z\s\-_]+$"
 global_errors = 0
 exist_wis = []
+synced_projects = []   # [(project uuid, "Application/Project", azure_project)] appended by
+                       # sync_project_v3
 updated_wi = []
-
-
-def fn():
-    fn_stack = inspect.stack()[1]
-    return f'{fn_stack.function}:{fn_stack.lineno}'
+# Tracks which library keyId first claimed each exist_id this run, so a second library that
+# happens to render the same title (see FINDING 1 in the strict-title review) can be detected
+# instead of silently dropped by the `exist_id not in updated_wi` guard below.
+wi_claim_keyid = {}
+# Memoises fetch_v2_library_paths by (project_uuid, library_uuid) for the run. In per-CVE mode
+# every CVE of one library would otherwise issue the same dependency-paths call -- "forever"'s 51
+# findings on one library must cost ONE HTTP round trip, not 51. A failure is cached too, so a
+# PAT lacking permission for this endpoint is not retried on every finding.
+library_paths_cache = {}
+# Circuit breaker for fetch_v2_library_paths. The per-(project, library) cache above stops a
+# single library from being retried, but does nothing across libraries or projects: a PAT that
+# lacks 2.0 permission fails EVERY distinct library, and call_ws_api_v2 treats 401/403 as an
+# expired JWT, so each failure also costs a re-login POST and invalidates the JWT that 3.0 calls
+# share. On a 107-project org that is thousands of wasted calls plus degraded 3.0 traffic. Five
+# consecutive failures is enough to distinguish "this PAT/endpoint is broken for the whole run"
+# from an ordinary transient blip, without giving up on the very first hiccup.
+LIBRARY_PATHS_BREAKER_THRESHOLD = 5
+library_paths_consecutive_failures = 0
+library_paths_breaker_tripped = False
+# Default width of the ThreadPoolExecutor the batch /paths fetch fans out over (see
+# _fetch_paths_batch). Mend imposes no rate limit here, so this is a latency/throughput knob.
+# MEND_DEPPATHS_CONCURRENCY (library_paths_pool_size) overrides it, and this constant is also the
+# fallback a bad override resolves to.
+LIBRARY_PATHS_POOL_SIZE = 16
+# Clamp for MEND_DEPPATHS_CONCURRENCY: generous headroom for a large org, without letting a
+# pasted "5000" spin up thousands of threads against a host with finite real capacity.
+LIBRARY_PATHS_POOL_SIZE_MAX = 64
+# Per-call timeout (seconds) for the batch /paths fetch only. It is deliberately not shared with
+# call_ws_api_v2/v3's unbounded _get_v2 callers. 30s is generous next to this endpoint's observed
+# sub-second-to-a-few-second latency, but
+# short enough that one stuck socket cannot recreate the multi-minute hang this change fixes --
+# with a 16-wide pool a handful of hangs would otherwise stack up to real wall-clock damage.
+LIBRARY_PATHS_TIMEOUT = 30
+run_failed = False
 
 
 def ex():
@@ -68,8 +118,8 @@ def check_patterns():
     res = []
     if not (re.match(uuid_pattern, conf.ws_user_key) or re.match(token_pattern, conf.ws_user_key)):
         res.append("MEND_USERKEY")
-    if not (re.match(uuid_pattern, conf.ws_org_token) or re.match(token_pattern, conf.ws_org_token)):
-        res.append("MEND_APIKEY")
+    if not (re.match(uuid_pattern, conf.org_uuid) or re.match(token_pattern, conf.org_uuid)):
+        res.append("MEND_ORGUUID (the organization UUID from the Mend platform)")
     if conf.wsproducttoken:
         prods = conf.wsproducttoken.split(",")
         for prod_ in prods:
@@ -95,11 +145,23 @@ def check_patterns():
                 res.append("MEND_AZUREAREA")
                 break
     if not conf.azure_project:
-        res.append("MEND_AZUREPROJECT")
+        # Under routing every destination comes from a Mend project tag and the work item type
+        # is probed per destination, so this variable is not required. It is honoured when set,
+        # and required without routing, where it is the destination.
+        if conf.routing.lower() != "true":
+            res.append("MEND_AZUREPROJECT")
+    elif "/" in conf.azure_project:
+        # Azure reads "{project}/{team}" and returns HTTP 500 — this is almost always a
+        # $(System.TeamProject)-style value that picked up a team suffix by mistake.
+        res.append(f"MEND_AZUREPROJECT ('{conf.azure_project}') must not contain '/' "
+                   f"— Azure DevOps parses this as '{{project}}/{{team}}'")
     if not conf.azure_pat:
         res.append("MEND_AZUREPAT")
     if not conf.ws_url:
         res.append("MEND_URL")
+    if not conf.email.strip():
+        res.append("MEND_EMAIL (the email of the Mend user whose MEND_USERKEY is configured) "
+                   "is required for Mend API 3.0 authentication")
     if not conf.azure_uri:
         res.append("MEND_AZUREURI")
     if conf.azure_custom and "::" not in conf.azure_custom:
@@ -108,172 +170,346 @@ def check_patterns():
         proxy_str = try_or_error(lambda: conf.proxy['http'], try_or_error(lambda: conf.proxy['https'],""))
         if proxy_str.count(":") < 2:
             res.append("MEND_PROXY.(The right format is <proxy_ip>:<proxy_port>)")
+    if conf.routing.lower() not in ("true", "false"):
+        res.append(f"MEND_ROUTING must be 'true' or 'false', got '{conf.routing}'")
+    if conf.routing.lower() == "true" and not [b for b in conf.branches.split(",") if b.strip()]:
+        # An empty pattern list matches nothing, and branch-filtered is the quiet bucket —
+        # so without this every project is skipped silently.
+        res.append("MEND_BRANCHES must list at least one branch pattern when "
+                   "MEND_ROUTING is enabled")
+    if conf.reachability.lower() not in ("true", "false"):
+        res.append(f"MEND_REACHABILITY must be 'true' or 'false', got '{conf.reachability}'")
     return res
 
 
-def get_lastrun(time_delta: int, reset: str):
-    if reset.lower() == "true":
-        last_run = (datetime.datetime.now() + datetime.timedelta(hours=time_delta) -
-                    datetime.timedelta(hours=reset_back_time)).strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        azure_prj_id = get_azure_prj_id(conf.azure_project)
-        if azure_prj_id:
-            r, errorcode = call_azure_api(api_type="GET", api=f"projects/{azure_prj_id}/properties", data={},
-                                          version="7.0-preview", cmd_type="?keys=Lastrun&", header="application/json")
-        last_run = try_or_error(lambda: r["value"][0]["value"],
-                                (datetime.datetime.now() + datetime.timedelta(hours=time_delta) -
-                                 datetime.timedelta(hours=reset_back_time)).strftime("%Y-%m-%d %H:%M:%S"))
-    return last_run
+azure_project_page = 100
 
 
-def set_lastrun(lastrun: str):
-    global global_errors
-    azure_prj_id = get_azure_prj_id(conf.azure_project)
-    errorcode = 2
-    if azure_prj_id:
-        data = [{
-            "op": "add",
-            "path": "/Lastrun",
-            "value": f"{lastrun}"
-        }]
+def iter_azure_projects():
+    # Azure DevOps pages _apis/projects. The previous unpaginated call silently hid every
+    # project past the first page, which at 107 projects made those destinations invisible to
+    # routing (and, before the sync state moved onto Mend tags, to get_lastrun/set_lastrun).
+    # Yields pages; on failure it yields a terminal `None` sentinel (already logged) before
+    # returning, so a consumer can tell "a later page failed" from "no more pages" instead of
+    # silently treating a partial sweep as complete.
+    skip = 0
+    while True:
+        r, errocode = call_azure_api(api_type="GET", api="projects", version="7.0",
+                                     data={}, header="application/json",
+                                     cmd_type=f"?$top={azure_project_page}&$skip={skip}&")
+        if errocode != 0:
+            logger.error(f"Could not list Azure DevOps projects: {r}")
+            yield None
+            return
+        page = try_or_error(lambda: r["value"], None)
+        if page is None:
+            logger.error(f"Unexpected project list payload: {r}")
+            yield None
+            return
+        yield page
+        if len(page) < azure_project_page:
+            return
+        skip += azure_project_page
 
-        r, errorcode = call_azure_api(api_type="PATCH", api="projects/{" + azure_prj_id + "}/properties", data=data,
-                                      version="7.0-preview")
-        if errorcode > 0:
-            info_el = r.pop()
-            logger.error(f"[{fn()}] {info_el}")
-            global_errors += 1
-    else:
-        logger.error(f"The Azure Project {conf.azure_project} was not found")
-        global_errors += 1
-    return errorcode
+
+def reachability_enabled() -> bool:
+    return conf.reachability.lower() == "true"
 
 
-def get_azure_prj_id(prj_name: str):
-    res = ""
+def _silence_tls_warnings():
+    """Suppress urllib3's InsecureRequestWarning, once, when verification is deliberately off.
+
+    Only ever called from verify_setting's false branch: while verification is ON, a TLS warning
+    would mean something real and must not be hidden. The one-shot logger.warning in the transports
+    still fires, so the run says once that it is not verifying -- what goes away is urllib3
+    repeating it per connection.
+    """
+    global TLS_WARNINGS_SILENCED
+    if not TLS_WARNINGS_SILENCED:
+        urllib3.disable_warnings(InsecureRequestWarning)
+        TLS_WARNINGS_SILENCED = True
+
+
+def verify_setting(raw=None):
+    """MEND_SSLVERIFY -> True or False, the `verify` argument for every request this tool makes.
+
+    A BOOLEAN, deliberately -- no CA bundle path. requests already honours REQUESTS_CA_BUNDLE and
+    CURL_CA_BUNDLE whenever verify is True (sessions.py:855-860), so a self-hosted agent behind a
+    TLS-inspecting proxy is served by upstream's tested code instead of a branch here that cannot
+    be exercised in this project's environment. A path passed in verifies and logs where to put it.
+
+    Nothing has to be installed for the default: api-saas.mend.io and dev.azure.com serve publicly
+    trusted certificates, so certifi validates them out of the box. `false` is the escape hatch if
+    verification ever fails on a self-hosted runner -- one variable rather than a code change.
+
+    Anything unrecognised verifies. A typo must never be the thing that silently disables TLS
+    validation, so only an explicit false/no/0 turns it off, and an unexpanded Azure placeholder
+    ("$(MEND_SSLVERIFY)") is not read as a value.
+    """
+    if raw is None:
+        raw = getattr(conf, "ssl_verify", "") if conf else ""
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw or "").strip()
+    if not text or re.match(r"^\$\(.+\)$", text):
+        return True
+    lowered = text.lower()
+    if lowered in ("false", "no", "0"):
+        _silence_tls_warnings()
+        return False
+    if lowered in ("true", "yes", "1"):
+        return True
+    if "/" in text or "\\" in text:
+        # Looks like somebody expected a CA bundle here. Verifying anyway is the safe outcome, but
+        # doing it silently would leave them believing they had configured a trust store.
+        logger.warning(f"MEND_SSLVERIFY is a true/false switch and does not take a "
+                       f"path, so '{text}' is ignored and certificates ARE being verified. To "
+                       f"supply a CA bundle for a TLS-inspecting proxy, set REQUESTS_CA_BUNDLE "
+                       f"to that path instead -- requests reads it directly.")
+    return True
+
+
+def ssl_error_hint(host_desc: str, err) -> str:
+    """The message for a certificate failure -- the one way turning verification on can break a
+    run. It has to name the variable that restores the old behaviour, or an operator is left
+    reading a stack trace about handshakes."""
+    return (f"TLS certificate verification failed for {host_desc}: {err}. If this runs behind a "
+            f"TLS-inspecting proxy, set REQUESTS_CA_BUNDLE to the proxy's CA bundle path "
+            f"(requests reads it directly), or set MEND_SSLVERIFY=false to skip verification as "
+            f"previous versions did.")
+
+
+def _post_v2_login():
+    # Split out so tests can stub the transport without mocking requests itself.
+    # mend_api_url(), NOT conf.ws_url: 2.0/3.0 live on api-saas.mend.io while conf.ws_url is
+    # the SCA app host. See the spec's servers block.
+    url = f"{mend_api_url()}/api/v2.0/login"
+    # orgToken takes MEND_ORGUUID: the 2.0 spec's LoginModelDTO documents the field as
+    # "org UUID ... or API Key", so the UUID is an accepted value and MEND_APIKEY is no
+    # longer read anywhere.
+    body = {"email": conf.email, "userKey": conf.ws_user_key, "orgToken": org_uuid()}
     try:
-        r, errorcode = call_azure_api(api_type="GET", api="projects", data={}, version="7.0", header="application/json")
-        if errorcode == 0:
-            for prj_ in r["value"]:
-                if prj_["name"] == prj_name:
-                    res = prj_["id"]
-                    break
-        elif errorcode == 2:  # Invalid Azure URI or PAT provided
-            logger.error(f"[{fn()}] Invalid Azure URI or PAT was provided")
-            exit(-1)
+        res_ = requests.post(url, json=body, verify=verify_setting(), proxies=conf.proxy,
+                             headers={"Content-Type": "application/json"})
+        return (json.loads(res_.text), 0) if res_.status_code == 200 \
+            else (try_or_error(lambda: json.loads(res_.text), {}), 2)
+    except requests.exceptions.SSLError as err:
+        logger.error(f"[{ex()}] {ssl_error_hint('the Mend API host', err)}")
+        return {f"[{ex()}] Mend 2.0 login failed": f"{err}"}, 2
     except Exception as err:
-        pass
-    return res
+        return {f"[{ex()}] Mend 2.0 login failed": f"{err}"}, 2
 
 
-def fetch_prj_policy(prj_token: str, sdate: str, edate: str):
-    global conf
-    if conf is None:
-        conf = startup()
-        conf.update_properties()
-    try:
-        data = json.dumps(
-            {"requestType": "fetchProjectPolicyIssues",
-             "userKey": conf.ws_user_key,
-             "orgToken": conf.ws_org_token,
-             "projectToken": prj_token,
-             "policyActionType": "CREATE_ISSUE",
-             "fromDateTime": sdate,
-             "toDateTime": edate,
-             })
-        rt = json.loads(call_ws_api(data=data))
-        rt_res = [rt['product']['productName'], rt['project']['projectName']]
-        for rt_el_val in rt['issues']:
-            if try_or_error(lambda: rt_el_val['policy']['enabled'], False):
-                rt_res.append(rt_el_val)
-    except Exception as err:
-        rt_res = [f"[{ex()}] Process getting Policy issues failed: ", f"{err}"]
-
-    return rt_res
+def mend_v2_token() -> str:
+    # Cached for the process. The JWT is valid for 10 minutes. 2.0 use is NOT one burst at the
+    # start of a run -- fetch_v2_library_paths issues 2.0 calls spread across the whole run, one
+    # per distinct (project, library) pair as per-CVE/license entries are rendered -- so expiry
+    # is handled by a single retry in call_ws_api_v2 rather than by refresh-token plumbing.
+    global mend_v2_session
+    if mend_v2_session:
+        return try_or_error(lambda: mend_v2_session["retVal"]["jwtToken"], "")
+    payload, errorcode = _post_v2_login()
+    if errorcode != 0:
+        logger.error(f"Mend API 2.0 login failed: {payload}")
+        return ""
+    token = try_or_error(lambda: payload["retVal"]["jwtToken"], "")
+    if token:
+        mend_v2_session = payload
+    return token
 
 
-def get_prj_list_modified(fromdate: str, todate: str):
-    data = json.dumps(
-        {"requestType": "getOrganizationLastModifiedProjects",
-         "userKey": conf.ws_user_key,
-         "orgToken": conf.ws_org_token,
-         "fromDateTime": fromdate,
-         "toDateTime": todate,
-         "includeRequestToken": False
-         })
-    resp = call_ws_api(data=data, agent_info_login=True)
-    if "Error" in resp:
-        logger.error(f"[{fn()}] {resp}")
-        exit(-1)
-    else:
-        response_ = json.loads(resp)
-        try:
-            err_msg = response_["errorMessage"]
-            logger.error(f"[{fn()}] Getting modified projects failed: {err_msg}")
-            exit(-1)
-        except Exception as err:  # Getting list of modified projects
-            res = response_["lastModifiedProjects"]
-            return [r["apiToken"] for r in res]
-
-
-def call_ws_api(data, header={"Content-Type": "application/json"}, method="POST", agent_info_login=False):
+def _get_v2(url: str, token: str, params: dict, timeout: float = None):
+    # timeout defaults to None, meaning no timeout: call_ws_api_v2, call_ws_api_v3 and the 2.0
+    # login all pass nothing. Only the batch /paths fetch (_fetch_paths_batch) passes a value, so
+    # `timeout is not None` doubles as "this call came from a ThreadPoolExecutor worker":
+    # warnings.catch_warnings(record=True) below swaps
+    # process-wide state (the filter list via simplefilter, and warnings.showwarning) on
+    # __enter__/__exit__, which is not thread-safe -- with several workers concurrently
+    # entering/exiting, one thread's __exit__ can restore another's saved state and leak an
+    # "always" filter for the rest of the run. WARNING_MSG/TLS_WARNINGS_SILENCED are idempotent
+    # latches so no data is corrupted either way, only log fidelity, so a batch-path call skips
+    # the recording entirely rather than risk racing it.
     global WARNING_MSG
-    data_json = json.loads(data)
-    data_json["agentInfo"] = AGENT_INFO
-    if agent_info_login:
-        data_json["agentInfo"]["agent"] = AGENT_INFO["agent"].replace("ps-", "ps-login-")
+    try:
+        if timeout is None:
+            with warnings.catch_warnings(record=True) as warning_list:
+                warnings.simplefilter("always", InsecureRequestWarning)
+                res_ = requests.get(url, params=params or {}, verify=verify_setting(),
+                                    proxies=conf.proxy, timeout=timeout,
+                                    headers={"Authorization": f"Bearer {token}",
+                                             "Content-Type": "application/json"})
+            if not WARNING_MSG:
+                for warning in warning_list:
+                    if issubclass(warning.category, InsecureRequestWarning):
+                        index_of_see = str(warning.message).find("See:")
+                        logger.warning(str(warning.message)[:index_of_see].strip())
+                        WARNING_MSG = True
+        else:
+            res_ = requests.get(url, params=params or {}, verify=verify_setting(),
+                                proxies=conf.proxy, timeout=timeout,
+                                headers={"Authorization": f"Bearer {token}",
+                                         "Content-Type": "application/json"})
+        if res_.status_code == 200:
+            return json.loads(res_.text), 0
+        return try_or_error(lambda: json.loads(res_.text), {}), res_.status_code
+    except requests.exceptions.SSLError as err:
+        logger.error(f"[{ex()}] {ssl_error_hint('the Mend API host', err)}")
+        return {f"[{ex()}] Mend 2.0 call failed": f"{err}"}, 2
+    except Exception as err:
+        return {f"[{ex()}] Mend 2.0 call failed": f"{err}"}, 2
+
+
+def _post_v3(url: str, token: str, body: dict, params: dict):
+    # Mirrors _get_v2's contract exactly (same InsecureRequestWarning one-shot suppression,
+    # verify=False, proxies=conf.proxy, (payload, errorcode) return) -- the only difference is
+    # the HTTP verb and that the payload travels as a JSON body instead of query params. This
+    # exists because /projects/summaries is POST-only in the 3.0 spec while every other 3.0
+    # endpoint in use is GET.
+    global WARNING_MSG
     try:
         with warnings.catch_warnings(record=True) as warning_list:
             warnings.simplefilter("always", InsecureRequestWarning)
-            res_ = requests.request(
-                method=method,
-                url=f"{extract_url(conf.ws_url)}/api/v{API_VERSION}",
-                data=json.dumps(data_json),
-                headers=header,
-                proxies=conf.proxy,
-                verify=False
-            )
+            res_ = requests.post(url, params=params or {}, json=body or {},
+                                 verify=verify_setting(),
+                                 proxies=conf.proxy,
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
         if not WARNING_MSG:
             for warning in warning_list:
                 if issubclass(warning.category, InsecureRequestWarning):
                     index_of_see = str(warning.message).find("See:")
                     logger.warning(str(warning.message)[:index_of_see].strip())
                     WARNING_MSG = True
-
-        res = res_.text if res_.status_code == 200 else ""
-        if res:
-            try:
-                res_check = json.loads(res_.text)
-            except:
-                temp_http_proxy = try_or_error(lambda: conf.proxy["http"], "")
-                if temp_http_proxy:
-                    with warnings.catch_warnings(record=True) as warning_list:
-                        warnings.simplefilter("always", InsecureRequestWarning)
-                        res_ = requests.request(
-                            method=method,
-                            url=f"{extract_url(conf.ws_url)}/api/v{API_VERSION}",
-                            data=json.dumps(data_json),
-                            headers=header,
-                            proxies={"http": temp_http_proxy},
-                            verify=False
-                        )
-                    if not WARNING_MSG:
-                        for warning in warning_list:
-                            if issubclass(warning.category, InsecureRequestWarning):
-                                index_of_see = str(warning.message).find("See:")
-                                logger.warning(str(warning.message)[:index_of_see].strip())
-                                WARNING_MSG = True
-
-                    res = res_.text if res_.status_code == 200 else ""
-                else:
-                    logger.error("Shutting down SSL/TLS connection. "
-                                 "Check that your proxy is appropriately configured and run again.")
-                    exit(-1)
-
+        if res_.status_code == 200:
+            return json.loads(res_.text), 0
+        return try_or_error(lambda: json.loads(res_.text), {}), res_.status_code
+    except requests.exceptions.SSLError as err:
+        logger.error(f"[{ex()}] {ssl_error_hint('the Mend API host', err)}")
+        return {f"[{ex()}] Mend 3.0 call failed": f"{err}"}, 2
     except Exception as err:
-        res = f"Error was raised. {try_or_error(lambda: err.args[0].reason.args[0], '')}"
-        logger.error(f'[{ex()}] {err}')
-    return res
+        return {f"[{ex()}] Mend 3.0 call failed": f"{err}"}, 2
+
+
+def call_ws_api_v2(api: str, params: dict = None):
+    # Returns (payload, errorcode) with the same convention as call_azure_api:
+    # 0 = success, non-zero = failure. One re-login covers a JWT that expired mid-run.
+    global mend_v2_session
+    url = f"{mend_api_url()}/api/v2.0/{api}"
+    payload, errorcode = _get_v2(url, mend_v2_token(), params)
+    if errorcode in (401, 403):
+        # The JWT lives 10 minutes. The spec documents no 401 anywhere, so an expired token
+        # most plausibly surfaces as 403 — retry both. A real permission denial costs one
+        # wasted re-login and still fails, which is the right trade.
+        mend_v2_session = None
+        payload, errorcode = _get_v2(url, mend_v2_token(), params)
+    if errorcode != 0:
+        logger.error(f"Mend 2.0 call to '{api}' failed: {payload}")
+        errorcode = 2
+    return payload, errorcode
+
+
+def call_ws_api_v3(api: str, params: dict = None, method: str = "GET", body: dict = None):
+    # Same (payload, errorcode) convention as call_ws_api_v2. Mend 3.0 accepts the JWT minted by
+    # the 2.0 login, so there is no separate 3.0 login path, and 3.0 lives on the same API host.
+    #
+    # method exists because the spec declares /projects/summaries as POST-only while every
+    # other 3.0 endpoint in use is GET; cursor/limit still travel as query params either way
+    # (the spec puts them `in: query` even on the POST), only the transport verb changes.
+    global mend_v2_session
+    url = f"{mend_api_url()}/api/v3.0/{api}"
+    if method == "POST":
+        payload, errorcode = _post_v3(url, mend_v2_token(), body or {}, params)
+        if errorcode in (401, 403):
+            mend_v2_session = None
+            payload, errorcode = _post_v3(url, mend_v2_token(), body or {}, params)
+    else:
+        payload, errorcode = _get_v2(url, mend_v2_token(), params)
+        if errorcode in (401, 403):
+            mend_v2_session = None
+            payload, errorcode = _get_v2(url, mend_v2_token(), params)
+    if errorcode != 0:
+        logger.error(f"Mend 3.0 call to '{api}' failed: {payload}")
+        errorcode = 2
+    return payload, errorcode
+
+
+# A server that keeps returning the same cursor would otherwise spin forever. 1000 pages at the
+# default limit is 1,000,000 items -- far past any real project -- so hitting it means something
+# is wrong, which is why it reports not-ok rather than returning what it collected.
+MAX_V3_PAGES = 1000
+
+
+def _v3_total_items_ok(api: str, items: list, payload: dict) -> bool:
+    """Cross-check the collected item count against the server's `additionalData.totalItems`.
+
+    totalItems is the only server-side evidence that a walk was complete, so a parseable
+    disagreement means the read was truncated (an empty page that still carried a cursor, or an
+    empty first page from a mis-scoped org or project UUID). totalItems may be a string, missing
+    or malformed, and absence or a parse failure always falls back to True.
+    """
+    raw_total = try_or_error(lambda: payload["additionalData"]["totalItems"], None)
+    if raw_total is None:
+        return True
+    try:
+        total = int(raw_total)
+    except (TypeError, ValueError):
+        return True
+    if total != len(items):
+        logger.error(f"Mend 3.0 call to '{api}' collected {len(items)} item(s) but "
+                     f"totalItems reported {total}; treating the read as truncated and "
+                     f"skipping closures.")
+        return False
+    return True
+
+
+def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000, method: str = "GET"):
+    """Walk every cursor page of a 3.0 collection endpoint.
+
+    Returns (items, ok). `ok` is False if ANY page failed, was malformed, the page cap was hit, a
+    cursor repeated, or the collected count disagrees with the server's totalItems -- and it is
+    load-bearing: reconciliation closes work items absent from a fetch, so a caller must treat
+    ok=False as "I know nothing about this project" rather than as a shorter list. The partial
+    items are returned alongside ok=False because they are still usable for creating and updating,
+    which cannot do harm, while closure must be skipped entirely.
+
+    method defaults to GET. Pass method="POST" for an endpoint like /projects/summaries that the
+    spec declares POST-only; cursor/limit still ride as query params on the POST.
+    """
+    items = []
+    cursor = None
+    seen_cursors = set()
+    for _ in range(MAX_V3_PAGES):
+        page_params = dict(params or {})
+        page_params["limit"] = limit
+        if cursor is not None:
+            page_params["cursor"] = cursor
+        if method == "POST":
+            payload, errorcode = call_ws_api_v3(api, page_params, method="POST", body={})
+        else:
+            payload, errorcode = call_ws_api_v3(api, page_params)
+        if errorcode != 0:
+            return items, False
+        rows = try_or_error(lambda: payload["response"], None)
+        if not isinstance(rows, list):
+            logger.error(f"Mend 3.0 call to '{api}' returned no 'response' list: {payload}")
+            return items, False
+        items.extend(rows)
+        if not rows:
+            # A cursor with no rows behind it is the end, however the server phrases it -- but an
+            # empty page (including an empty first page) is exactly what a truncated or
+            # mis-scoped read looks like, so it still needs the totalItems cross-check.
+            return items, _v3_total_items_ok(api, items, payload)
+        cursor = try_or_error(lambda: payload["additionalData"]["cursor"], None)
+        if cursor is None:
+            return items, _v3_total_items_ok(api, items, payload)
+        if cursor in seen_cursors:
+            logger.error(f"Mend 3.0 call to '{api}' returned a repeated cursor; "
+                         f"treating the read as failed rather than looping to the page cap.")
+            return items, False
+        seen_cursors.add(cursor)
+    logger.error(f"Mend 3.0 call to '{api}' exceeded {MAX_V3_PAGES} pages; "
+                 f"treating the read as failed rather than trusting a truncated list.")
+    return items, False
 
 
 def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", project: str = "", cmd_type: str = "?",
@@ -291,7 +527,7 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
             res_ = requests.request(api_type, url, json=data,
                                     headers={'Content-Type': f'{header}'},
                                     proxies=conf.proxy,
-                                    verify=False,
+                                    verify=verify_setting(),
                                     auth=('', conf.azure_pat))
         if not WARNING_MSG:
             for warning in warning_list:
@@ -310,7 +546,7 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                         res_ = requests.request(api_type, url, json=data,
                                                 headers={'Content-Type': f'{header}'},
                                                 proxies={"http": temp_http_proxy},
-                                                verify=False,
+                                                verify=verify_setting(),
                                                 auth=('', conf.azure_pat))
                     if not WARNING_MSG:
                         for warning in warning_list:
@@ -330,7 +566,7 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                     exit(-1)
             try:
                 msg = res['message']
-                logger.error(f"[{fn()}] Error: {msg}")
+                logger.error(f"Error: {msg}")
                 errorcode = 1
             except:
                 pass
@@ -342,12 +578,16 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                 msg = try_or_error(lambda: re.search(r"<title>(.*?)</title>", res_.text), "")
                 msg_text = f'Status code: {res_.status_code}'
                 msg_text = f'{msg_text} - {msg.group(1)}' if msg else f'{msg_text} - {try_or_error(lambda: json.loads(res_.text)["message"], "")}'
-                res = {f"[{fn()}] {msg_text}"}
+                res = {f"{msg_text}"}
             elif res_.status_code == 401:
-                res = {f"[{fn()}]  Non-valid authentication credentials or PAT does not have enough permissions."
+                res = {f" Non-valid authentication credentials or PAT does not have enough permissions."
                        f"Check it according to READ.ME file."}
             else:
-                res = {f"[{fn()}] Azure API call failed": "No message text was returned."}
+                res = {f"Azure API call failed": "No message text was returned."}
+    except requests.exceptions.SSLError as err:
+        errorcode = 2
+        logger.error(f"[{ex()}] {ssl_error_hint('the Azure DevOps host', err)}")
+        res = {f"[{ex()}] Azure API call failed": f"{err}"}
     except Exception as err:
         errorcode = 2
         res = {f"[{ex()}] Azure API call failed": f"{err}"}
@@ -355,26 +595,44 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
     return res, errorcode
 
 
+def mend_tag_predicate() -> str:
+    # Every work item this tool creates carries exactly one policy tag from the Tags enum.
+    # OR-ing them narrows the WIQL query from the whole Azure DevOps backlog down to items
+    # this integration owns.
+    return " OR ".join([f'[System.Tags] CONTAINS "{t}"' for t in Tags.all_tags()])
+
+
 def get_exist_wi():
     def retrieve_work_items(work_item_ids):
         work_items = []
         batch_size = 200  # This is maximum for running one bulk
-        num_batches = (len(work_item_ids) // batch_size) + 1
+        num_batches = (len(work_item_ids) + batch_size - 1) // batch_size
 
         for batch_index in range(num_batches):
             start_index = batch_index * batch_size
             end_index = min(start_index + batch_size, len(work_item_ids))
             batch_ids = work_item_ids[start_index:end_index]
 
+            if not batch_ids:
+                continue
             payload = {
                 "ids": batch_ids,
-                "fields": ["System.Id", "System.Title", "System.Tags", "System.WorkItemType"],  #"System.WorkItemType",
+                "fields": ["System.Id", "System.Title", "System.Tags", "System.State",
+                           "System.WorkItemType"],  #"System.WorkItemType",
             }
             response, err = call_azure_api(api_type="POST", api="wit/workitemsbatch", version="6.0",
                                            data=payload, project=conf.azure_project, header="application/json")
-            if err == 0:
-                work_items.extend([{x["fields"]["System.Title"]: {x["fields"]["System.Id"]: try_or_error(lambda: x["fields"]["System.Tags"],"")}} for x in response["value"]])
-                                   #if x["fields"]["System.WorkItemType"].lower() == conf.azure_type.lower()])
+            if err != 0:
+                logger.error(f"Work item batch hydration failed: {response}")
+                return None
+            # System.State is carried so reconciliation can tell an open item from a closed one
+            # without a second round trip; a closed item that looked absent would be recreated
+            # as a duplicate and the original would never reopen.
+            work_items.extend([{x["fields"]["System.Title"]: {x["fields"]["System.Id"]: {
+                "tags": try_or_error(lambda x=x: x["fields"]["System.Tags"], ""),
+                "state": try_or_error(lambda x=x: x["fields"]["System.State"], "")}}}
+                for x in response["value"]])
+                               #if x["fields"]["System.WorkItemType"].lower() == conf.azure_type.lower()])
 
         return work_items
 
@@ -383,22 +641,70 @@ def get_exist_wi():
         conf = startup()
         conf.update_properties()
     try:
-        data = {"query": f'select [System.Id] From WorkItems Where '
-                         f'[System.TeamProject] = "{conf.azure_project}" And [System.State] <> "Removed" AND [System.State] <> "Deleted"'}
-        r, errocode = call_azure_api(api_type="POST", api="wit/wiql", version="6.0", project=conf.azure_project,
-                                     data=data, header="application/json")
-        if errocode == 0:
-            ids = [x["id"] for x in r["workItems"]]
-            return retrieve_work_items(work_item_ids=ids)
-        else:
-            return []
+        ids = []
+        first_id = 0
+        while True:
+            data = {"query": f'select [System.Id] From WorkItems Where '
+                             f'[System.TeamProject] = "{conf.azure_project}" '
+                             f'And [System.Id] > {first_id} '
+                             f'And ({mend_tag_predicate()}) '
+                             f'And [System.State] <> "Removed" AND [System.State] <> "Deleted" '
+                             f'ORDER BY [System.Id]'}
+            r, errocode = call_azure_api(api_type="POST", api="wit/wiql", version="6.0",
+                                         project=conf.azure_project, data=data,
+                                         header="application/json",
+                                         cmd_type=f"?$top={max_wiql_page}&")
+            if errocode != 0:
+                logger.error(f"Could not read existing work items for "
+                             f"'{conf.azure_project}': {r}")
+                return None
+            page = [x["id"] for x in r["workItems"]]
+            if not page:
+                break
+            ids.extend(page)
+            first_id = page[-1]
+        return retrieve_work_items(work_item_ids=ids)
     except Exception as err:
-        return []
+        logger.error(f"[{ex()}] Could not read existing work items for "
+                     f"'{conf.azure_project}': {err}")
+        return None
 
 
-def check_wi_id(id: str, project_name: str):
+def tag_set(raw_tags: str) -> set:
+    # Azure DevOps returns System.Tags as "; "-delimited, while this tool writes them
+    # comma-joined. Azure normalizes on write, so accepting both separators makes this
+    # safe wherever it is called. Splitting is safe because neither character is legal
+    # inside an Azure DevOps tag.
+    return {t.strip() for t in (raw_tags or "").replace(",", ";").split(";") if t.strip()}
+
+
+def check_wi_id_matching(title_matches, project_name: str):
+    """Find a live work item whose title satisfies `title_matches` and which carries
+    `project_name` as a tag. Returns its id, or 0.
+
+    `title_matches` is a predicate over the title so callers can match either an exact title or
+    a legacy title shape (see identity.py) through one code path -- the tag-ownership rule below
+    is the part that must not be duplicated.
+    """
+    def owns(entry):
+        # entry is {work_item_id: {"tags": raw_tags, "state": state}}; a malformed entry must
+        # skip, not abort the search.
+        # ';' joins multiple values so a tag at the end of one value can't weld onto the start
+        # of the next; the needle is stripped since tag_set() only strips the haystack; both
+        # sides are casefolded because Azure Boards tags are case-insensitive for identity
+        # (case-preserving on first write, lowercased on read back), so an exact case-sensitive
+        # comparison would miss an existing tag forever and create a duplicate every run.
+        return try_or_error(lambda: project_name.strip().casefold() in
+                            {t.casefold() for t in tag_set(
+                                ';'.join(v.get("tags", "") for v in entry.values()))}, False)
+
     try:
-        values = [d[id] for d in exist_wis if id in d and project_name in ''.join(d[id].values())]
+        values = []
+        for d in exist_wis:
+            for title, entry in try_or_error(lambda: list(d.items()), []):
+                # A predicate raising on one odd title must not suppress a match elsewhere.
+                if try_or_error(lambda: bool(title_matches(title)), False) and owns(entry):
+                    values.append(entry)
         res = try_or_error(lambda: max(values, key=lambda x: list(x.keys())[0]), 0)
         if type(res) is dict:
             return list(res.keys())[0]
@@ -408,665 +714,1645 @@ def check_wi_id(id: str, project_name: str):
         return 0
 
 
-def update_wi_in_thread():
-    global conf, global_errors
-    if conf is None:
-        conf = startup()
-        conf.update_properties()
+def check_wi_id(id: str, project_name: str):
+    return check_wi_id_matching(lambda title: title == id, project_name)
+
+
+def classify_title(title: str):
+    """A work item title -> (kind, key), or None if it is not one of ours.
+
+    Inverts the three shipped title formats:
+      "License Policy Violation detected in {lib}"             -> ("license", lib)
+      "{lib}: {N} vulnerabilities (highest severity is {S})"   -> ("vulnerability", lib)
+      "{CVE} ({Severity}) detected in {lib}"                   -> ("vulnerability", "{CVE}|{lib}")
+
+    The key is the work item's IDENTITY, which is what differs between the two MEND_DEPENDENCY
+    modes: dependency mode puts every CVE of a library on one work item, per-CVE mode puts each
+    CVE on its own. Both the CVE and the library are in the per-CVE key -- the CVE alone collides
+    when one CVE affects two libraries in a project, the library alone is dependency mode.
+
+    The moving parts of every format are wildcards (the count, the max score, the severity word),
+    because Mend rescores and a number baked into the key orphans the work item on the next run.
+
+    A title matching NONE of the three returns None and is never adopted: a person's hand-created
+    work item that happens to carry a Mend tag must not be closed by this tool.
+    """
+    text = (title or "").strip()
+    prefix = "License Policy Violation detected in "
+    if text.startswith(prefix):
+        lib = text[len(prefix):].strip()
+        return ("license", lib) if lib else None
+    # The dependency form is decoded FIRST, and by an anchored parse of the WHOLE title rather
+    # than by splitting on the first ":" and guessing the head: a library whose own name contains
+    # a colon (Maven's "{group}:{artifact}", e.g. org.apache:log4j) decoded to None under the
+    # guess, so those work items were created and updated but never closed. Trying it before the
+    # per-CVE form also settles a title that could parse as both -- the dependency tail is the
+    # more specific pattern, so it wins.
+    lib = parse_dependency_title(text)
+    if lib:
+        return ("vulnerability", lib)
+    parsed = parse_cve_title(text)
+    if parsed:
+        return ("vulnerability", cve_key(*parsed))
+    return None
+
+
+def actual_work_items(project_name: str):
+    """{(kind, key): {"id", "state"}} for the live work items belonging to one Mend project.
+
+    The key is whatever classify_title decodes -- the library name in dependency mode, and
+    "{cve}|{library}" in per-CVE mode -- so it matches the key fetch_v3_desired builds `desired`
+    on. The two must agree exactly or reconciliation closes everything.
+
+    The reverse of check_wi_id: that answers "does THIS title exist", this answers "what does
+    Azure currently hold for this project". Reconciliation needs the second question.
+
+    A title matching neither known format is IGNORED, never adopted. A person's hand-created work
+    item that happens to carry the Mend tag must never be closed by this tool.
+    """
+    found = {}
+    for entry_dict in exist_wis:
+        for title, entry in try_or_error(lambda: list(entry_dict.items()), []):
+            wid, meta = try_or_error(lambda: list(entry.items())[0], (None, None))
+            if wid is None or not isinstance(meta, dict):
+                continue
+            if not try_or_error(lambda: project_name.strip().casefold() in
+                                {t.casefold() for t in tag_set(meta.get("tags", ""))}, False):
+                continue
+            key = classify_title(title)
+            if not key:
+                continue
+            candidate = {"id": wid, "state": meta.get("state", "")}
+            previous = found.get(key)
+            if previous is None:
+                found[key] = candidate
+                continue
+            # Two live work items for one key. The winner is the LOWEST id, so the
+            # choice is deterministic across runs rather than "whichever the cache listed last".
+            # The loser is left alone -- we cannot tell which is canonical, and closing the wrong
+            # one destroys a record an operator may be using. Leaving it open is today's
+            # behaviour, so this is not a regression.
+            keep, drop = sorted([previous, candidate],
+                                key=lambda item: try_or_error(lambda: int(item["id"]),
+                                                              float("inf")))
+            logger.warning(f"Two work items share the key {key} in project "
+                           f"{project_name}: {previous.get('id')} and {candidate.get('id')}. "
+                           f"Reconciling against {keep.get('id')} (the lowest id); "
+                           f"{drop.get('id')} is left untouched -- resolve the duplicate by hand.")
+            found[key] = keep
+    return found
+
+
+def _patch_state(work_item_id, state: str, verb: str):
+    """PATCH System.State and NOTHING else. Returns (ok, unsupported_state).
+
+    `unsupported_state` tells the caller the failure was Azure rejecting the state name, so
+    another candidate is worth trying -- see _apply_state. Every other failure is final.
+
+    Patches the state only, never the description: this path has no enrichment join, so rewriting
+    the description would blank the EPSS and reachability columns.
+    """
+    data = [{"op": "replace", "path": "/fields/System.State", "value": state}]
     try:
-        logger.info("Start to update Mend’s data")
-        first_id = 0
-        executed_wi = 0
-        tag_lic = Tags.get_el_by_name("LICENSE")
-        tag_vul = Tags.get_el_by_name("VULNERABILITY_SCORE")
-        while True:
-            data = {"query": f'select [System.Id] From WorkItems Where '
-                             f'[System.ChangedDate] > "{get_lastrun(conf.utc_delta, conf.reset)}" And '
-                             f'[System.TeamProject] = "{conf.azure_project}" And [System.Id] > {first_id} '
-                             f'AND (([System.Tags] CONTAINS "{tag_lic}") or ([System.Tags] CONTAINS "{tag_vul}")) '
-                             f'And [System.State] <> "Removed" AND [System.State] <> "Deleted" '
-                             f'ORDER BY [System.Id]'}
-            r, errocode = call_azure_api(api_type="POST", api="wit/wiql", version="7.0", project=conf.azure_project,
-                                         data=data, header="application/json",
-                                         cmd_type=f"?timePrecision=True&$top={max_wi}&")
-            results_wi = r["workItems"] if errocode == 0 else []
-            if not results_wi:
-                break
-            id_str = ""
-            for pos_number, wi_ in enumerate(results_wi):
-                id_str += str(wi_["id"]) + ","
-            first_id = try_or_error(lambda: wi_["id"], 0)
-            id_str = id_str[:-1] if results_wi else ""
+        response, errorcode = call_azure_api(api_type="PATCH", api=f"wit/workitems/{work_item_id}",
+                                             data=data, project=conf.azure_project)
+        if errorcode != 0:
+            unsupported = bool(_UNSUPPORTED_STATE.search(str(response)))
+            if unsupported:
+                # Not an error yet: the caller has another candidate to try. DEBUG, so a Scrum
+                # board's one rejected attempt per project does not read as a failure.
+                logger.debug(f"Work item {work_item_id}: state '{state}' is not valid for "
+                             f"this project's process; trying the next known state.")
+            else:
+                logger.error(f"Could not {verb} work item {work_item_id} to state "
+                             f"'{state}': {response}. This one item is left as it was; the run "
+                             f"continues.")
+            return False, unsupported
+        logger.debug(f"Work item {work_item_id} {verb}d ({state})")
+        return True, False
+    except Exception as err:
+        logger.error(f"[{ex()}] Could not {verb} work item {work_item_id}: {err}")
+        return False, False
 
-            if id_str:
-                wi, errcode = call_azure_api(api_type="GET", api=f"wit/workitems?ids={id_str}&$expand=Relations",
-                                             data={}, project=conf.azure_project, cmd_type="&")
-                if errcode == 0:
-                    for wq_el in wi['value']:
-                        issue_id = wq_el['id']
-                        issue_wi_title = wq_el['fields']['System.Title']
-                        if list(set(try_or_error(lambda: wq_el['fields']['System.Tags'], "").split(";")) &
-                                {f"{tag_vul}", f"{tag_lic}"}) or \
-                            list(set(try_or_error(lambda: wq_el['fields']['System.Tags'], "").split(";")) &
-                                 {f" {tag_vul}", f" {tag_lic}"}):
-                            # If we have completely another task in the same Azure Project then just pass it
-                            # Now Vulnerability and License violation are produced only
-                            try:
-                                uuid = ""
-                                prj_token = ""
-                                for wq_el_rel_ in wq_el['relations']:
-                                    if wq_el_rel_['rel'] == "Hyperlink":
-                                        prj_token = try_or_error(lambda: wq_el_rel_['attributes']['comment'].split(",")[0], "")
-                                        uuid = try_or_error(lambda: wq_el_rel_['attributes']['comment'].split(",")[1], "")
 
-                                wq_el_url = wq_el['url'][0:wq_el['url'].find("apis")] + f"workitems/edit/{issue_id}"
-                                ext_issues = [{"identifier": f"{issue_wi_title}",
-                                               "url": wq_el_url,
-                                               "status": wq_el['fields']['System.State'],
-                                               "lastModified": wq_el['fields']['System.ChangedDate'],
-                                               "created": wq_el['fields']['System.CreatedDate']
-                                               }]
-                                try:
-                                    if uuid and prj_token:
-                                        data = json.dumps(
-                                            {"requestType": "updateExternalIntegrationIssues",
-                                             "userKey": conf.ws_user_key,
-                                             "orgToken": conf.ws_org_token,
-                                             "projectToken": prj_token,
-                                             "wsPolicyIssueItemUuid": uuid,
-                                             "externalIssues": ext_issues
-                                             })
-                                        json.loads(call_ws_api(data=data))
-                                        #logger.info(f"Work item #{issue_id} updated corresponded to Mend's data successfully.")
-                                except Exception as err:
-                                    logger.error(f"[{ex()}] Work item #{issue_id} update Mend's data failed: {err}")
-                                    global_errors += 1
-                                executed_wi += 1
-                            except Exception as err:
-                                pass
-        return f"Updated {executed_wi} corresponded Mend's item(s)"
+# The closed/reopen states of Azure DevOps's four out-of-box processes. One global
+# MEND_CLOSEDSTATE cannot serve an organization running two boards on different processes, which
+# Azure rejects with "The field 'State' contains the value 'Closed' that is not in the list of
+# supported values".
+#
+#   | Process | States                                | Closed | Reopen   |
+#   | Agile   | New / Active / Resolved / Closed      | Closed | New      |
+#   | CMMI    | Proposed / Active / Resolved / Closed | Closed | Proposed |
+#   | Scrum   | New / Approved / Committed / Done     | Done   | New      |
+#   | Scrum   | To Do / In Progress / Done   (Task)   | Done   | To Do    |
+#   | Basic   | To Do / Doing / Done                  | Done   | To Do    |
+#
+# So closure needs only two values and reopen three -- no state-discovery API call. A DERIVED
+# process that renames the state is the operator's job to declare via MEND_CLOSEDSTATE /
+# MEND_REOPENSTATE, and an explicit value is then used ALONE: never followed by a fallback guess,
+# because an operator who says "Retired" did not ask for "Closed".
+CLOSED_STATE_CANDIDATES = ("Closed", "Done")
+REOPEN_STATE_CANDIDATES = ("New", "To Do", "Proposed")
+
+# {(azure_project, verb): the state Azure accepted}. A Scrum board pays ONE rejected PATCH on its
+# first closed item and none afterwards; without it, every closed item in every run pays one.
+# Keyed by project because MEND_ROUTING sends different Mend projects to different Azure projects,
+# which can sit on different processes; one global answer would apply Scrum's state to an Agile
+# board.
+STATE_RESOLVED = {}
+
+# The one error meaning "wrong state name, try another". A refused transition or a missing
+# required field is also a 400, and retrying those would issue a second bad write against a work
+# item whose state name is legal.
+_UNSUPPORTED_STATE = re.compile(r"not in the list of supported values", re.IGNORECASE)
+
+
+def state_candidates(configured, defaults) -> list:
+    """A configured state -> the ordered list of values to try.
+
+    Unset, blank, or an unexpanded Azure placeholder ("$(MEND_CLOSEDSTATE)", which
+    Config.update_properties normally blanks) yields every default candidate in order.
+
+    An explicit value is returned ALONE -- what an operator lists is what gets tried, never
+    extended with the defaults. It may be a COMMA-SEPARATED list, tried in order, which is what
+    makes one global variable serve a MIXED fleet: with a derived board wanting "Retired" and an
+    Agile board wanting "Closed", neither "" nor "Retired" alone can satisfy both, but
+    "Retired,Closed" does. Same convention MEND_BRANCHES uses.
+
+    Empty entries are dropped -- Azure rejects an empty System.State, so a trailing comma must not
+    become an attempt -- and duplicates are collapsed case-insensitively, keeping first position,
+    because a repeat is only a second rejected write.
+    """
+    text = str(configured or "").strip()
+    if not text or re.match(r"^\$\(.+\)$", text):
+        return list(defaults)
+    states, seen = [], set()
+    for part in text.split(","):
+        name = part.strip()
+        if not name or name.casefold() in seen:
+            continue
+        seen.add(name.casefold())
+        states.append(name)
+    # Nothing but separators is as good as unset; falling back beats sending nothing to Azure.
+    return states or list(defaults)
+
+
+def closed_state_candidates() -> list:
+    """MEND_CLOSEDSTATE -> the states closure may try, in order."""
+    return state_candidates(getattr(conf, "closed_state", ""), CLOSED_STATE_CANDIDATES)
+
+
+def reopen_state_candidates() -> list:
+    """MEND_REOPENSTATE -> the states reopen may try, in order.
+
+    Three candidates, not two: Scrum uses "New" for a Product Backlog Item but "To Do" for a Task,
+    so the same process needs both depending on MEND_AZURETYPE.
+    """
+    return state_candidates(getattr(conf, "reopen_state", ""), REOPEN_STATE_CANDIDATES)
+
+
+def _apply_state(work_item_id, states, verb: str, env_var: str) -> bool:
+    """PATCH the first state Azure accepts, remembering the winner for this project.
+
+    `states` is a list of candidates or a single string (a bare string keeps the old
+    one-attempt-no-fallback behaviour, which is what an explicit MEND_CLOSEDSTATE resolves to).
+
+    Only an unsupported-state 400 advances to the next candidate -- see _UNSUPPORTED_STATE. Any
+    other failure returns immediately, so one bad work item never triggers a sweep of guesses.
+    """
+    candidates = [states] if isinstance(states, str) else list(states)
+    if not candidates:
+        return False
+    cache_key = (getattr(conf, "azure_project", ""), verb)
+    remembered = STATE_RESOLVED.get(cache_key)
+    if remembered in candidates:
+        # Try the known-good one first, but keep the rest: a project can be reconfigured mid-life.
+        candidates = [remembered] + [c for c in candidates if c != remembered]
+
+    for state in candidates:
+        ok, unsupported = _patch_state(work_item_id, state, verb)
+        if ok:
+            STATE_RESOLVED[cache_key] = state
+            return True
+        if not unsupported:
+            return False
+    # The Azure PROJECT is in the message deliberately: at 107 projects, "work item 8118" alone
+    # makes an operator go and look up which board they need to reconfigure.
+    logger.error(f"Could not {verb} work item {work_item_id} in Azure project "
+                 f"'{getattr(conf, 'azure_project', '')}' (work item type "
+                 f"'{getattr(conf, 'azure_type', '')}'): Azure rejected every state this process "
+                 f"is known to use ({', '.join(candidates)}). If this board runs a derived process "
+                 f"with a renamed state, set {env_var} to it. This one item is left as it was; the "
+                 f"run continues.")
+    return False
+
+
+def apply_close(work_item_id, state) -> bool:
+    return _apply_state(work_item_id, state, "close", "MEND_CLOSEDSTATE")
+
+
+def apply_reopen(work_item_id, state) -> bool:
+    return _apply_state(work_item_id, state, "reopen", "MEND_REOPENSTATE")
+
+
+def per_cve_mode() -> bool:
+    """MEND_DEPENDENCY=false -- one work item per CVE instead of one per library.
+
+    The ONE place conf.dependency is turned into a boolean, so grouping (fetch_v3_desired),
+    rendering (render_entry_v3) and matching (write_wi_v3) can never disagree about which mode
+    the run is in. Disagreement means the key `desired` is built on is not the key closure
+    decodes, and reconciliation then closes every work item in the project.
+
+    Config.update_properties defaults an unset MEND_DEPENDENCY to "True", so anything that is not
+    "true" is per-CVE -- the same test render_entry_v3 has always applied.
+    """
+    return str(getattr(conf, "dependency", "")).lower() != "true"
+
+
+def dep_paths_enabled() -> bool:
+    """MEND_DEPPATHS -- kill switch for attach_library_paths' /paths fetch, default ON.
+
+    The ONE place conf.dep_paths is turned into a boolean, the same pattern as per_cve_mode:
+    attach_library_paths reads this directly rather than each call site re-deriving it.
+
+    Only an explicit false-y value ("false"/"no"/"0", case-insensitive) turns it off. Unset,
+    blank, or an unexpanded Azure placeholder ("$(MEND_DEPPATHS)") all mean "fetch them" --
+    anything other than an explicit false value, so a typo cannot silently disable the feature
+    (the same rule verify_setting applies to MEND_SSLVERIFY).
+    """
+    raw = str(getattr(conf, "dep_paths", "") or "").strip().lower()
+    return raw not in ("false", "no", "0")
+
+
+_library_paths_pool_size_cache = None
+
+
+def reset_library_paths_pool_size_cache():
+    """Drop the memoised MEND_DEPPATHS_CONCURRENCY resolution -- called once per run (alongside
+    the other library_paths_* run-scoped resets in run_sync) so a fresh run re-reads `conf`, and
+    by tests that need library_paths_pool_size() to see a new conf mid-test."""
+    global _library_paths_pool_size_cache
+    _library_paths_pool_size_cache = None
+
+
+def library_paths_pool_size() -> int:
+    """MEND_DEPPATHS_CONCURRENCY -> the ThreadPoolExecutor width for the batch /paths fetch.
+
+    The ONE place conf.dep_paths_concurrency is turned into a number -- the same one-place
+    pattern as per_cve_mode and verify_setting, so nothing else in the codebase re-parses it.
+    Resolved once and memoised for the run: `_fetch_paths_batch` runs once per project (up to
+    107 times in a real org), and a misconfigured value must log its fallback WARNING once, not
+    once per project.
+
+    Unset, blank, or an unexpanded placeholder defaults to LIBRARY_PATHS_POOL_SIZE (16, the
+    value the brief specifies). A non-numeric value, a negative value, or exactly `0` is a config
+    mistake rather than a request for a serial or degenerate pool -- each falls back to the same
+    default, and each is logged at WARNING so a typo in a pipeline variable is visible instead of
+    silently changing performance. A value above LIBRARY_PATHS_POOL_SIZE_MAX is clamped down to
+    it rather than rejected, so pasting an unreasonably large number gets a safe upper bound
+    instead of an error. `1` is returned exactly as given -- it makes the fetch genuinely serial
+    and is a useful escape hatch while diagnosing, exercising the same batch code path as any
+    other pool size rather than a special case.
+    """
+    global _library_paths_pool_size_cache
+    if _library_paths_pool_size_cache is not None:
+        return _library_paths_pool_size_cache
+    raw = str(getattr(conf, "dep_paths_concurrency", "") or "").strip()
+    if not raw or re.match(r"^\$\(.+\)$", raw):
+        value = LIBRARY_PATHS_POOL_SIZE
+    else:
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(f"MEND_DEPPATHS_CONCURRENCY={raw!r} is not a whole number; "
+                           f"using the default of {LIBRARY_PATHS_POOL_SIZE}.")
+            parsed = None
+        if parsed is None:
+            value = LIBRARY_PATHS_POOL_SIZE
+        elif parsed <= 0:
+            logger.warning(f"MEND_DEPPATHS_CONCURRENCY={raw!r} must be a positive "
+                           f"integer; using the default of {LIBRARY_PATHS_POOL_SIZE}.")
+            value = LIBRARY_PATHS_POOL_SIZE
+        elif parsed > LIBRARY_PATHS_POOL_SIZE_MAX:
+            logger.warning(f"MEND_DEPPATHS_CONCURRENCY={raw!r} exceeds the maximum of "
+                           f"{LIBRARY_PATHS_POOL_SIZE_MAX}; clamping to it.")
+            value = LIBRARY_PATHS_POOL_SIZE_MAX
+        else:
+            value = parsed
+    _library_paths_pool_size_cache = value
+    return value
+
+
+def run_severity_floor() -> float:
+    """The ONE severity floor for this run -- the shared accessor creation and closure both read.
+
+    MEND_SEVERITY now decides which findings earn a work item AND which findings hold one open.
+    Those two answers MUST come from the same number: if creation filters at 7.0 and closure at
+    0.0 (or the reverse) every work item between the two thresholds is created, immediately
+    closed, and re-created on the next run -- flapping forever. Never call severity_floor() on
+    conf directly from the run path; call this.
+    """
+    return severity_floor(getattr(conf, "severity", ""))
+
+
+def reconcile_project(project, floor=None, desired=None, ok=None):
+    """Reconcile ONE Mend project against Azure. Returns (created, updated, closed, reopened,
+    skipped).
+
+    CREATE and UPDATE are counted and reported but deliberately NOT executed here: creation is
+    create_wi_v3's job, and sync_project_v3 runs the two halves in order off ONE 3.0 read at ONE
+    severity floor. This function is only the closure half.
+
+    The closure interlock: on ok=False from fetch_v3_desired nothing is closed. An incomplete read
+    is indistinguishable from a project whose findings were all remediated, and acting on that at
+    scale is a mass-closure event. REOPEN still runs, since it cannot destroy anything.
+
+    SKIP makes no API call at all: see reconcile.plan_actions.
+
+    `floor` defaults to run_severity_floor(), the same accessor the creation path reads.
+    sync_project_v3 passes the floor it created with, together with the `desired`/`ok` pair it
+    created from, so creation and closure decide on one snapshot at one threshold. A differing
+    floor here would make every work item between the two thresholds created, closed and
+    re-created every run.
+    """
+    project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
+    # Candidate LISTS, not single states: Azure's four out-of-box processes disagree about what
+    # "closed" is called, and an unset MEND_CLOSEDSTATE must work on all of them. An explicit
+    # value resolves to a one-item list and is never second-guessed.
+    closed_state = closed_state_candidates()
+    reopen_state = reopen_state_candidates()
+    if floor is None:
+        floor = run_severity_floor()
+
+    # `actual` is read from the exist_wis cache. When sync_project_v3 calls this it has already
+    # written this project's work items, so entries it just created/updated are present with the
+    # state Azure returned on the write. That is safe in one direction only: everything written
+    # this run came FROM `desired`, so nothing written can be missing from `desired` and be
+    # closed. A write whose response carried no state caches "" -- read as "not closed", which
+    # can only miss a reopen, never cause a close.
+    actual = actual_work_items(project_name)
+    if desired is None or ok is None:
+        # Standalone call (no caller-supplied snapshot): read it here, at the SAME floor.
+        desired, ok = fetch_v3_desired(project.get("uuid", ""), floor)
+
+    if not ok:
+        logger.warning(f"The Mend read for project {project_name} was incomplete. "
+                       f"Closures are SKIPPED for this project -- a partial read looks exactly "
+                       f"like a project whose findings were all remediated, and closing on it "
+                       f"would be a mass-closure. Reopens and the rest of the run continue.")
+
+    # Key-space interlock. `actual` keys are decoded from work item titles; `desired` keys come
+    # from 3.0 component.name / originName. If those two spellings differ at all, every `actual`
+    # key misses and every work item in the project would be closed. Both sides non-empty with
+    # zero overlap is not a fully remediated project: that case has an empty `desired`, and its
+    # closures must still run.
+    if desired and actual and not (set(desired) & set(actual)):
+        logger.error(f"Suspected key-space mismatch in project {project_name}: "
+                     f"{len(desired)} Mend finding(s) and {len(actual)} work item(s), and NOT "
+                     f"ONE key in common. Closures are SKIPPED for this project. Example Mend "
+                     f"keys: {sorted(map(str, desired))[:2]}. Example work item keys: "
+                     f"{sorted(map(str, actual))[:2]}. If those two spellings differ, that is "
+                     f"the bug -- not a remediated project.")
+        ok = False
+
+    created = updated = closed = reopened = skipped = 0
+    for action in plan_actions(desired, actual, closed_state):
+        verb = action.get("action")
+        if verb == CREATE:
+            created += 1
+        elif verb == UPDATE:
+            updated += 1
+        elif verb == REOPEN:
+            if apply_reopen(action.get("id"), reopen_state):
+                reopened += 1
+        elif verb == CLOSE:
+            if not ok:
+                continue
+            if apply_close(action.get("id"), closed_state):
+                closed += 1
+        elif verb == SKIP:
+            skipped += 1
+
+    logger.info(f"Reconciled {project_name}: {created} to create, {updated} to update "
+                f"(neither is executed on this path), {closed} closed, {reopened} reopened, "
+                f"{skipped} already closed and skipped.")
+    return created, updated, closed, reopened, skipped
+
+
+def reconcile_after_sync():
+    """Close work items whose Mend findings are gone, for every project synced this run.
+
+    Runs AFTER the forward sync, off `synced_projects` -- the (prj_token, "Product/Project",
+    azure_project) tuples sync_project_v3 appends. That third element is the join that makes this
+    routing-safe: run_sync_routed re-points conf.azure_project per target, so the Azure project a
+    Mend project was written to is the only one its work items may be closed in.
+    """
+    global conf, global_errors
+    conf = startup() if not conf else conf
+    conf.update_properties()
+    logger.info(f"Reconciliation starting for {len(synced_projects)} synced "
+                f"project(s): work items whose Mend finding is gone move to MEND_CLOSEDSTATE, "
+                f"and items whose finding came back move to MEND_REOPENSTATE.")
+
+    original_azure_project = conf.azure_project
+    try:
+        projects, ok = fetch_v3_projects()
+        if not ok:
+            logger.error(f"Could not read the Mend project list. NOTHING is closed this "
+                         f"run: a partial list makes a project we simply failed to read look "
+                         f"exactly like one whose findings are all gone.")
+            return
+
+        lookup = {}
+        for project in projects or []:
+            key = f"{project.get('application_name', '')}/{project.get('name', '')}".casefold()
+            lookup[key] = project
+
+        closed = reopened = skipped = matched = unmatched = 0
+        for prj_token, product_project, azure_project in list(synced_projects):
+            project = lookup.get(str(product_project).casefold())
+            if not project:
+                unmatched += 1
+                logger.warning(f"Mend project '{product_project}' was synced this run "
+                               f"but is not in the Mend 3.0 project list. It is SKIPPED -- "
+                               f"guessing which 3.0 project it is could close work items "
+                               f"belonging to a different project.")
+                continue
+            try:
+                # Per-project Azure target, restored afterwards. Leaking one project's target
+                # into the next closes work items in the wrong Azure project.
+                conf.azure_project = azure_project
+                _, _, prj_closed, prj_reopened, prj_skipped = reconcile_project(project)
+                closed += prj_closed
+                reopened += prj_reopened
+                skipped += prj_skipped
+                matched += 1
+            except Exception as err:
+                global_errors += 1
+                logger.error(f"[{ex()}] Reconciliation failed for '{product_project}': {err}. "
+                             f"The remaining projects are still reconciled.")
+            finally:
+                conf.azure_project = original_azure_project
+
+        logger.info(f"Reconciliation summary: {closed} work item(s) closed, "
+                    f"{reopened} reopened, {skipped} already closed and skipped; "
+                    f"{matched} project(s) reconciled, {unmatched} unmatched and skipped.")
     except Exception as err:
         global_errors += 1
-        return f"[{ex()}] Update Mend's data failed: {err}"
+        logger.error(f"[{ex()}] Reconciliation did not complete: {err}. The forward sync that "
+                     f"already succeeded is unaffected.")
+    finally:
+        conf.azure_project = original_azure_project
 
 
-def create_wi(prj_token: str, sdate: str, edate: str, cstm_flds: list, wi_type: str):
-    def dep_hierarchy(key_uuid):
-        def get_dependencies(dependencies):
-            res = []
-            for dependency in dependencies:
-                res.append(dependency['fileName'])
-                if 'dependencies' in dependency:
-                    nested_dependencies = dependency['dependencies']
-                    get_dependencies(nested_dependencies)
-            return res
+# The work item rendering helpers below are module level so create_wi_v3 reuses one set of
+# renderers; two implementations of a work item description would drift.
 
-        data = json.dumps({
-            "requestType": "getProjectLibraryDependencies",
-            "userKey": conf.ws_user_key,
-            "projectToken": prj_token,
-            "keyUuid": key_uuid
-        })
-        deps = json.loads(call_ws_api(data=data))
+
+def set_priority(value: float):
+    score = [70, 55, 40]  # Mend gradation of SCC scores
+    z = value * 10
+    i = 0
+    for i, sc_ in enumerate(score):
+        if z // sc_ == 1:
+            break
+    return i + 1
+
+
+def mend_val(alert_val: str, prj_el: list):
+    temp = None
+    for lst_ in alert_val.split("."):
         try:
-            errcode = deps["errorCode"]
-            return []
-        except:
-            return get_dependencies(dependencies=try_or_error(lambda: deps["dependencies"][0],
-                                                              try_or_error(lambda: deps["dependencies"], [])))
+            temp = try_or_error(lambda: temp[lst_], "No content") if temp is not None else prj_el[lst_]
+            if type(temp) is list:
+                rs = ""
+                for el_ in temp:
+                    if type(el_) is str:
+                        rs += el_ + ","
+                    elif type(el_) is dict:
+                        temp = el_
+                    elif type(el_) is list:
+                        temp = temp[0]  # Take just first element
+                        break
+                if rs:
+                    return rs[:-1]
+        except Exception as err:
+            logger.error(f"[{ex()}] Custom field parsing failed: {err}")
+            return ""
+    return temp
 
-    def get_prj_licenses():
-        data = json.dumps({
-            "requestType": "getProjectLicenses",
-            "userKey": conf.ws_user_key,
-            "projectToken": prj_token
-        })
-        return json.loads(call_ws_api(data=data))
 
-    def get_lib_locations():
-        data = json.dumps({
-            "requestType": "getProjectLibraryLocations",
-            "userKey": conf.ws_user_key,
-            "projectToken": prj_token
-        })
-        return json.loads(call_ws_api(data=data))
-
-    def get_lib_lic(key_uuid):
-        for lib_lic_ in prj_licenses['libraries']:
-            if lib_lic_['keyUuid'] == key_uuid:
-                lib_lic_licenses = try_or_error(lambda: lib_lic_['licenses'], [])
-                lib_lic_data = []
-                for lib_lic_licenses_ in lib_lic_licenses:
-                    lib_lic_data.append((try_or_error(lambda: lib_lic_licenses_['references'][0]['reference'], ""),
-                                         try_or_error(lambda: lib_lic_licenses_["name"], ""),
-                                         try_or_error(lambda: lib_lic_licenses_["url"], "")))
-                return try_or_error(lambda: lib_lic_['description'], ""), \
-                       try_or_error(lambda: lib_lic_['references']['url'], ""), \
-                       lib_lic_data, \
-                       try_or_error(lambda: "Direct" if lib_lic_['directDependency'] else "Transitive", "Direct")
-        return "", "", [("","","")], "Direct"
-
-    def get_pathes(keyuuid_):
-        for location_ in prj_lib_locations['libraryLocations']:
-            if location_['keyUuid'] == keyuuid_:
-                return try_or_error(lambda: location_['locations'][0]['dependencyFile'], ""), \
-                       try_or_error(lambda: location_['locations'][0]['path'], "")
-        return "", ""
-
-    def set_priority(value: float):
-        score = [70, 55, 40]  # Mend gradation of SCC scores
-        z = value * 10
-        i = 0
-        for i, sc_ in enumerate(score):
-            if z // sc_ == 1:
-                break
-        return i + 1
-
-    def analyze_fields(fld: dict, prj: list):
-        val = ""
-        if fld["defaultValue"]:
-            step1 = fld["defaultValue"].split("&")
-            for st_ in step1:
-                t = f"{mend_val(st_[5:], prj)}" if "MEND:" in st_ else st_
-                if t:
-                    if t.startswith("$"):
-                        dict_env_val = conf.conf_json()
-                        env_val = t[1:].strip()
-                        for var_ in varenvs:
-                            if env_val in var_.value:
-                                var_name = var_.name
-                                break
-                        t = try_or_error(lambda: dict_env_val[var_name], "")
-                    val += t
-                elif "MEND:" in st_:
-                    logger.warning(f"The field '{fld['referenceName']}' is empty. "
-                                   f"Check the MEND_CUSTOMFIELDS syntax.")
-        return fld["referenceName"], val.strip()
-
-    def mend_val(alert_val: str, prj_el: list):
-        temp = None
-        for lst_ in alert_val.split("."):
-            try:
-                temp = try_or_error(lambda: temp[lst_], "No content") if temp is not None else prj_el[lst_]
-                if type(temp) is list:
-                    rs = ""
-                    for el_ in temp:
-                        if type(el_) is str:
-                            rs += el_ + ","
-                        elif type(el_) is dict:
-                            temp = el_
-                        elif type(el_) is list:
-                            temp = temp[0]  # Take just first element
+def analyze_fields(fld: dict, prj: list):
+    val = ""
+    if fld["defaultValue"]:
+        step1 = fld["defaultValue"].split("&")
+        for st_ in step1:
+            t = f"{mend_val(st_[5:], prj)}" if "MEND:" in st_ else st_
+            if t:
+                if t.startswith("$"):
+                    dict_env_val = conf.conf_json()
+                    env_val = t[1:].strip()
+                    # Reset per '&'-delimited part: a part naming an unknown variable would
+                    # otherwise leak the previous part's var_name and duplicate its value, which
+                    # can be $MEND_USERKEY. An unmatched part resolves to "".
+                    var_name = ""
+                    for var_ in varenvs:
+                        if env_val in var_.value:
+                            var_name = var_.name
                             break
-                    if rs:
-                        return rs[:-1]
-            except Exception as err:
-                logger.error(f"[{ex()}] Custom field parsing failed: {err}")
-                return ""
-        return temp
+                    t = try_or_error(lambda: dict_env_val[var_name], "")
+                val += t
+            elif "MEND:" in st_:
+                logger.warning(f"The field '{fld['referenceName']}' is empty. "
+                               f"Check the MEND_CUSTOMFIELDS syntax.")
+    return fld["referenceName"], val.strip()
 
-    def field_name_in_data(fld_name: str):  # Don't need to add existing element to data
-        res = False
-        for el_ in data:
-            if fld_name in el_["path"]:
-                res = True
-                break
-        return res
 
-    def create_area(area):
-        areas = area.split("\\")
-        if areas[0] != conf.azure_project:
-            areas.insert(0, conf.azure_project)
-            conf.azure_area = f"{conf.azure_project}\\{conf.azure_area}"
-        res = {}
-        for i, area_ in enumerate(areas):
-            data = {
-                'name': area_,
-            }
-            if i == 1:
-                res, errcode = call_azure_api(api_type="POST", api=f"wit/classificationnodes/areas", data=data,
-                                     project=conf.azure_project, header="application/json")
-            elif 1 < i < len(areas):
-                res, errcode = call_azure_api(api_type="POST", api=f"wit/classificationnodes/areas/{under}", data=data,
-                                     project=conf.azure_project, header="application/json")
-            under = f"{under}/{area_}" if i > 1 else area_
-        return res
+def create_area(area):
+    areas = area.split("\\")
+    if areas[0] != conf.azure_project:
+        areas.insert(0, conf.azure_project)
+        conf.azure_area = f"{conf.azure_project}\\{conf.azure_area}"
+    res = {}
+    for i, area_ in enumerate(areas):
+        data = {
+            'name': area_,
+        }
+        if i == 1:
+            res, errcode = call_azure_api(api_type="POST", api=f"wit/classificationnodes/areas", data=data,
+                                 project=conf.azure_project, header="application/json")
+        elif 1 < i < len(areas):
+            res, errcode = call_azure_api(api_type="POST", api=f"wit/classificationnodes/areas/{under}", data=data,
+                                 project=conf.azure_project, header="application/json")
+        under = f"{under}/{area_}" if i > 1 else area_
+    return res
 
-    def create_html_table(data):
-        table_html = "<table style='border-collapse: collapse; table-layout: auto'>\n"  # Start of the table HTML with styles
 
-        # Create the table header row
+def esc(value) -> str:
+    """A Mend-supplied value, made safe to drop into a description.
+
+    NOT cosmetic. A CVE description reading "<2.0.1, >=3.0.0 <4.0.1. A type confusion ..." was
+    confirmed live to come back from Azure DevOps with that whole sentence DELETED: its parser
+    read "<2.0.1, >" as a tag, dropped it, then ate from "<4.0.1" to the next ">". Version ranges
+    and enrichment.EPSS_BELOW_ONE ("<1%") make that common, so operators were reading truncated
+    vulnerability descriptions.
+
+    quote=True because every attribute this tool writes is single-quoted: an apostrophe in a URL
+    or a license name would otherwise close the attribute early and hand Azure broken markup.
+
+    Only DATA is escaped, never the markup built around it -- see generate_expandable_section,
+    whose summary is markup at one call site and data at another.
+    """
+    return escape(str(value if value is not None else ""), quote=True)
+
+
+def create_html_table(data):
+    table_html = "<table style='border-collapse: collapse; table-layout: auto'>\n"  # Start of the table HTML with styles
+
+    # Create the table header row
+    table_html += "<tr>"
+    for header in data[0].keys():
+        if header != "URL":
+            table_html += f"<th style='border: 1px solid black; padding: 5px;'><b>{esc(header)}</b></th>"
+    table_html += "</tr>\n"
+
+    # Create the table data rows
+    for row in data:
         table_html += "<tr>"
-        for header in data[0].keys():
-            if header != "URL":
-                table_html += f"<th style='border: 1px solid black; padding: 5px;'><b>{header}</b></th>"
+        for j, value in enumerate(row.values()):
+            if j == 0:
+                url_ = esc(row["URL"])
+                table_html += f"<td style='border: 1px solid black; padding: 5px;'><a href='{url_}'>{esc(value)}</a></td>"
+            elif j < len(row.values()) - 1:
+                table_html += f"<td style='border: 1px solid black; padding: 5px;'>{esc(value)}</td>"
+
         table_html += "</tr>\n"
 
-        # Create the table data rows
-        for row in data:
-            table_html += "<tr>"
-            for j, value in enumerate(row.values()):
-                if j == 0:
-                    url_ = row["URL"]
-                    table_html += f"<td style='border: 1px solid black; padding: 5px;'><a href='{url_}'>{value}</a></td>"
-                elif j < len(row.values()) - 1:
-                    table_html += f"<td style='border: 1px solid black; padding: 5px;'>{value}</td>"
+    table_html += "</table>"  # End of the table HTML
 
-            table_html += "</tr>\n"
+    return table_html
 
-        table_html += "</table>"  # End of the table HTML
 
-        return table_html
+def generate_expandable_section(summary, detail):
+    html = f"<details>\n"
+    html += f"  <summary>{summary}</summary>\n"
+    html += f"  <p>{detail}</p>\n"
+    html += f"</details>"
+    return html
 
-    def find_parent_chain(key_uuid, libraries):
-        # Helper function to recursively find the parent chain
-        def find_parent_recursively(child_uuid, libraries, chain):
-            for library in libraries:
-                if 'dependencies' in library:
-                    for dependency in library['dependencies']:
-                        if dependency['keyUuid'] == child_uuid:
-                            chain.append(library)
-                            find_parent_recursively(library['keyUuid'], libraries, chain)
-                            break
 
-        parent_chain = []
-        find_parent_recursively(key_uuid, libraries, parent_chain)
-        return parent_chain
+def generate_html_bulleted_list(items):
+    # Items are always data (the dependency hierarchy), so escaping belongs here.
+    html = "<ul>\n"
+    for item in items:
+        html += f"  <li>{esc(item)}</li>\n"
+    html += "</ul>"
+    return html
 
-    def get_prj_lib_hierarchy():
-        data = json.dumps({
-            "requestType": "getProjectHierarchy",
-            "userKey": conf.ws_user_key,
-            "projectToken": prj_token
-        })
-        return json.loads(call_ws_api(data=data))
 
-    def generate_expandable_section(summary, detail):
-        html = f"<details>\n"
-        html += f"  <summary>{summary}</summary>\n"
-        html += f"  <p>{detail}</p>\n"
-        html += f"</details>"
-        return html
+def _nested_list_node(path, index, leaf_label, indent):
+    """One <li> of a single root->leaf chain, recursing one level per remaining hop.
 
-    def get_field_ref(fld_name):
-        for c_fld_ in cstm_flds:
-            if fld_name == c_fld_["name"]:
-                return f"/fields/{c_fld_['referenceName']}"
-        return f"/fields/Custom.{fld_name}"
+    The root (index 0) is always suffixed " (Root Library)"; the leaf (the last index) is
+    suffixed " ({leaf_label})" only when leaf_label is non-empty. A single-node path is both
+    root and leaf at once, and the root label wins -- never both on one node.
+    """
+    pad = "  " * indent
+    name = esc(path[index])
+    is_leaf = index == len(path) - 1
+    if index == 0:
+        name += " (Root Library)"
+    elif is_leaf and leaf_label:
+        name += f" ({leaf_label})"
+    if is_leaf:
+        return f"{pad}<li>{name}</li>\n"
+    child = _nested_list_node(path, index + 1, leaf_label, indent + 2)
+    return f"{pad}<li>{name}\n{pad}  <ul>\n{child}{pad}  </ul>\n{pad}</li>\n"
 
-    def create_wi_content(issue_id):
-        global data, count_item, global_errors
-        data = [
-            {
-                "op": azure_operation,
-                "path": "/fields/System.Title",
-                "value": vul_title
-            },
-            {
-                "op": azure_operation,
-                "path": "/fields/Microsoft.VSTS.Common.Priority",
-                "value": priority
-            },
-            {
-                "op": azure_operation,
-                "path": "/fields/System.Tags",
-                "value": ",".join(tags)
-            },
-        ]
-        if conf.description == "Description":
-            desc_field = "/fields/System.Description"
-        elif conf.description == "ReproSteps":
-            desc_field = "/fields/Microsoft.VSTS.TCM.ReproSteps"
-        elif conf.description:
-            desc_field = get_field_ref(conf.description)
+
+def generate_html_nested_list(paths, leaf_label="") -> str:
+    """Root->leaf dependency chains (an entry's `paths`) -> nested <ul>/<li> HTML.
+
+    One <ul> per path, one <li> nested inside the previous for each hop -- a six-hop chain
+    that generate_html_bulleted_list would collapse to one flat bullet instead shows every
+    hop. Several paths render as sibling <ul> blocks, concatenated in retval order, never sorted.
+    Every node name is data from Mend and goes through esc();
+    " (Root Library)" / " ({leaf_label})" are literal text, not escaped.
+
+    [] or None yields "" -- there is nothing to render, not an empty <ul>.
+    """
+    if not paths:
+        return ""
+    html = ""
+    for path in paths:
+        if not path:
+            continue
+        html += "<ul>\n" + _nested_list_node(path, 0, leaf_label, 1) + "</ul>\n"
+    return html
+
+
+def get_field_ref(fld_name, cstm_flds):
+    for c_fld_ in cstm_flds:
+        if fld_name == c_fld_["name"]:
+            return f"/fields/{c_fld_['referenceName']}"
+    return f"/fields/Custom.{fld_name}"
+
+
+def build_wi_tags(project_tag: str, policy_tag: str, routing: str, reponame: str) -> list:
+    # Repo identity is carried as a work item tag, not an Area Path. Taking the values as
+    # arguments keeps this testable without constructing a whole Config.
+    tags = [project_tag, policy_tag]
+    if routing.lower() == "true" and reponame:
+        tags.append(reponame)
+    return tags
+
+
+
+def build_enrich_html_v3(row: dict, reachability_on: bool) -> str:
+    """The enrichment lines spliced into a 3.0 CVE section.
+
+    EPSS and Exploit Code Maturity render unconditionally and have no variable: both values
+    arrive inline with the 3.0 finding at no extra call, so gating them would only buy an operator
+    a missing column.
+
+    MEND_REACHABILITY gates the Reachability line: it is blank for an org that has not enabled
+    reachability analysis, and the toggle spares them a column of dashes.
+    """
+    html = ""
+    if reachability_on:
+        html += f"<br><b>Reachability:</b> {esc(row.get('reachability', ''))}"
+    # EPSS_BELOW_ONE is the literal "<1%", so this one is not hypothetical.
+    html += f"<br><b>EPSS:</b> {esc(row.get('epss', ''))}" \
+            f"<br><b>Exploit Code Maturity:</b> {esc(row.get('maturity', ''))}"
+    return html
+
+
+def remediation_block_v3(remediation: dict) -> str:
+    """The prominent Recommended Fix / Recommended Major Version block, above the CVE table.
+
+    Rendered as an inline-styled table because that is the ONE prominent pattern proven to survive
+    Azure DevOps's HTML sanitiser -- create_html_table has used it in production throughout. A
+    styled <div> or an <h3> is untested here, and this branch has already been bitten twice by
+    assuming Azure keeps what it is sent.
+
+    "" when every value is empty, so a root missing from the index (a partial read) adds nothing
+    rather than an empty box. Each line is omitted individually when its own value is empty.
+    """
+    if not isinstance(remediation, dict):
+        return ""
+    rows = []
+    if remediation.get("fix"):
+        rows.append(("Recommended Fix", remediation["fix"]))
+    if remediation.get("major"):
+        rows.append(("Recommended Major Version", remediation["major"]))
+    if not rows and not remediation.get("note"):
+        return ""
+    cell = "border: 1px solid black; padding: 5px;"
+    html = "<table style='border-collapse: collapse; table-layout: auto'>\n"
+    for label, value in rows:
+        html += f"<tr><td style='{cell}'><b>{label}</b></td>" \
+                f"<td style='{cell}'>{esc(value)}</td></tr>\n"
+    if remediation.get("note"):
+        # No colspan: the attribute is outside the whitelist proven to survive Azure DevOps's
+        # HTML sanitiser (style and href only), and a stripped attribute would leave a one-cell
+        # row that renders ragged. Two cells, the label empty.
+        html += f"<tr><td style='{cell}'></td>" \
+                f"<td style='{cell}'>{esc(remediation['note'])}</td></tr>\n"
+    return html + "</table><br>"
+
+
+def build_license_html_v3(licenses: list, policy_name: str, library_url: str = "") -> str:
+    """The <details> License Details block.
+
+    `licenses` is the list source3.normalise_licenses builds and fetch_v3_desired attaches to
+    every entry ({"name", "url", "reference_file"}).
+
+    License Reference File comes from LicenseReferenceDTO.liabilityReference, the only field 3.0
+    offers for it, so when Mend reports none the line is omitted rather than rendered as an empty
+    link.
+
+    The license name is a link. LicenseReferenceDTO.textUrl is preferred; when Mend publishes none
+    the name links to `library_url`, the library's Mend page, which is where Mend shows this
+    license and the file that evidenced it. Plain text is the last resort.
+    """
+    lic_data = ""
+    for lic_ in licenses or []:
+        ref_ = esc(lic_.get("reference_file", "")) if isinstance(lic_, dict) else ""
+        name_ = esc(lic_.get("name", "")) if isinstance(lic_, dict) else ""
+        url_ = esc(lic_.get("url", "")) if isinstance(lic_, dict) else ""
+        link_ = url_ or esc(library_url)
+        lic_data = lic_data + (f"<a href='{link_}'>{name_}</a>" if link_ else name_) + \
+            (f"<br><b>License Reference File: </b><a href='{ref_}'>{ref_}</a>" if ref_ else "") + \
+            f"<br><b>License Policy Violation - </b>{esc(policy_name)}<br>"
+    return generate_expandable_section("<b>License Details</b>", lic_data)
+
+
+def max_score_v3(rows: list) -> str:
+    """The highest CVSS score across a library's findings, as it appears in the title.
+
+    Returned as the RAW value, not a reformatted float: the title is the match key's carrier and
+    "9.8" must not become "9.80". "" when nothing is scored -- identity.matches_library tolerates
+    an empty score group precisely for this case.
+    """
+    best, best_val = "", None
+    for row in rows or []:
+        raw = row.get("score", "")
+        value = try_or_error(lambda raw=raw: float(raw), None)
+        if value is None:
+            continue
+        if best_val is None or value > best_val:
+            best, best_val = raw, value
+    return best
+
+
+def labelled_line(label: str, value: str) -> str:
+    """A "<br><b>Label</b>value" line, or "" when there is no value.
+
+    Mend can identify a library by filename alone, in which case it reports no path at all -- and
+    a bold label followed by nothing reads to an operator as a broken integration rather than as
+    "Mend does not know". Omitting the whole line is the house rule for every optional field in a
+    description.
+    """
+    return f"<br><b>{label}</b>{value}" if value else ""
+
+
+def vuln_section_v3(row: dict, inputs: dict, reachability_on: bool) -> str:
+    """One CVE's <details> body.
+
+    The library and paths come from the row -- the vulnerable library and its own paths -- and
+    fall back to `inputs` (the work item header) only where the row carries none. Under root
+    grouping the header describes the root, so each section must read its own row. In per-CVE mode
+    the row's library is the header's.
+    """
+    library = row.get("library") or inputs["library"]
+    dependency_file = row.get("dependency_file") or inputs["dependency_file"]
+    library_path = row.get("library_path") or inputs["library_path"]
+    return "<b>Vulnerable Library:</b>" + esc(library) + \
+        labelled_line("Path to dependency file: ", esc(dependency_file)) + \
+        labelled_line("Path to library:", esc(library_path)) + \
+        "<br><b>Vulnerability Details:</b> " + esc(row.get("description", "")) + \
+        "<br><b>Publish Date:</b> " + esc(row.get("publish_date", "")) + \
+        f"<br><b>URL:</b> <a href='{esc(row.get('url', ''))}'>{esc(row.get('name', ''))}</a>" + \
+        "<br><b>CVSS 3 Score Details </b>(" + esc(row.get("score", "")) + ")" + \
+        build_enrich_html_v3(row, reachability_on) + \
+        "<br><b>Suggested Fix:</b> " + esc(row.get("fix_type", "")) + \
+        f"<br><b>Origin:</b> <a href='{esc(row.get('fix_url', ''))}'></a><br>" \
+        f"<b>Release Date:</b> " + esc(row.get("fix_date", "")) + \
+        "<br><b>Fix Resolution:</b> " + esc(row.get("fix_resolution", ""))
+
+
+def library_block_v3(inputs: dict, with_hierarchy: bool, root: bool = False,
+                     leaf_label: str = "") -> str:
+    """The library header block both MEND_DEPENDENCY branches open their description with.
+
+    The path lines and the home page are rendered ONLY when Mend supplied them -- see
+    labelled_line. On a license work item these come from the due-diligence component index
+    (source3.normalise_library_components); on a vulnerability work item, from the finding.
+
+    `leaf_label` is threaded through to generate_html_nested_list: "Vulnerable Library" on a
+    vulnerability item, "" on a license item, where the leaf is not vulnerable. The root-grouping
+    call site passes with_hierarchy=False, so leaf_label is unused there.
+    """
+    # "Root Library" in dependency mode: the item is about the direct dependency an operator can
+    # upgrade, not about the transitive library the CVE is in.
+    block = ("<b>Root Library - </b>" if root else "<b>Library - </b>") + esc(inputs["library"]) + \
+        "<br>" + esc(inputs["description"]) + \
+        labelled_line("Path to dependency file: ", esc(inputs["dependency_file"])) + \
+        labelled_line("Path to library:", esc(inputs["library_path"]))
+    # A root item omits the "Vulnerable Library" line: the root is the library to upgrade, not
+    # the vulnerable one, and the name is already on the line above.
+    if not root:
+        block += "<br><b>Vulnerable Library: </b>" + esc(inputs["library"])
+    if with_hierarchy:
+        if inputs["paths"]:
+            block += "<br><b>Dependency Hierarchy: </b><br>" + \
+                     generate_html_nested_list(inputs["paths"], leaf_label=leaf_label)
+        elif inputs["dependency_type"].strip().lower() != "direct" and inputs["parents"]:
+            # The fallback fires whenever the type is not direct: "transitive" (a /paths call
+            # that failed, since attach_library_paths only sets "paths" for a transitive library
+            # with a known uuid) or "" (unknown, when Mend publishes neither
+            # dependencyContexts[0].isDirect nor component.dependencyType). Only a Direct
+            # dependency gets no line, so an unknown-type item renders its parents here.
+            block += "<br><b>Dependency Hierarchy: </b><br>" + \
+                     generate_html_bulleted_list(items=inputs["parents"])
+        # Else: a direct dependency gets no call and no line. The whole line, heading included,
+        # is omitted per the labelled_line house rule.
+    home = esc(inputs["home_page"])
+    if home:
+        block += f"<br><b> Library home page: </b><a href='{home}'>{home}</a>"
+    return block
+
+
+def render_entry_v3(kind: str, library: str, entry: dict, reachability_on: bool) -> list:
+    """One `desired` entry -> the work items it should produce, as
+    [{"title", "desc", "score", "exact"}, ...].
+
+    Rendering is split out of create_wi_v3 so the HTML and, far more importantly, the TITLES can
+    be tested without an Azure DevOps double.
+
+    Titles are a contract. Every title here must round-trip through classify_title back to the
+    (kind, library) key it was built for, because closure reads Azure by title and closes on the
+    key it decodes. A title that does not round-trip either strands a work item open forever or
+    closes somebody else's.
+
+    "exact" says how the item is matched against what Azure already holds. Only a LICENCE title
+    is matched exactly -- it has no moving parts. A dependency-mode title carries a finding count
+    and a max score and a per-CVE title carries a severity word; all three move on a rescore, so
+    those match on identity instead (identity.matches_library / identity.matches_cve). A per-CVE
+    item also carries "cve", which is what picks the second matcher.
+    """
+    inputs = render_inputs(entry)
+    rows = inputs["vulnerabilities"]
+    licenses = entry.get("licenses") or [] if isinstance(entry, dict) else []
+
+    if kind == "license":
+        desc = library_block_v3(inputs, with_hierarchy=True, leaf_label="") + \
+            build_license_html_v3(licenses, license_policy_name(entry), library_url(entry))
+        return [{"title": license_title(library), "desc": desc, "score": "", "exact": True}]
+
+    if not per_cve_mode():
+        if not rows:
+            return []
+        table_data = []
+        sections = ""
+        for row in rows:
+            # URL must stay the LAST key written: create_html_table renders the first column as
+            # a link to row["URL"] and drops the final cell by position, so any key after URL
+            # vanishes from the table.
+            table_row = {
+                "CVE": row.get("name", ""),
+                "Severity": row.get("severity", ""),
+                "CVSS": row.get("score", ""),
+                "EPSS": row.get("epss", ""),
+                "Exploit": row.get("maturity", ""),
+                # The actually-vulnerable library, per row. Under root grouping one item covers
+                # several, so this column carries information for the first time.
+                "Dependency": row.get("library", ""),
+                # Relative to THIS work item's root, not Mend's global dependencyType: a library
+                # can be direct under one root and transitive under another (body-parser is both
+                # a direct dependency of itself and a transitive one via express), so the verdict
+                # is "Direct" iff the row's library equals the root, else "Transitive" -- always
+                # one or the other, no fallback. Stripped but NOT case-folded: folding could
+                # merge two genuinely distinct library names.
+                "Type": "Direct" if str(row.get("library", "")).strip() ==
+                str(library).strip() else "Transitive",
+                # No "Fixed in": Mend publishes no per-CVE root fix version, and the transitive
+                # library's version is not something an operator can set. Remediation is stated
+                # once, at root level, by remediation_block_v3.
+            }
+            if reachability_on:
+                table_row["Reachability"] = row.get("reachability", "")
+            table_row["URL"] = row.get("url", "")
+            table_data.append(table_row)
+            sections += generate_expandable_section(esc(row.get("name", "")),
+                                                    vuln_section_v3(row, inputs, reachability_on))
+        # len(entry["findings"]) rather than len(rows): the count in the title is the number of
+        # findings the entry holds, and the two are one-to-one by construction (_vulnerabilities
+        # emits exactly one row per finding).
+        count = len(entry.get("findings") or []) if isinstance(entry, dict) else len(rows)
+        max_severity = max_score_v3(rows)
+        title = f"{library}: {count} vulnerabilities (highest severity is {max_severity})"
+        desc = library_block_v3(inputs, with_hierarchy=False, root=True) + "<br>" + \
+            remediation_block_v3(root_remediation(entry.get("root") if isinstance(entry, dict)
+                                                  else {})) + \
+            create_html_table(data=table_data) + "<b>Details:</b><br>" + sections
+        return [{"title": title, "desc": desc, "score": max_severity, "exact": False}]
+
+    items = []
+    for row in rows:
+        vul_name = row.get("name", "")
+        if not vul_name:
+            continue
+        severity = str(row.get("severity", "")).capitalize()
+        desc = library_block_v3(inputs, with_hierarchy=True, leaf_label="Vulnerable Library") + \
+            vuln_section_v3(row, inputs, reachability_on)
+        items.append({"title": f"{vul_name} ({severity}) detected in {library}",
+                      "desc": desc, "score": row.get("score", ""), "exact": False,
+                      "cve": vul_name})
+    return items
+
+
+# The work item state machine. load_wi_json keeps every alwaysRequired field, and System.State
+# is alwaysRequired in most process templates, so it arrives in cstm_flds carrying Azure's DEFAULT
+# ("New", "To Do") -- which an UPDATE would then write over an operator's Active item. State
+# transitions belong to reconciliation (apply_close / apply_reopen, MEND_CLOSEDSTATE /
+# MEND_REOPENSTATE), never to a content update. System.Reason travels with State in the same
+# machine and is excluded with it.
+STATE_FIELDS = ("System.State", "System.Reason")
+
+
+# A tag, and only a tag. "<[^>]*>" would also match a bare "<" in content and eat everything up
+# to the next ">": enrichment.EPSS_BELOW_ONE is the literal "<1%", and Mend descriptions say things
+# like "<=1.2.5 is vulnerable to ...". Azure stores those escaped while this tool sends them raw, so
+# a loose pattern strips a different amount of real text from each side. Requiring a letter or "/"
+# after the "<" separates markup from prose; it is heuristic, and the failure direction is a stray
+# "<b" in prose read as markup.
+_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>|<!--.*?-->", re.DOTALL)
+_URL_RE = re.compile(r"""\b(?:href|src)\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+# An anchor with no visible text. vuln_section_v3's "Origin:" line renders one (a URL and no
+# label), and Azure DevOps drops empty elements when it sanitises stored HTML, so its href never
+# comes back. Its URL is invisible to an operator, so it is dropped from both sides before URLs
+# are collected.
+_EMPTY_ANCHOR_RE = re.compile(r"<a\b[^>]*>\s*</a>", re.IGNORECASE)
+
+
+def canonical_html(value) -> str:
+    """An HTML value reduced to what it SAYS: its visible text, plus every URL in order.
+
+    Azure DevOps does not store HTML byte-for-byte as sent -- it sanitises and reformats it (a
+    wrapping <div>, <br> to <br />, its own whitespace) -- so a raw compare of System.Description
+    reports a change on every work item on every run, and nothing is ever skipped. Confirmed live.
+
+    URLs are kept because a link's target is content: changing where an operator lands is a real
+    change and must not be swallowed by ignoring markup. Everything else about the markup is
+    Azure's business -- including an anchor with no visible text, which is removed first (see
+    _EMPTY_ANCHOR_RE).
+
+    Deliberately regex, not an HTML parser: this compares two strings the tool itself generated
+    against Azure's echo of them, entity-for-entity fidelity is not needed, and it must never
+    raise on the render path. Tags are stripped BEFORE unescaping, so an escaped "&lt;b&gt;" on
+    one side and a real "<b>" on the other do NOT collapse -- that direction reports a change,
+    which is the safe way to be wrong.
+    """
+    text = _EMPTY_ANCHOR_RE.sub(" ", str(value if value is not None else ""))
+    urls = _URL_RE.findall(text)
+    text = _TAG_RE.sub(" ", text)
+    text = unescape(text).replace("\xa0", " ")
+    return " ".join(text.split()) + ("\x00" + "\x00".join(urls) if urls else "")
+
+
+def canonical_divergence(new_val, cur_val, window: int = 60) -> str:
+    """Where two values first differ once canonicalised, as a short "sent ... | azure ..." string.
+
+    For the DEBUG log when a description is rewritten. Naming the field was not enough to diagnose
+    this class of bug: what an operator needs to see is whether the delta is real content (a
+    rescore, a suppressed CVE dropping out) or markup Azure rewrote. Bounded to `window`
+    characters either side so one work item cannot flood a log.
+    """
+    new_c, cur_c = canonical_html(new_val), canonical_html(cur_val)
+    if new_c == cur_c:
+        return ""
+    at = 0
+    for at, (a, b) in enumerate(zip(new_c, cur_c)):
+        if a != b:
+            break
+    else:
+        at = min(len(new_c), len(cur_c))
+    return (f"at char {at}: sent {new_c[at:at + window]!r} | "
+            f"azure {cur_c[at:at + window]!r}")
+
+
+def wi_content_diff(ops: list, fields: dict) -> list:
+    """The fields this run would write that do NOT already hold that value in Azure.
+
+    [] means the PATCH would change nothing. Anything this cannot prove identical counts as a
+    difference -- writing twice is harmless, skipping a real change is not -- and each of those
+    cases names itself in the returned list so a run can say WHY it rewrote a work item:
+      - "{field} (absent)"          Azure's GET did not return the field at all. It omits empty
+                                    fields, which is indistinguishable from a real change.
+      - "{path} (unrecognised op)"  an op that is not a /fields/ write, so nothing to compare.
+      - "(no fields returned)"      an empty or failed GET proves nothing about what Azure holds.
+
+    Returned in op order, and EVERY difference is reported rather than short-circuiting on the
+    first: a run that rewrites every work item needs the whole story in one pass.
+
+    The description is compared exactly as written, with no HTML normalisation. If Azure DevOps
+    sanitises the HTML it stores, this reports a difference every run -- which is the honest
+    answer, because normalising here could hide a real content change. The DEBUG line in
+    write_wi_v3 names the field so that case is diagnosable from a log instead of guesswork.
+    """
+    if not fields:
+        return ["(no fields returned)"]
+    diffs = []
+    for op_ in ops or []:
+        path = op_.get("path", "")
+        if not path.startswith("/fields/"):
+            diffs.append(f"{path} (unrecognised op)")
+            continue
+        name = path[len("/fields/"):]
+        if name in STATE_FIELDS:
+            # Not content. A state difference must never be what forces a rewrite -- that is the
+            # rewrite that resets the state in the first place.
+            continue
+        cur_val = fields.get(name)
+        if op_.get("op") == "remove":
+            # A remove only matters when Azure still holds something to remove.
+            if cur_val not in (None, ""):
+                diffs.append(name)
+            continue
+        new_val = op_.get("value")
+        if name not in fields:
+            diffs.append(f"{name} (absent)")
+        elif name == "System.Tags":
+            # Azure returns "; "-delimited and this tool writes comma-joined, and tag identity
+            # is case-insensitive there -- comparing the raw strings would report a change on
+            # every single run and skip nothing at all.
+            if {t.lower() for t in tag_set(str(new_val or ""))} != \
+                    {t.lower() for t in tag_set(str(cur_val or ""))}:
+                diffs.append(name)
+        elif name == "Microsoft.VSTS.Common.Priority":
+            # Azure hands priority back as an int or a string depending on the field type.
+            if try_or_error(lambda: int(float(new_val)), new_val) != \
+                    try_or_error(lambda: int(float(cur_val)), cur_val):
+                diffs.append(name)
         else:
-            desc_field = ""
-        if desc_field:
-            data.append({
-                "op": azure_operation,
-                "path": desc_field,
-                "value": desc
-            })
-
-        for custom_ in cstm_flds:
-            fld_name, fld_val = analyze_fields(custom_, prj_el)
-            if fld_val and not field_name_in_data(fld_name):
-                data.append({
-                    "op": "add",
-                    "path": f"/fields/{fld_name}",
-                    "value": fld_val
-                })
-            elif not fld_val and "Custom." in fld_name:
-                data.append({
-                    "op": "remove",
-                    "path": f"/fields/{fld_name}",
-                })
+            new_text = str(new_val if new_val is not None else "")
+            cur_text = str(cur_val if cur_val is not None else "")
+            if new_text == cur_text:
+                continue
+            # Only a value carrying markup gets the tolerant compare, and only after the exact
+            # one has already failed. A plain-text field -- System.Title above all, which is the
+            # identity key classify_title decodes -- is never normalised.
+            if "<" in new_text or "<" in cur_text:
+                if canonical_html(new_text) == canonical_html(cur_text):
+                    continue
+            diffs.append(name)
+    return diffs
 
 
-        if conf.azure_area:
-            res = create_area(conf.azure_area)
-            data.append(
-                {
-                    "op": azure_operation,
-                    "path": "/fields/System.AreaPath",
-                    "value": f"{conf.azure_area}"
-                }
-            )
-        try:
-            if azure_operation == "add":
-                if issue_id:
-                    data.append(
-                        {
-                            "op": "add",
-                            "path": "/relations/-",
-                            "value": {
-                                "rel": "Hyperlink",
-                                "url": lib_url,
-                                "attributes": {"comment": prj_token + "," + issue_id}
-                            }
-                        }
-                    )
+def wi_content_unchanged(ops: list, fields: dict) -> bool:
+    """True when every field this run would write already holds that value in Azure.
 
-                r, errcode = call_azure_api(api_type="POST", api=f"wit/workitems/${wi_type}", data=data,
-                                            project=conf.azure_project)
-                try:
-                    exist_wis.append({lib_name: r["id"]})
-                except Exception as err:
-                    pass
-                    #logger.warning(f"[{ex()}] Work item creation/update failed: {r}")
+    The point is NOT to save an API call: some Azure DevOps process rules reset a work item's
+    state on every edit, so a PATCH that changes nothing still drags an operator's Active item
+    back to New. Not issuing that PATCH is the fix.
 
-                status_op = "created"
-            else:
-                r, errcode = call_azure_api(api_type="PATCH", api=f"wit/workitems/{exist_id}", data=data,
-                                            project=conf.azure_project)
-                status_op = "updated"
-            try:
-                updated_wi.append(exist_id if exist_id > 0 else r["id"])
-            except Exception as err:
-                pass
+    Defined in terms of wi_content_diff so the decision and the explanation logged next to it can
+    never disagree.
+    """
+    return not wi_content_diff(ops, fields)
 
-            if errcode == 0:
-                count_item += 1
-                logger.info(f"{conf.azure_type} {r['id']} {status_op}")
-            elif errcode == 1:
-                logger.warning(f"{conf.azure_type} creation/update failed: {r['message']}")
-            else:
-                info_el = r.pop()
-                logger.error(f"[{fn()}] {info_el}")
-        except Exception as err:
-            logger.error(f"[{ex()}] Work item creation/update failed: {err}")
-            global_errors += 1
 
-    def generate_html_bulleted_list(items):
-        html = "<ul>\n"
-        for item in items:
-            html += f"  <li>{item}</li>\n"
-        html += "</ul>"
-        return html
+def restore_wi_state(exist_id: int, prior_state: str, patch_result) -> str:
+    """Put the work item's `System.State` back after a content PATCH that Azure reset.
 
-    def get_ingnored_alerts(project):
-        ign_alerts = json.dumps({
-            "requestType": "getProjectIgnoredAlerts",
-            "userKey": conf.ws_user_key,
-            "projectToken": project
-        })
-        res = []
-        try:
-            res_ = json.loads(call_ws_api(data=ign_alerts))["alerts"]
-            res.extend([x["vulnerability"]["name"] for x in res_])
-        except Exception as err:
-            pass
-        return res
-
-    def is_ignored(cve, ignored):
-        return cve in ignored
-
-    global conf, global_errors, exist_wis, updated_wi, count_item
+    Only ever called from write_wi_v3's update path. apply_close/apply_reopen change state on
+    purpose and run later, from reconcile_project, so this can never fight them. A failure here
+    is logged and swallowed -- an unrestored state must not cost the run or the work item.
+    """
     try:
-        ws_prj = fetch_prj_policy(prj_token, sdate, edate)
-        ignore_alerts = get_ingnored_alerts(project=prj_token) if conf.wsalert.lower() == "false" else []
-        prj_lib_hierarchy = try_or_error(lambda: get_prj_lib_hierarchy()["libraries"], [])
-        prj_licenses = try_or_error(lambda: get_prj_licenses(), [])
-        prj_lib_locations = try_or_error(lambda: get_lib_locations(), [])
-        prd_name = ws_prj[0]
-        prj_name = ws_prj[1]
-        status_op = "created"
-        count_item = 0
-        sorted_libs = sorted(ws_prj[2:], key=lambda x: (x["library"]["keyId"], -len(x["policyViolations"])))
-        for prj_el in sorted_libs:
-            lib_url = prj_el["library"]["url"]
-            lib_name = prj_el["library"]["filename"]
-            policy_lic_name = try_or_error(
-                lambda: prj_el['policy']['name'][prj_el['policy']['name'].find("]") + 1:].strip(), "")
-            tags = [f"{prd_name}/{prj_name}", Tags.get_el_by_name(prj_el["policy"]["policyMatch"]["type"])]
-            key_uuid = try_or_error(lambda: prj_el['library']['keyUuid'], "")
-            path_dep, path_lib = get_pathes(key_uuid)
-            list_dep_lib = dep_hierarchy(key_uuid=key_uuid)
-            lib_desc, lib_home_page, lic_data_arr, lib_dep = get_lib_lic(key_uuid)
-            is_license = prj_el["policy"]["policyMatch"]["type"] == "LICENSE"
-            lib_hierarchy = find_parent_chain(key_uuid=key_uuid,
-                                              libraries=prj_lib_hierarchy) if lib_dep == "Transitive" else []
-
-            if conf.dependency.lower() == "true":  # Different process creation WI (related dependency or CVE)
-                relevant_vuls = []
-                max_severity = ""
-                if not is_license:
-                    for vuln_ in prj_el["policyViolations"]:
-                        if not is_ignored(cve=vuln_["vulnerability"]["name"], ignored=ignore_alerts):
-                            relevant_vuls.append(vuln_)
-                    if relevant_vuls:
-                        max_severity_el = max(relevant_vuls, key=lambda x:
-                        float(try_or_error(lambda: x["vulnerability"]["cvss3_score"],
-                                           try_or_error(lambda: x["vulnerability"]["score"], 0))))
-                        max_severity = try_or_error(lambda: max_severity_el["vulnerability"]["cvss3_score"],
-                                                    try_or_error(lambda: max_severity_el["vulnerability"]["score"], ""))
-                vul_title = f"License Policy Violation detected in {lib_name}" if is_license else f"{lib_name}: " \
-                                        f"{len(relevant_vuls)} vulnerabilities (highest severity is {max_severity})"
-                hierarchy_libs = ""
-                vulnerability_data = ""
-                exist_id = check_wi_id(id=vul_title,project_name=f"{prd_name}/{prj_name}")
-                # Looking for ID by System.Title and Tag (Product/Project Name)
-                if exist_id > 0:
-                    wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
-                                                   data={}, project=conf.azure_project)
-                wi_type_ = try_or_error(lambda: wi_data["fields"]["System.WorkItemType"], "")
-                if exist_id == 0:
-                    azure_operation = "add"
-                elif wi_type_.lower() != wi_type.lower():
-                    call_azure_api(api_type="DELETE", api=f"wit//workitems/{exist_id}",
-                                   data={}, project=conf.azure_project)
-                    azure_operation = "add"
-                else:
-                    azure_operation = "replace"
-                if exist_id not in updated_wi:
-                    issue_id = try_or_error(lambda: prj_el["policyViolations"][0]["issueUuid"], "")
-                    # For link take first IssuedID
-                    if is_license:  # Different description creation for License and Vulnerability
-                        lic_data = ""
-                        for lic_data_ in lic_data_arr:
-                            lic_data = lic_data + f"<a href='{lic_data_[2]}'>{lic_data_[1]}</a>" + \
-                                       f"<br><b>License Reference File: </b><a href='{lic_data_[0]}'>{lic_data_[0]}</a><br>" \
-                                       f"<b>License Policy Violation - </b>{policy_lic_name}<br>"
-                        lic_data = generate_expandable_section("<b>License Details</b>",lic_data)
-                        desc = "<b>Library - </b>" + lib_name + \
-                               "<br>" + lib_desc + \
-                               "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
-                               "<br><b>Vulnerable Library: </b>" + lib_name + f"<br><b> Library home page: " \
-                                                                              f"</b><a href='{lib_home_page}'>{lib_home_page}</a>" + lic_data
-                    else:
-                        table_data = []
-                        for i, policy_el in enumerate(prj_el["policyViolations"]):
-                            vul_name = f"License Policy Violation" if is_license else \
-                                try_or_error(lambda: policy_el["vulnerability"]["name"], "")
-                            if "License Policy Violation" in vul_name or not is_ignored(cve=vul_name, ignored=ignore_alerts):
-                                vul_desc = try_or_error(lambda: policy_el["vulnerability"]["description"], "")
-                                vul_origin_url = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["url"], "")
-                                vul_publish_date = try_or_error(lambda: policy_el["vulnerability"]["publishDate"], "")
-                                vul_fix_release_date = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["date"],
-                                                                    "")
-                                vul_severity = try_or_error(lambda: policy_el["vulnerability"]["cvss3_severity"],
-                                                            try_or_error(lambda: policy_el["vulnerability"]["severity"],
-                                                                         ""))
-                                vul_score = try_or_error(lambda: policy_el["vulnerability"]["cvss3_score"],
-                                                         try_or_error(lambda: policy_el["vulnerability"]["score"], ""))
-                                vul_fix_resolution = try_or_error(lambda: policy_el["vulnerability"]["fixResolutionText"],
-                                                                  "")
-                                vul_fix_type = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["type"], "")
-                                vul_url = lib_home_page if is_license else try_or_error(
-                                    lambda: policy_el["vulnerability"]["url"], "")
-                                table_data.append({
-                                    "CVE": vul_name,
-                                    "Severity": vul_severity,
-                                    "CVSS": vul_score,
-                                    "Dependency": lib_name,
-                                    "Type": lib_dep,
-                                    "Fixed in": vul_fix_resolution,
-                                    "URL": vul_url
-                                })
-                                lic_data = "<br>"
-                                for lic_data_ in lic_data_arr:
-                                    lic_data = lic_data + f"<a href='{lic_data_[2]}'>{lic_data_[1]}</a>" + \
-                                               f"<br><b>License Reference File: </b><a href='{lic_data_[0]}'>{lic_data_[0]}</a><br>" \
-                                               f"<b>License Policy Violation - </b>{policy_lic_name}<br>"
-                                lic_data = generate_expandable_section("<b>License Details</b>", lic_data) if is_license else ""
-
-                                vul_data = "<b>Vulnerable Library:</b>" + lib_name + \
-                                    "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
-                                    "<br><b>Vulnerability Details:</b> " + vul_desc + "<br><b>Publish Date:</b> " + \
-                                    vul_publish_date + \
-                                    f"<br><b>URL:</b> <a href='{vul_url}'>{vul_name}</a>" + \
-                                    "<br><b>CVSS 3 Score Details </b>(" + str(vul_score) + ")" \
-                                                                                           "<br><b>Suggested Fix:</b> " + \
-                                    vul_fix_type + f"<br><b>Origin:</b> <a href='{vul_origin_url}'></a><br>" \
-                                                   f"<b>Release Date:</b> " + vul_fix_release_date + \
-                                    "<br><b>Fix Resolution:</b> " + vul_fix_resolution
-                                hierarchy_libs = generate_html_bulleted_list(items=[x["filename"] for x in lib_hierarchy] if lib_dep == "Transitive" else list_dep_lib)
-                                vulnerability_data += generate_expandable_section(vul_name, vul_data + lic_data)
-
-                        desc = create_html_table(data=table_data) if table_data else ""
-                        desc_add = "<b>Library - </b>" + lib_name + \
-                                   "<br>" + lib_desc + \
-                                   "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
-                                   "<br><b>Vulnerable Library: </b>" + lib_name + \
-                                   "<br><b>Dependency Hierarchy: </b><br>" + hierarchy_libs + \
-                                   f"<br><b> Library home page: " \
-                                   f"</b><a href='{lib_home_page}'>{lib_home_page}</a>"
-                        desc = generate_expandable_section(f"Vulnerable library - {lib_name}", desc_add) + "<br>" + \
-                               desc + "<b>Details:</b><br>" if vulnerability_data else ""
-                        desc += vulnerability_data
-
-                    priority = set_priority(try_or_error(lambda: float(max_severity), 6)) if conf.priority.lower() == "true" else DEFAULT_PRIORITY
-                    # Default priority is 2
-                    if desc:  # Creation WI just in case existing data
-                        create_wi_content(issue_id=issue_id)
-            else:
-                for i, policy_el in enumerate(prj_el["policyViolations"]):
-                    if (is_license and policy_el["violationType"] == "LICENSE") or (
-                            not is_license and policy_el["violationType"] == "VULNERABILITY"):
-                        lic_num_vuln = f" #{str(i+1)}" if is_license and i>0 else ""
-                        vul_name = f"License Policy Violation{lic_num_vuln}" if is_license else \
-                            try_or_error(lambda: policy_el["vulnerability"]["name"], "")
-                        if "License Policy Violation" in vul_name or not is_ignored(cve=vul_name, ignored=ignore_alerts):
-                            issue_id = policy_el["issueUuid"]
-                            vul_severity = try_or_error(lambda: policy_el["vulnerability"]["cvss3_severity"],
-                                                        try_or_error(lambda: policy_el["vulnerability"]["severity"], ""))
-                            if not vul_name:
-                                break
-                            vul_title = f"{vul_name} detected in {lib_name}" if is_license else \
-                                f"{vul_name} ({str(vul_severity).capitalize()}) detected in {lib_name}"
-
-                            vul_score = try_or_error(lambda: policy_el["vulnerability"]["cvss3_score"],
-                                                     try_or_error(lambda: policy_el["vulnerability"]["score"], ""))
-                            vul_desc = try_or_error(lambda: policy_el["vulnerability"]["description"], "")
-                            vul_url = try_or_error(lambda: policy_el["vulnerability"]["url"], "")
-                            vul_origin_url = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["url"], "")
-                            vul_publish_date = try_or_error(lambda: policy_el["vulnerability"]["publishDate"], "")
-                            vul_fix_resolution = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["fixResolution"],
-                                                              "")
-                            vul_fix_type = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["type"], "")
-                            vul_fix_release_date = try_or_error(lambda: policy_el["vulnerability"]["topFix"]["date"], "")
-
-                            exist_id = check_wi_id(id=vul_title,project_name=f"{prd_name}/{prj_name}")
-                            if exist_id > 0:
-                                wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
-                                                               data={}, project=conf.azure_project)
-                            wi_type_ = try_or_error(lambda: wi_data["fields"]["System.WorkItemType"], "")
-                            if exist_id == 0:
-                                azure_operation = "add"
-                            elif wi_type_.lower() != wi_type.lower():
-                                call_azure_api(api_type="DELETE", api=f"wit//workitems/{exist_id}",
-                                               data={}, project=conf.azure_project)
-                                azure_operation = "add"
-                            else:
-                                azure_operation = "replace"
-                            if exist_id not in updated_wi:
-                                priority = set_priority(try_or_error(lambda: float(vul_score), 6)) if conf.priority.lower() == "true" else DEFAULT_PRIORITY
-                                # Default priority is 2
-                                lic_data = "<br>"
-                                for lic_data_ in lic_data_arr:
-                                    lic_data = lic_data + f"<a href='{lic_data_[2]}'>{lic_data_[1]}</a>" + \
-                                               f"<br><b>License Reference File: </b><a href='{lic_data_[0]}'>{lic_data_[0]}</a><br>" \
-                                               f"<b>License Policy Violation - </b>{policy_lic_name}<br>"
-                                lic_data = generate_expandable_section("<b>License Details</b>", lic_data) if is_license else ""
-                                vul_data = "" if is_license else \
-                                    "<br><b>Vulnerability Details:</b> " + vul_desc + \
-                                    "<br><b>Publish Date:</b> " + vul_publish_date + \
-                                    f"<br><b>URL:</b> <a href='{vul_url}'>{vul_name}</a>" + \
-                                    "<br><b>CVSS 3 Score Details </b>(" + str(vul_score) + ")" \
-                                                                                           "<br><b>Suggested Fix:</b> " + \
-                                    vul_fix_type + f"<br><b>Origin:</b> <a href='{vul_origin_url}'></a><br>" \
-                                                   f"<b>Release Date:</b> " + vul_fix_release_date + \
-                                    "<br><b>Fix Resolution:</b> " + vul_fix_resolution
-                                hierarchy_libs = generate_html_bulleted_list(items=[x["filename"] for x in lib_hierarchy] if lib_dep == "Transitive" else list_dep_lib)
-
-                                desc = "<b>Library - </b>" + lib_name + \
-                                       "<br>" + lib_desc + \
-                                       "<br><b>Path to dependency file: </b>" + path_dep + "<br><b>Path to library:</b>" + path_lib + \
-                                       "<br><b>Vulnerable Library: </b>" + lib_name + \
-                                       "<br><b>Dependency Hierarchy: </b><br>" + hierarchy_libs + \
-                                       f"<br><b> Library home page: " \
-                                       f"</b><a href='{lib_home_page}'>{lib_home_page}</a>" + vul_data + lic_data
-                                create_wi_content(issue_id=issue_id)
-
-        return f"{count_item} {conf.azure_type} work items created/updated for Mend project " \
-               f"'{prj_name}' (Product '{prd_name}')" if count_item > 0 else \
-            f"No {conf.azure_type} work items {status_op} for Mend project '{prj_name}' (Product '{prd_name}')"
+        current = try_or_error(lambda: patch_result["fields"]["System.State"], "")
+        if not current:
+            # Only when the PATCH response carried no fields -- no second round trip otherwise.
+            chk, cerr = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
+                                       data={}, project=conf.azure_project)
+            if cerr != 0:
+                return prior_state
+            current = try_or_error(lambda: chk["fields"]["System.State"], "")
+        if not current or current == prior_state:
+            return current or prior_state
+        _, err_r = call_azure_api(
+            api_type="PATCH", api=f"wit/workitems/{exist_id}",
+            data=[{"op": "replace", "path": "/fields/System.State", "value": prior_state}],
+            project=conf.azure_project)
+        if err_r != 0:
+            logger.warning(f"Work item {exist_id} was reset from '{prior_state}' to "
+                           f"'{current}' on update and could not be restored.")
+            return current
+        logger.info(f"Work item {exist_id} state restored to '{prior_state}' after the "
+                    f"update (Azure DevOps had reset it to '{current}').")
+        return prior_state
     except Exception as err:
-        return f"[{ex()}] Work item creation failed: {err}"
+        logger.error(f"[{ex()}] Could not restore the state of work item {exist_id}: {err}")
+        return prior_state
+
+
+def write_wi_v3(item: dict, tags: list, lib_url: str, cstm_flds: list, wi_type: str,
+                project_name: str):
+    """Create or update ONE work item from a rendered 3.0 item. Returns "created", "updated"
+    or "failed".
+
+    Matches by title through check_wi_id, DELETEs and recreates an item whose type differs from
+    `wi_type`, and refreshes the exist_wis cache so a later call in the same run sees the result.
+    """
+    global global_errors, exist_wis, updated_wi
+    title = item["title"]
+    if item["exact"]:
+        exist_id = check_wi_id(id=title, project_name=project_name)
+    elif item.get("cve"):
+        # Per-CVE mode: the severity word in the title moves on a rescore, so the item is found
+        # by CVE + library -- the same key classify_title decodes for closure. Matching the title
+        # exactly here would create a duplicate on every rescore and strand the original open.
+        exist_id = check_wi_id_matching(
+            lambda t: matches_cve(t, item["cve"], item["library"]), project_name=project_name)
+    else:
+        exist_id = check_wi_id_matching(lambda t: matches_library(t, item["library"]),
+                                        project_name=project_name)
+    wi_data, err_ = {}, 2
+    if exist_id > 0:
+        wi_data, err_ = call_azure_api(api_type="GET", api=f"wit/workitems/{exist_id}",
+                                       data={}, project=conf.azure_project)
+    wi_type_ = try_or_error(lambda: wi_data["fields"]["System.WorkItemType"], "")
+    if exist_id == 0:
+        azure_operation = "add"
+    # err_ == 0 is required: a transiently-failed (e.g. throttled) GET must not be read as
+    # "wrong type" and trigger a DELETE of a work item that is perfectly fine.
+    elif err_ == 0 and wi_type_.lower() != wi_type.lower():
+        call_azure_api(api_type="DELETE", api=f"wit//workitems/{exist_id}",
+                       data={}, project=conf.azure_project)
+        azure_operation = "add"
+    else:
+        azure_operation = "replace"
+
+    if exist_id > 0 and exist_id in updated_wi:
+        # Two Mend projects routed to one Azure project can both hold the same library. The
+        # second write would overwrite the first with its own project's content; skip it and
+        # say so rather than letting the work item flip contents run to run.
+        logger.warning(f"Work item {exist_id} ('{title}') was already written this "
+                       f"run; skipping the duplicate write for {project_name}.")
+        return "skipped"
+
+    data = [
+        {"op": azure_operation, "path": "/fields/System.Title", "value": title},
+        {"op": azure_operation, "path": "/fields/Microsoft.VSTS.Common.Priority",
+         "value": item["priority"]},
+        {"op": azure_operation, "path": "/fields/System.Tags", "value": ",".join(tags)},
+    ]
+    if conf.description == "Description":
+        desc_field = "/fields/System.Description"
+    elif conf.description == "ReproSteps":
+        desc_field = "/fields/Microsoft.VSTS.TCM.ReproSteps"
+    elif conf.description:
+        desc_field = get_field_ref(conf.description, cstm_flds)
+    else:
+        desc_field = ""
+    if desc_field:
+        data.append({"op": azure_operation, "path": desc_field, "value": item["desc"]})
+
+    for custom_ in cstm_flds:
+        fld_name, fld_val = analyze_fields(custom_, item["source"])
+        if fld_name in STATE_FIELDS and azure_operation == "replace":
+            # A CREATE still writes these: the field is alwaysRequired, so Azure may want it in
+            # the create payload, and a brand-new item has no operator-set state to trample.
+            continue
+        if fld_val and not any(fld_name in el_["path"] for el_ in data):
+            data.append({"op": "add", "path": f"/fields/{fld_name}", "value": fld_val})
+        elif not fld_val and "Custom." in fld_name:
+            data.append({"op": "remove", "path": f"/fields/{fld_name}"})
+
+    if conf.azure_area:
+        create_area(conf.azure_area)
+        data.append({"op": azure_operation, "path": "/fields/System.AreaPath",
+                     "value": f"{conf.azure_area}"})
+
+    # err_ == 0 is required: a failed GET proves nothing, so it falls through to the PATCH.
+    prior_state = try_or_error(lambda: wi_data["fields"]["System.State"], "") if err_ == 0 else ""
+    if azure_operation == "replace" and err_ != 0:
+        # The unchanged-check and the state restore BOTH depend on this GET, and both are skipped
+        # when it fails. Logged loudly because the symptom -- every work item rewritten every run
+        # -- is identical to the content genuinely differing, and the two need different fixes.
+        logger.warning(f"Work item {exist_id} ('{title}') could not be read back from "
+                       f"Azure (errorcode {err_}), so this run cannot tell whether its content "
+                       f"changed. Updating it unconditionally.")
+    if azure_operation == "replace" and err_ == 0:
+        changed = wi_content_diff(data, try_or_error(lambda: wi_data["fields"], {}) or {})
+        if not changed:
+            logger.debug(f"Work item {exist_id} ('{title}') is unchanged; skipping the "
+                         f"update so an Azure DevOps process rule cannot reset its state.")
+            updated_wi.append(exist_id)
+            return "unchanged"
+        # Why this item is being rewritten. Without it, "everything updates every run" is
+        # indistinguishable from "the skip is not wired up", which cost a live debugging round.
+        logger.debug(f"Work item {exist_id} ('{title}') differs from Azure in "
+                     f"{len(changed)} field(s), so it is being updated: {', '.join(changed)}")
+        azure_fields = try_or_error(lambda: wi_data["fields"], {}) or {}
+        for op_ in data:
+            name_ = op_.get("path", "")[len("/fields/"):]
+            if name_ in changed and name_ in azure_fields:
+                delta = canonical_divergence(op_.get("value"), azure_fields[name_])
+                if delta:
+                    logger.debug(f"  {name_} {delta}")
+
+    try:
+        if azure_operation == "add":
+            if lib_url:
+                # The operator's one click from the work item to the library in Mend.
+                # No attributes.comment: nothing reads one.
+                data.append({"op": "add", "path": "/relations/-",
+                             "value": {"rel": "Hyperlink", "url": lib_url}})
+            r, errcode = call_azure_api(api_type="POST", api=f"wit/workitems/${wi_type}",
+                                        data=data, project=conf.azure_project)
+            status_op = "created"
+        else:
+            r, errcode = call_azure_api(api_type="PATCH", api=f"wit/workitems/{exist_id}",
+                                        data=data, project=conf.azure_project)
+            status_op = "updated"
+        if errcode == 0:
+            claimed_id = exist_id if exist_id > 0 else try_or_error(lambda: r["id"], 0)
+            wi_state = try_or_error(lambda: r["fields"]["System.State"], "")
+            if azure_operation == "replace" and prior_state:
+                wi_state = restore_wi_state(exist_id, prior_state, r)
+            if claimed_id:
+                # A PATCH can rename the item, and exist_wis is read again later this same run,
+                # so the stale entry is replaced rather than left cached under its old title.
+                for d in list(exist_wis):
+                    if claimed_id in try_or_error(lambda d=d: list(d.values())[0], {}):
+                        exist_wis.remove(d)
+                exist_wis.append({title: {claimed_id: {
+                    "tags": ",".join(tags),
+                    "state": wi_state}}})
+                updated_wi.append(claimed_id)
+            logger.debug(f"{conf.azure_type} {try_or_error(lambda: r['id'], claimed_id)} {status_op}")
+            return status_op
+        if errcode == 1:
+            logger.warning(f"{conf.azure_type} creation/update failed: "
+                           f"{try_or_error(lambda: r['message'], r)}")
+        else:
+            logger.error(f"{try_or_error(lambda: r.pop(), r)}")
+        return "failed"
+    except Exception as err:
+        logger.error(f"[{ex()}] Work item creation/update failed: {err}")
+        global_errors += 1
+        return "failed"
+
+
+# One progress line per this many entries. Low enough that a long project keeps proving it
+# is alive, high enough that a normal one prints nothing between its header and its summary.
+PROGRESS_EVERY = 20
+
+
+def create_wi_v3(project, desired: dict, cstm_flds: list, wi_type: str):
+    """Create and update Azure work items from one project's 3.0 `desired` state.
+
+    Returns (created, updated, failed).
+    """
+    global conf
+    conf = startup() if not conf else conf
+    project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
+    reachability_on = reachability_enabled()
+    created = updated = failed = unchanged = 0
+    # Counted per kind so the summary can say which half of the backlog moved. A run that
+    # creates 40 license work items and touches no vulnerability at all is a very different
+    # event from the reverse, and a single set of totals cannot tell them apart.
+    tally = {k: dict(created=0, updated=0, unchanged=0, failed=0)
+             for k in ("vulnerability", "license")}
+    entries = list((desired or {}).items())
+    total = len(entries)
+    logger.info(f"Processing {project_name} work items ({total} total)")
+    processed = 0
+    for (kind, key), entry in entries:
+        # The KEY is the work item's identity ("{cve}|{lib}" in per-CVE mode); the LIBRARY is what
+        # the renderers need. They are the same string only in dependency mode, so the library is
+        # read off the entry rather than taken apart from the key.
+        library = (entry.get("library") if isinstance(entry, dict) else "") or key
+        try:
+            tags = build_wi_tags(
+                project_name,
+                Tags.get_el_by_name("LICENSE" if kind == "license" else "VULNERABILITY_SCORE"),
+                conf.routing, conf.reponame)
+            lib_url = library_url(entry)
+            for item in render_entry_v3(kind, library, entry, reachability_on):
+                if not item["desc"]:
+                    continue
+                item["library"] = library
+                item["source"] = entry
+                item["priority"] = set_priority(
+                    try_or_error(lambda item=item: float(item["score"]), 6)) \
+                    if conf.priority.lower() == "true" else DEFAULT_PRIORITY
+                outcome = write_wi_v3(item, tags, lib_url, cstm_flds, wi_type, project_name)
+                if outcome == "created":
+                    created += 1
+                elif outcome == "updated":
+                    updated += 1
+                elif outcome == "failed":
+                    failed += 1
+                elif outcome == "unchanged":
+                    unchanged += 1
+                if outcome in tally.get(kind, {}):
+                    tally[kind][outcome] += 1
+        except Exception as err:
+            failed += 1
+            tally.get(kind, {})["failed"] = tally.get(kind, {}).get("failed", 0) + 1
+            logger.error(f"[{ex()}] Work item creation failed for "
+                         f"{kind} '{key}' in {project_name}: {err}")
+        processed += 1
+        # The last entry is deliberately excluded: "20/20 processed" immediately above a
+        # summary saying the same thing is noise, not progress.
+        if processed % PROGRESS_EVERY == 0 and processed != total:
+            logger.info(f"{project_name}: {processed}/{total} processed")
+    logger.info(f"{project_name}: {total} work item(s) processed.")
+    for kind, label in (("vulnerability", "Vulnerability"), ("license", "License")):
+        counts = tally[kind]
+        if not any(counts.values()):
+            continue
+        logger.info(f"  {label}: {counts['created']} created, {counts['updated']} updated, "
+                    f"{counts['unchanged']} unchanged, {counts['failed']} failed")
+    return created, updated, failed
+
+
+def list_azure_projects():
+    # Returns None on failure so the caller can tell a real empty organization from a
+    # call that did not happen or a partial sweep - a page failing after earlier pages
+    # already succeeded must not be reported as the complete set.
+    names = set()
+    saw_page = False
+    for page in iter_azure_projects():
+        if page is None:
+            return None
+        saw_page = True
+        names.update([x["name"] for x in page])
+    return names if saw_page else None
+
+
+def sync_had_fatal_error() -> bool:
+    # A function, not a value: azure_wi_sync.py imports names at module load, so an
+    # imported flag would be frozen at False (the same trap global_errors falls into).
+    return run_failed
+
+
+def error_count() -> int:
+    # Mirrors sync_had_fatal_error(): azure_wi_sync.py must call this rather than import
+    # global_errors by value, or its "completed successfully" check is frozen at 0 forever.
+    return global_errors
+
+
+def sync_project_v3(project, floor: float, custom_flds: list, wi_type: str,
+                    position: str = "") -> bool:
+    """Create/update AND reconcile ONE Mend project, from ONE 3.0 read at ONE severity floor.
+
+    The whole point of doing both here: `desired` and `ok` are fetched once and handed to both
+    halves. Creation writes exactly the entries that pass `floor`; closure closes exactly the
+    work items those entries do not account for. Two reads at two floors is the flapping bug --
+    see run_severity_floor.
+
+    ok=False (a partial Mend read) still creates and updates -- neither can destroy anything --
+    and reconcile_project closes NOTHING. That interlock lives there, untouched.
+
+    A failure here is per project: it is logged, counted, and the run continues. Returns True
+    when the project was synced.
+    """
+    global global_errors, synced_projects
+    project_name = f"{project.get('application_name', '')}/{project.get('name', '')}"
+    # Logged BEFORE the read, not after. fetch_v3_desired is the longest silence in a run --
+    # findings, libraries, licenses and up to MEND_DEPPATHS_CONCURRENCY dependency-path calls --
+    # and with routing on there is no startup probe ahead of it either, so without this line a
+    # large project looks like a stalled pipeline.
+    logger.info(f"{'[' + position + '] ' if position else ''}Reading {project_name} from Mend")
+    try:
+        desired, ok = fetch_v3_desired(project.get("uuid", ""), floor)
+        create_wi_v3(project, desired, custom_flds, wi_type)
+        # (project id, "Application/Project", the Azure project written to). Read only by
+        # reconcile_after_sync, which main() does not call: closure runs inline below.
+        synced_projects.append((project.get("uuid", ""), project_name, conf.azure_project))
+        reconcile_project(project, floor=floor, desired=desired, ok=ok)
+        return True
+    except Exception as err:
+        global_errors += 1
+        logger.error(f"[{ex()}] Sync failed for Mend project {project_name}: {err}. "
+                     f"The remaining projects are still synced.")
+        return False
+
+
+def run_sync_routed(projects: list, custom_flds: list, wi_type: str, floor: float):
+    """Routed variant: each Mend project's Azure target comes from its own 3.0 tags.
+
+    `projects` are 3.0 project dicts that already survived select_projects, so MEND_*TOKEN
+    narrowing has happened and there are no scope-excluded / out-of-scope outcomes left to
+    preset -- routing.py only decides no-target / missing-branch-tag / branch-filtered /
+    unknown-target.
+
+    `custom_flds` and `wi_type` are accepted for signature symmetry with run_sync and are
+    UNUSED: both are per Azure project, so they are read from each destination below. main()
+    does not even run the startup probe when routing is on.
+    """
+    global exist_wis, global_errors, run_failed
+    # conf.azure_project, conf.reponame and conf.azure_area are all re-pointed per target
+    # below and must be restored: create_area mutates azure_area cumulatively, and a leaked
+    # azure_project would write -- or close -- work items in the wrong Azure project.
+    original_azure_project = conf.azure_project
+    original_reponame = conf.reponame
+    original_azure_area = conf.azure_area
+    if original_azure_project:
+        logger.info(f"MEND_AZUREPROJECT ('{original_azure_project}') is not used under "
+                    f"MEND_ROUTING: every destination comes from the Mend project's tags, and "
+                    f"the work item type is read from each destination.")
+    try:
+        known = list_azure_projects()
+        if known is None:
+            global_errors += 1
+            run_failed = True
+            return "Aborted: could not list Azure DevOps projects."
+        # Azure project names are matched case-insensitively for lookup, but classify()'s
+        # known_projects membership test is deliberately exact-string (routing.py stays dumb).
+        # Normalise here, the only place that sees both the real Azure names and the raw tag
+        # value, by rewriting each route's azure_project to the canonically-cased name before
+        # classify() ever runs.
+        known_by_casefold = {name.casefold(): name for name in known}
+
+        routes, by_uuid = {}, {}
+        for project in projects or []:
+            uuid = project.get("uuid", "")
+            by_uuid[uuid] = project
+            route = parse_route(project.get("tags") or {})
+            if route.azure_project:
+                route.azure_project = known_by_casefold.get(route.azure_project.casefold(),
+                                                            route.azure_project)
+            routes[uuid] = route
+
+        targets, outcomes = build_table(routes, known, conf.branches)
+        report = coverage_report(outcomes)
+        routed = len([o for o in outcomes.values() if o == SKIP_OK])
+        # branch-filtered is "the normal state during rollout" per routing.py, so a run made
+        # up entirely of deliberate skips must not be fatal. Only outcomes that actually
+        # reached a routing decision count.
+        considered = [t for t, o in outcomes.items()
+                      if o not in (SKIP_EXCLUDED, SKIP_OUT_OF_SCOPE, SKIP_BRANCH)]
+        if considered and not routed:
+            # Zero coverage among projects that reached a routing decision is never normal,
+            # and must be FATAL: logging at ERROR alone still lets main() print "completed
+            # successfully" and exit 0.
+            global_errors += 1
+            run_failed = True
+            logger.error(f"{report} - nothing routed. Check MEND_BRANCHES "
+                         f"('{conf.branches}') and the scan template's tag keys.")
+        elif outcomes and not routed:
+            logger.warning(f"{report} - nothing routed this window.")
+        else:
+            logger.info(report)
+        for uuid, outcome in sorted(outcomes.items()):
+            if outcome in LOUD_OUTCOMES:
+                logger.error(f"Mend project {uuid}: {outcome} "
+                             f"(destination '{routes[uuid].azure_project}')")
+        unknown = len([o for o in outcomes.values() if o == SKIP_UNKNOWN])
+        if unknown and routed and unknown >= routed:
+            # Many unknown targets is more likely a PAT that cannot see those projects than
+            # that many bad tags. We cannot prove it - call_azure_api collapses 403 and 404.
+            logger.error(f"{unknown} destinations were not found in the organization. If they "
+                         f"exist, the PAT may lack visibility into them.")
+
+        synced = 0
+        # Counted across destinations, not within one: an operator watching the log wants to
+        # know how far through the RUN it is, not how far through one Azure project.
+        routed_total = sum(len(targets[t]) for t in targets)
+        routed_index = 0
+        for azure_project in sorted(targets):
+            # Each Azure project is its own failure boundary: one bad target must not cost the
+            # other 106.
+            conf.azure_project = azure_project
+            conf.azure_area = original_azure_area
+            # The work item type and its fields are read from THIS destination, not from
+            # MEND_AZUREPROJECT. A destination on a different process exposes different custom
+            # fields, and one probe applied to all of them meant a Custom.X that exists only in
+            # the probed project was still sent here -- rejected by Azure per work item.
+            # MEND_AZURETYPE stays global: every destination must carry that type.
+            wi_type_here, fields_here = probe_wi_type(azure_project)
+            if fields_here is None:
+                global_errors += 1
+                run_failed = True
+                logger.error(f"Skipping Azure project '{azure_project}': it has no work item "
+                             f"type '{wi_type_here}' (MEND_AZURETYPE). Every routing "
+                             f"destination must carry that type. Nothing is created or closed "
+                             f"for the Mend project(s) routed to it.")
+                continue
+            fields_here = apply_custom_fields(fields_here)
+            # exist_wis is per AZURE project and MUST be re-read whenever the target changes,
+            # or every title is matched against another project's work items - which both
+            # duplicates work items and, now that closure is live, closes the wrong ones.
+            exist_wis = get_exist_wi()
+            if exist_wis is None:
+                global_errors += 1
+                run_failed = True
+                exist_wis = []
+                logger.error(f"Skipping Azure project '{azure_project}': could not read "
+                             f"existing work items. Nothing is created or closed for the Mend "
+                             f"project(s) routed to it; the next run retries them.")
+                continue
+            for uuid, route in targets[azure_project]:
+                conf.reponame = route.repo
+                routed_index += 1
+                if sync_project_v3(by_uuid[uuid], floor, fields_here, wi_type_here,
+                                   position=f"{routed_index}/{routed_total}"):
+                    synced += 1
+        return f"{report}; {synced} Mend project(s) synced"
+    finally:
+        conf.azure_project = original_azure_project
+        conf.reponame = original_reponame
+        conf.azure_area = original_azure_area
+
+
+def selection_tokens():
+    """The configured selection UUIDs -> (include, exclude, {value: the variable it came from}).
+
+    The variable map exists only so an unresolved value can be reported with the name of the
+    variable an operator has to go and fix.
+    """
+    include, exclude, source = [], [], {}
+    for raw, var, bucket in ((conf.wsproducttoken, "MEND_PRODUCTTOKEN", include),
+                             (conf.wsprojecttoken, "MEND_PROJECTTOKEN", include),
+                             (conf.wsexcludetoken, "MEND_EXCLUDETOKEN", exclude)):
+        for value in [v.strip() for v in str(raw or "").split(",") if v.strip()]:
+            bucket.append(value)
+            source.setdefault(value, var)
+    return include, exclude, source
 
 
 def run_sync(st_date: str, end_date: str, custom_flds: list, wi_type: str):
-    global exist_wis
-    res = []
-    logger.info("Getting a modified project list")
-    modified_projects = get_prj_list_modified(st_date, end_date)
-    if conf.wsproducttoken:
-        prd_list = conf.wsproducttoken.split(",")
-        for prd_ in prd_list:
-            data = json.dumps(
-                {"requestType": "getAllProjects",
-                 "userKey": conf.ws_user_key,
-                 "orgToken": conf.ws_org_token,
-                 "productToken": prd_,
-                 })
-            prj_lst_ = json.loads(call_ws_api(data=data))
-            try:
-                for prj_ in prj_lst_['projects']:
-                    res.append(prj_['projectToken'])
-            except Exception as err:
-                logger.error(f"Mend API call failed. Details:{err}")
-                exit(-1)
+    """Drive the whole run from Mend 3.0: select projects, create/update, then close.
 
-    if conf.wsprojecttoken:
-        res.extend(conf.wsprojecttoken.split(","))
-    res = set(modified_projects).intersection(res) if res else modified_projects
-    res = list(set(res) - set(conf.wsexcludetoken.split(",")))
-    #deleted_items = get_deleted_items()
+    `st_date` and `end_date` are accepted for signature compatibility and are UNUSED. 3.0
+    reports a project's complete current state, so there are no windows, no watermarks and no
+    retry queue: a project that fails this run is simply read again in full on the next one.
+    """
+    global exist_wis, global_errors, run_failed, synced_projects, library_paths_cache, \
+        library_paths_consecutive_failures, library_paths_breaker_tripped
+    run_failed = False
+    synced_projects = []
+    library_paths_cache = {}
+    library_paths_consecutive_failures = 0
+    library_paths_breaker_tripped = False
+    reset_library_paths_pool_size_cache()
+    reset_field_meta_cache()
+    floor = run_severity_floor()
+    logger.info(f"Severity floor: MEND_SEVERITY '{conf.severity}' -> {floor}. The SAME floor "
+                f"decides which findings earn a work item and which findings hold one open.")
+    logger.info(f"Selection mode: "
+                f"{'tag-based routing' if conf.routing.lower() == 'true' else 'token list'}")
+    # Logged before routing returns, so a pipeline log can answer "did enrichment run?". 'off' is
+    # reached silently by an unexpanded $(MEND_REACHABILITY) as well as by an explicit false.
+    logger.info(f"Enrichment: EPSS and Exploit Code Maturity always render; "
+                f"Reachability {'on' if reachability_enabled() else 'off'} (MEND_REACHABILITY)")
+
+    projects, ok = fetch_v3_projects()
+    if not ok:
+        global_errors += 1
+        run_failed = True
+        return ("Aborted: could not read the Mend project list. Nothing is created and nothing "
+                "is closed - a partial list makes a project we failed to read look exactly "
+                "like one whose findings are all gone.")
+
+    include, exclude, source = selection_tokens()
+    selected, unresolved = select_projects(projects, include, exclude)
+    if unresolved:
+        # Never sync a partial selection. These variables take 3.0 UUIDs, and an unrecognised
+        # value selects nothing, which would read as "no work to do" and close everything.
+        global_errors += 1
+        run_failed = True
+        for value in unresolved:
+            variable = source.get(value, "MEND_PRODUCTTOKEN/MEND_PROJECTTOKEN/MEND_EXCLUDETOKEN")
+            logger.error(f"{variable} contains '{value}', which matches no Mend project or "
+                         f"application UUID. These variables take Mend 3.0 UUIDs now, not 1.4 "
+                         f"tokens.")
+        return (f"Aborted: {len(unresolved)} configured UUID(s) matched no Mend project or "
+                f"application: {', '.join(unresolved)}. Nothing is created and nothing is "
+                f"closed.")
+
+    if conf.routing.lower() == "true":
+        return run_sync_routed(selected, custom_flds, wi_type, floor)
+
     exist_wis = get_exist_wi()
-    for prj_el in res:
-        logger.info(create_wi(prj_el, st_date, end_date, custom_flds, wi_type))
-
-    return f"{len(res)} project(s) processed" if res else "Nothing to create/update"
+    if exist_wis is None:
+        global_errors += 1
+        run_failed = True
+        exist_wis = []
+        return (f"Aborted: could not read existing work items in Azure project "
+                f"'{conf.azure_project}'. Skipping to avoid creating duplicates and to avoid "
+                f"closing work items we cannot see.")
+    synced = 0
+    for index, project in enumerate(selected, 1):
+        if sync_project_v3(project, floor, custom_flds, wi_type,
+                           position=f"{index}/{len(selected)}"):
+            synced += 1
+    return f"{synced} project(s) processed" if selected else "Nothing to create/update"
 
 
 def get_deleted_items():
@@ -1081,47 +2367,560 @@ def get_deleted_items():
     return del_lst
 
 
+# {referenceName: the wit/fields payload, or None if the read failed}. Field definitions are
+# ORGANIZATION-level in Azure DevOps -- the same referenceName is the same field, with the same
+# type and the same isLocked/isPicklist/readOnly flags, in every project of the organization.
+# Caching them across destinations is what makes the per-destination probe affordable under
+# routing: one call per DISTINCT field for the whole run instead of one per field per project
+# (~60 fields x 107 projects). Cleared per run by run_sync.
+field_meta_cache = {}
+
+
+def reset_field_meta_cache():
+    global field_meta_cache
+    field_meta_cache = {}
+
+
+def field_is_editable(reference_name: str, project: str) -> bool:
+    """Is this field one we may write a string/html/double value into?
+
+    Read through field_meta_cache. A field whose definition cannot be read returns False. Custom
+    and alwaysRequired fields are kept by probe_wi_type regardless of this answer, so False only
+    drops a field that could not be proven writable.
+    """
+    if reference_name not in field_meta_cache:
+        flds, err = call_azure_api(api_type="GET", api=f"wit/fields/{reference_name}",
+                                   project=project, data={}, version="7.0",
+                                   header="application/json")
+        field_meta_cache[reference_name] = flds if err == 0 else None
+    flds = field_meta_cache[reference_name]
+    if not flds:
+        return False
+    return try_or_error(
+        lambda: flds["type"].lower() in ("string", "html", "double")
+        and not flds["isLocked"] and not flds["isPicklist"] and not flds["readOnly"], False)
+
+
+def probe_wi_type(project: str):
+    """MEND_AZURETYPE's definition, and its usable fields, as ONE Azure project reports it.
+
+    Returns (wi_type, fields), or (wi_type, None) when that project's process does not carry
+    the type. The caller decides how bad that is: at startup it is fatal (see load_wi_json),
+    while under routing it is one destination out of many and the rest of the run continues.
+
+    The type name itself is global (MEND_AZURETYPE) -- only the field list is per project,
+    because a destination on a different process can expose different custom fields.
+    """
+    load_el = conf.azure_type if conf.azure_type else "Task"
+    r, errcode = call_azure_api(api_type="GET", api="wit/workitemtypes/", project=project, data={},
+                                version="7.0", header="application/json")
+    if errcode != 0:
+        logger.error(f"Could not read the work item types of Azure project '{project}'{r}")
+        return load_el, None
+    for el_ in try_or_error(lambda: r["value"], []):
+        if el_["name"].lower() != load_el.lower():
+            continue
+        fields = []
+        for el_fld_ in el_["fields"]:
+            if "Custom." in el_fld_["referenceName"] or el_fld_["alwaysRequired"] \
+                    or field_is_editable(el_fld_["referenceName"], project):
+                fields.append(
+                    {"referenceName": el_fld_["referenceName"],
+                     "name": el_fld_["name"],
+                     "defaultValue": el_fld_["defaultValue"],
+                     }
+                )
+        return load_el, fields
+    return load_el, None
+
+
+def apply_custom_fields(wi_fields: list) -> list:
+    """Stuff MEND_CUSTOMFIELDS values into the matching field descriptors as defaultValue.
+
+    Lives here rather than in main() because the routed path probes each destination
+    separately and has to do this to every field list it gets back, not just the first one.
+    Resolution of those values happens later, in analyze_fields / mend_val.
+    """
+    if not conf.azure_custom:
+        return wi_fields
+    for c_fld_ in conf.azure_custom.split(";"):
+        field_name_from_param = c_fld_.split("::")
+        fld_ref = f"Custom.{field_name_from_param[0]}"
+        for w_field_ in wi_fields or []:
+            if fld_ref == w_field_["referenceName"] or field_name_from_param[0] == w_field_["name"]:
+                w_field_["defaultValue"] = try_or_error(lambda: field_name_from_param[1],
+                                                        w_field_["defaultValue"])
+                break
+    return wi_fields
+
+
 def load_wi_json():
+    """The startup probe: MEND_AZUREPROJECT's definition of MEND_AZURETYPE.
+
+    Only the non-routed path uses this. Under MEND_ROUTING the probe happens per destination
+    inside run_sync_routed, because MEND_AZUREPROJECT is not where the work items go.
+    """
     global conf
     conf = startup() if not conf else conf
     conf.update_properties()
-    load_el = conf.azure_type if conf.azure_type else "Task"
-    r, errcode = call_azure_api(api_type="GET", api="wit/workitemtypes/", project=conf.azure_project, data={},
-                                version="7.0", header="application/json")
-    wi_list = []
-    is_add = False
-    if errcode == 0:
-        for el_ in r["value"]:
-            if el_["name"].lower() == load_el.lower():
-                fields = []
-                for el_fld_ in el_["fields"]:
-                    flds, err = call_azure_api(api_type="GET", api=f"wit/fields/{el_fld_['referenceName']}", project=conf.azure_project, data={},
-                                    version="7.0", header="application/json")
-                    if err == 0:
-                        is_add = (flds['type'].lower() == "string" or flds['type'].lower() == "html" or flds['type'].lower() == "double") \
-                                 and not flds["isLocked"] and not flds["isPicklist"] and not flds["readOnly"]
-                    if "Custom." in el_fld_["referenceName"] or el_fld_["alwaysRequired"] or is_add:
-                        fields.append(
-                            {"referenceName": el_fld_["referenceName"],
-                             "name": el_fld_["name"],
-                             "defaultValue": el_fld_["defaultValue"],
-                             }
-                        )
-                wi_list.append(
-                    {
-                        "name": el_["name"],
-                        "referenceName": el_["referenceName"],
-                        "fields": fields
-                    })
-                break
-    if not wi_list:
-        logger.error(f"No work item types available for project '{conf.azure_project}'{r}")
+    load_el, fields = probe_wi_type(conf.azure_project)
+    if fields is None:
+        logger.error(f"No work item types available for project '{conf.azure_project}'")
         exit(-1)
+    return load_el, fields
 
-    for res_ in wi_list:
-        if res_["name"].lower() == load_el.lower():
-            return load_el, res_["fields"]
-    return load_el, []
+
+def org_uuid() -> str:
+    """The org identifier for 3.0's org-scoped paths, and the login's orgToken.
+
+    MEND_ORGUUID is required and validated by check_patterns, so this never falls back. Every
+    caller goes through here; never read conf.org_uuid directly.
+    """
+    return (conf.org_uuid or "").strip()
+
+
+def fetch_v3_projects():
+    """Every project in the org, with its routing tags and last scan time. One paged call.
+
+    Replaces getAllProjects, getOrganizationProjectVitals, getOrganizationProjectTags and
+    get_prj_list_modified -- all four collapse into this.
+    """
+    # The spec declares this endpoint POST-only (getProjectSummaries) -- confirmed against
+    # references/3.0 (2).json, which lists only "post" under this path. Every other 3.0 endpoint
+    # in use is GET; this is the one exception.
+    rows, ok = fetch_v3_pages(f"orgs/{org_uuid()}/projects/summaries", method="POST")
+    if not ok:
+        logger.error(f"Could not read Mend projects for org {org_uuid()}. "
+                     f"Nothing is synced this run -- acting on a partial project list could "
+                     f"close work items for projects we simply failed to read.")
+    return normalise_projects(rows), ok
+
+
+def fetch_v3_licenses(project_uuid: str):
+    """One project's due-diligence license rows -> ({library_name: [license, ...]}, ok).
+
+    Returns (licenses, components, ok): the license list per library AND the library metadata
+    index built from the SAME rows (source3.normalise_library_components), which is the only
+    source a license work item has for its version, paths and home page.
+
+    GET /projects/{projectUuid}/dependencies/libraries/licenses, confirmed GET-only against
+    references/3.0 (2).json (the path declares only a "get" operation). See
+    source3.normalise_licenses for the schema this reads.
+    """
+    rows, ok = fetch_v3_pages(f"projects/{project_uuid}/dependencies/libraries/licenses")
+    if not ok:
+        logger.error(f"Could not read library licenses for project {project_uuid}. "
+                     f"Callers must not treat the absence of license data here as \"this "
+                     f"library has no licenses\".")
+    return normalise_licenses(rows), normalise_library_components(rows), ok
+
+
+def fetch_v3_libraries(project_uuid: str):
+    """One project's library list -> (components, licenses, ok).
+
+    The primary source for the description's paths, description, home page and license reference
+    files: GET /projects/{projectUuid}/dependencies/libraries (LibraryDTOV3), which carries
+    locations[] and licenses[].licenseReferences[]. See
+    source3.normalise_libraries / normalise_library_licenses.
+
+    A failed read returns ok=False and the caller must fold it into fetch_v3_desired's interlock:
+    the library list feeds only description content, but a read that failed must never be
+    presented as a complete one.
+    """
+    rows, ok = fetch_v3_pages(f"projects/{project_uuid}/dependencies/libraries")
+    if not ok:
+        logger.error(f"Could not read the library list for project {project_uuid}. "
+                     f"Descriptions this run may omit library paths, versions and license "
+                     f"reference files that Mend does in fact know.")
+    return normalise_libraries(rows), normalise_library_licenses(rows), ok
+
+
+def fetch_v3_root_libraries(project_uuid: str):
+    """One project's root-library remediation index -> (index, ok).
+
+    GET /projects/{projectUuid}/dependencies/findings/security/groupBy/rootLibrary. Supplies
+    Recommended Fix and Recommended Major Version and NOTHING ELSE: the work item set comes from
+    surviving findings, because this endpoint's counts include suppressed findings and it knows
+    nothing about MEND_SEVERITY. See source3.normalise_root_libraries.
+    """
+    rows, ok = fetch_v3_pages(
+        f"projects/{project_uuid}/dependencies/findings/security/groupBy/rootLibrary")
+    if not ok:
+        # WARNING, not ERROR, and deliberately NOT part of fetch_v3_desired's closure interlock
+        # -- see that function's docstring. This read cannot shrink `desired`, so a failure here
+        # cannot turn a real closure into a false one; blocking closure on it would mean one
+        # unavailable endpoint stops every project in the org from ever closing anything.
+        logger.warning(f"Could not read root library remediation for project "
+                       f"{project_uuid}. Work items this run may omit Recommended Fix and "
+                       f"Recommended Major Version that Mend does in fact publish. Closure is "
+                       f"NOT being blocked by this: the root index supplies description lines "
+                       f"only and cannot make a work item look resolved.")
+    return normalise_root_libraries(rows), ok
+
+
+def fetch_v2_library_paths(project_uuid: str, library_uuid: str) -> list:
+    """One library's root->leaf dependency chains -> [[name, ...], ...], memoised for the run.
+
+    GET /projects/{projectUuid}/libraries/{libraryUuid}/paths on the Mend 2.0 API -- confirmed
+    live to be unpaged, so this is ONE call and must never be routed through fetch_v3_pages.
+
+    Decorative, like fetch_v3_root_libraries: a failure logs a WARNING (not an error) naming the
+    project and library and returns [], and is deliberately NOT folded into fetch_v3_desired's
+    closure interlock. Dependency paths can only add a line to a description and can never remove
+    a key from `desired`, so a failed call here must never block closure.
+
+    Missing project_uuid or library_uuid returns [] without calling -- a direct dependency or an
+    entry with no library_uuid has nothing to look up.
+
+    Memoised in the module-level `library_paths_cache`, keyed (project_uuid, library_uuid): in
+    per-CVE mode every CVE finding against one library would otherwise issue the identical call.
+    A FAILURE is cached too, not just a success -- a PAT that lacks permission for this endpoint
+    would otherwise retry on every finding in the project for no better result; an empty list is
+    a valid, stable cached answer for the rest of the run.
+
+    Also guarded by a run-scoped circuit breaker (`library_paths_breaker_tripped`): once
+    `LIBRARY_PATHS_BREAKER_THRESHOLD` calls fail consecutively -- across ANY libraries or
+    projects, not just one cache key -- every subsequent call in this run returns [] without
+    even attempting the HTTP call. A single success resets the consecutive-failure count. The
+    trip is logged once, at ERROR, so an operator reading pipeline output understands why every
+    later description in the run is missing its dependency hierarchy. Like the cache, this never
+    touches fetch_v3_desired's `ok` closure interlock -- see attach_library_paths.
+    """
+    global library_paths_consecutive_failures, library_paths_breaker_tripped
+    if not project_uuid or not library_uuid:
+        return []
+    cache_key = (project_uuid, library_uuid)
+    if cache_key in library_paths_cache:
+        return list(library_paths_cache[cache_key])
+    if library_paths_breaker_tripped:
+        return []
+    payload, errorcode = call_ws_api_v2(f"projects/{project_uuid}/libraries/{library_uuid}/paths")
+    if errorcode != 0:
+        logger.warning(f"Could not read dependency paths for library {library_uuid} "
+                       f"in project {project_uuid}. This work item's description will omit its "
+                       f"dependency path this run; closure is NOT affected -- see "
+                       f"fetch_v2_library_paths.")
+        result = []
+        library_paths_consecutive_failures += 1
+        if library_paths_consecutive_failures >= LIBRARY_PATHS_BREAKER_THRESHOLD:
+            library_paths_breaker_tripped = True
+            logger.error(f"Dependency-path lookups failed "
+                        f"{LIBRARY_PATHS_BREAKER_THRESHOLD} times in a row (most recently for "
+                        f"library {library_uuid} in project {project_uuid}). Giving up on "
+                        f"/paths for the rest of this run -- likely cause: the configured PAT "
+                        f"lacks Mend 2.0 permission. Every remaining work item's description "
+                        f"this run will omit its dependency hierarchy; closure is NOT affected.")
+    else:
+        library_paths_consecutive_failures = 0
+        result = normalise_library_paths(payload)
+    library_paths_cache[cache_key] = result
+    return list(result)
+
+
+def _fetch_paths_batch(project_uuid: str, library_uuids: list) -> dict:
+    """Concurrently fetch /paths for many libraries in one project, in WAVES of the pool size,
+    checking the breaker between waves -- the fix for a review finding on the first version of
+    this change (see the dep-paths-perf brief and its review).
+
+    Returns {library_uuid: (payload, errorcode)} for every uuid actually attempted. Workers touch
+    NO shared state -- each is a bare `_get_v2` call whose only output is its own return value;
+    the JWT is pre-warmed once before fanning out so no worker ever triggers its own re-login.
+    All REAL mutation (the cache, the breaker counters, entry["paths"]) still happens in
+    attach_library_paths, on the main thread, after this function returns, in the deterministic
+    (sorted) order it applies -- see its docstring. This function's own wave loop keeps a purely
+    LOCAL simulation of that same rule (starting from the real counters, read once, never
+    written here) so it knows when to stop submitting further waves; because it walks the exact
+    same sorted uuids in the exact same order attach_library_paths will apply afterward, the two
+    always trip at the same point.
+
+    THE BUG THIS FIXES: submitting the entire `library_uuids` set to one `pool.map()` call, with
+    the breaker only checked at entry and applied at the end, defeats the breaker within a
+    project -- a PAT lacking Mend 2.0 permission on a 383-library project fires all 383 calls
+    (plus a full 383-wide retry misdiagnosed as an expired JWT: 766 calls) before the breaker,
+    consulted only afterward, ever gets a chance to trip on the 5th applied result. Chunking into
+    waves of `library_paths_pool_size()` and checking the (simulated) breaker between waves
+    bounds the damage to roughly one wave before the fetch loop itself stops: worst case is one
+    pool-sized wave plus one pool-sized retry pass for that wave (e.g. 16 + 16 = 32 calls with the
+    default pool size), not the whole project.
+
+    THE RETRY CAP: a 401/403 on any worker means the pre-warmed JWT expired mid-wave, OR the PAT
+    genuinely lacks permission -- those two cases are indistinguishable from a status code alone.
+    Retrying is only ever right for the former, so the retry pass is capped to the CURRENT WAVE's
+    own failing uuids (at most `library_paths_pool_size()` of them, never the whole project), and
+    happens at most ONCE per call to this function (the first wave to see a 401/403 triggers one
+    fresh mend_v2_token(); later waves reuse that refreshed token and are not retried again even
+    if they also fail) -- never a re-login inside a worker, and never a retry sized to hundreds of
+    uuids that were never going to succeed anyway.
+
+    Returns {} and makes no call at all if there is nothing to fetch, or if the breaker is
+    already tripped -- "subsequent batches make no calls at all" once tripped.
+    """
+    global mend_v2_session
+    if not library_uuids or library_paths_breaker_tripped:
+        return {}
+    uuids = sorted(set(library_uuids))
+    pool_size = library_paths_pool_size()
+    token = mend_v2_token()
+    relogin_done = False
+
+    def _fetch_one(library_uuid, bearer):
+        url = f"{mend_api_url()}/api/v2.0/projects/{project_uuid}/libraries/{library_uuid}/paths"
+        payload, errorcode = _get_v2(url, bearer, None, timeout=LIBRARY_PATHS_TIMEOUT)
+        return library_uuid, payload, errorcode
+
+    def _fetch_many(uuid_list, bearer):
+        out = {}
+        with ThreadPoolExecutor(max_workers=min(pool_size, len(uuid_list))) as pool:
+            for library_uuid, payload, errorcode in pool.map(
+                    lambda u: _fetch_one(u, bearer), uuid_list):
+                out[library_uuid] = (payload, errorcode)
+        return out
+
+    results = {}
+    # Purely local control-flow state -- never written to the real (global) counters. Starts
+    # from the real value so a run of failures that began in an earlier project (not yet at the
+    # threshold) is honoured rather than reset to 0 here. `simulated_tripped` mirrors the real
+    # `library_paths_breaker_tripped` flag's STICKINESS: the counter itself resets to 0 on a
+    # success (matching the real counter, so the two agree on ordinary runs), but once the
+    # simulated count reaches the threshold, `simulated_tripped` latches and stops further waves
+    # even if a later success in the same batch would otherwise have reset the counter back down.
+    # Without this, a wave of `threshold` consecutive failures followed by a success would trip
+    # the REAL breaker (applied afterward in attach_library_paths, which is also sticky) while
+    # this simulation forgot the trip and kept submitting waves -- "once tripped, the rest of
+    # the batch is not attempted" must hold in both directions.
+    simulated_consecutive = library_paths_consecutive_failures
+    simulated_tripped = simulated_consecutive >= LIBRARY_PATHS_BREAKER_THRESHOLD
+    for wave_start in range(0, len(uuids), pool_size):
+        if simulated_tripped:
+            break
+        wave = uuids[wave_start:wave_start + pool_size]
+        wave_results = _fetch_many(wave, token)
+
+        retry_uuids = sorted(u for u, (_, code) in wave_results.items() if code in (401, 403))
+        if retry_uuids and not relogin_done:
+            mend_v2_session = None
+            token = mend_v2_token()
+            relogin_done = True
+            wave_results.update(_fetch_many(retry_uuids, token))
+
+        for library_uuid in sorted(wave_results):
+            _, errorcode = wave_results[library_uuid]
+            simulated_consecutive = 0 if errorcode == 0 else simulated_consecutive + 1
+            if simulated_consecutive >= LIBRARY_PATHS_BREAKER_THRESHOLD:
+                simulated_tripped = True
+        results.update(wave_results)
+
+    return results
+
+
+def attach_library_paths(project_uuid: str, desired: dict, per_cve: bool):
+    """Fill in entry["paths"] for every `desired` entry that has earned a dependency-path call.
+
+    Called from fetch_v3_desired after `desired` is fully assembled. Rewritten (see the
+    dep-paths-perf brief) into three passes so the number of HTTP calls scales with distinct
+    transitive libraries, fetched CONCURRENTLY, instead of one serial call per entry:
+
+    1. Selection -- unchanged filter, verbatim: skip non-dict entries, skip vulnerability entries
+       when `per_cve` is False, resolve `render_inputs(entry)`, skip unless
+       dependency_type.strip().lower() == "transitive", skip entries with no library_uuid.
+       Collected into {library_uuid: [entry, ...]} so several entries sharing one uuid (every CVE
+       of one library in per-CVE mode) still cost ONE call, exactly as before.
+      - `render_inputs(entry)` resolves library_uuid and dependency_type -- called again here
+        (it already runs at render time) deliberately, so the fetch and the render can never
+        disagree about which library an item is about; it is pure and cheap.
+      - Direct dependencies get no call and no line: only
+        dependency_type.strip().lower() == "transitive" qualifies. The comparison is
+        case-insensitive because _dependency_type yields "Direct"/"Transitive" from
+        dependencyContexts but falls through to component.dependencyType, whose 3.0 enum is
+        DIRECT/TRANSITIVE.
+      - A vulnerability entry is skipped unless `per_cve` is True; MEND_DEPENDENCY=true
+        root-grouping descriptions render no hierarchy. License entries are fetched in both modes.
+      - An entry with no library_uuid is skipped -- there is nothing to look up.
+    2. Batch fetch (_fetch_paths_batch) of only the uuids not already in library_paths_cache,
+       WAVE by wave, stopping early once its own local simulation predicts the breaker will
+       trip -- see that function's docstring for why the fetch loop itself now bounds the
+       damage, not just the apply loop below. Its raw (payload, errorcode) results are then
+       applied HERE, on the main thread, in library_uuid-sorted order, one at a time -- the
+       circuit breaker (library_paths_consecutive_failures / library_paths_breaker_tripped /
+       LIBRARY_PATHS_BREAKER_THRESHOLD) is evaluated exactly as fetch_v2_library_paths always
+       evaluated it, just against pre-fetched results instead of a fresh call per entry, so "five
+       consecutive failures" stays a meaningful, deterministic count even though the underlying
+       HTTP calls raced concurrently.
+       EVERY result _fetch_paths_batch returns is applied here, including any that sort after
+       the point where the breaker actually trips: those uuids were already fetched (paid for)
+       before the trip was known, often concurrently in the same wave as the one that tripped
+       it, and a successful one must not be thrown away -- doing so would make which libraries
+       render a hierarchy depend on sort order relative to which ones happened to fail, and
+       change descriptions (hence PATCHes) run to run for no reason. Only *further fetching* is
+       what the breaker stops (enforced inside _fetch_paths_batch and by the check at its own
+       entry on the next call); applying results already in hand is unconditional. The "giving
+       up" ERROR is still logged only once (guarded on the False->True transition), not once per
+       failing result after the trip.
+    3. Assignment -- entry["paths"] for every collected entry, read back out of
+       library_paths_cache (a cache hit either way: pre-existing, or just populated in step 2).
+
+    MEND_DEPPATHS (dep_paths_enabled) is the run's kill switch: if disabled, this returns
+    immediately, making no calls at all, and every entry is left exactly as fetch_v3_desired
+    built it -- descriptions fall back to the pre-existing rendering (no nested list; the flat
+    parents fallback for a non-direct library, same as an unknown dependency_type today).
+    """
+    if not dep_paths_enabled():
+        return
+    global library_paths_consecutive_failures, library_paths_breaker_tripped
+    start = time.monotonic()
+    by_uuid = {}
+    for entry in desired.values():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("kind") == "vulnerability" and not per_cve:
+            continue
+        inputs = render_inputs(entry)
+        dependency_type = (inputs.get("dependency_type") or "").strip().lower()
+        if dependency_type != "transitive":
+            continue
+        library_uuid = inputs.get("library_uuid") or ""
+        if not library_uuid:
+            continue
+        by_uuid.setdefault(library_uuid, []).append(entry)
+
+    to_fetch = sorted(uuid for uuid in by_uuid if (project_uuid, uuid) not in library_paths_cache)
+    cache_hits = len(by_uuid) - len(to_fetch)
+    failed = 0
+
+    results = _fetch_paths_batch(project_uuid, to_fetch) if to_fetch else {}
+    already_tripped_here = False
+    for library_uuid in sorted(results):
+        payload, errorcode = results[library_uuid]
+        cache_key = (project_uuid, library_uuid)
+        if errorcode != 0:
+            logger.warning(f"Could not read dependency paths for library "
+                           f"{library_uuid} in project {project_uuid}. This work item's "
+                           f"description will omit its dependency path this run; closure is "
+                           f"NOT affected -- see fetch_v2_library_paths.")
+            result = []
+            failed += 1
+            library_paths_consecutive_failures += 1
+            if not already_tripped_here and \
+                    library_paths_consecutive_failures >= LIBRARY_PATHS_BREAKER_THRESHOLD:
+                library_paths_breaker_tripped = True
+                already_tripped_here = True
+                logger.error(f"Dependency-path lookups failed "
+                            f"{LIBRARY_PATHS_BREAKER_THRESHOLD} times in a row (most recently "
+                            f"for library {library_uuid} in project {project_uuid}). Giving up "
+                            f"on /paths for the rest of this run -- likely cause: the "
+                            f"configured PAT lacks Mend 2.0 permission. Every remaining work "
+                            f"item's description this run will omit its dependency hierarchy; "
+                            f"closure is NOT affected.")
+        else:
+            library_paths_consecutive_failures = 0
+            result = normalise_library_paths(payload)
+        library_paths_cache[cache_key] = result
+
+    for library_uuid, entries in by_uuid.items():
+        paths = list(library_paths_cache.get((project_uuid, library_uuid), []))
+        for entry in entries:
+            entry["paths"] = paths
+
+    logger.debug(f"project {project_uuid}: {len(results)} /paths call(s) made, "
+                f"{cache_hits} served from cache, {failed} failed, "
+                f"{time.monotonic() - start:.2f}s elapsed.")
+
+
+def fetch_v3_desired(project_uuid: str, floor: float):
+    """One project's desired end state: {(kind, library): entry}.
+
+    `ok` is the closure interlock: reconciliation closes work items absent from `desired`, so a
+    partial read must never be mistaken for a shrunken one. A caller seeing ok=False may still
+    create and update, which cannot destroy anything, but must not close.
+
+    FOUR of the five reads gate it, and they are exactly the reads that can make `desired`
+    SMALLER than the truth: the security findings and the violations BUILD `desired`, and the
+    due-diligence and library reads can drop a library's licenses -- a missing license entry is
+    indistinguishable from a resolved one, so it could close a live work item.
+
+    The fifth read, fetch_v3_root_libraries, does NOT gate it and must not be added back. It
+    contributes two decorative lines (Recommended Fix, Recommended Major Version) to items that
+    already exist; it can never remove a key from `desired`, so its failure cannot produce a
+    false closure. .../groupBy/rootLibrary is also a new endpoint whose availability per org is
+    unproven and whose OpenAPI spec is known to be incomplete -- folding it in meant one 404
+    stopped closure for EVERY project and failed the run, which is the precise defect closure
+    was built to fix. A failed root read logs a warning saying so instead.
+
+    Keyed by (kind, identity-key) rather than by library: one library can carry both a
+    vulnerability and a license work item, and they are separate items with different titles.
+    The vulnerability half of that key depends on MEND_DEPENDENCY -- the library name in
+    dependency mode, "{cve}|{library}" in per-CVE mode, because that mode makes one work item per
+    CVE. conf is read HERE and threaded into normalise_findings as a flag; source3 stays pure.
+
+    Every entry carries "licenses" (a list, [] when the library has none) so downstream
+    rendering never has to guard for the key's absence. A LICENSE entry also carries "component"
+    ({} when the library has no due-diligence row), because ProjectViolationDTOV3 has no
+    component of its own -- see normalise_library_components.
+    A VULNERABILITY entry also carries "root" ({} when the root has no remediation row), which is
+    what the Recommended Fix block renders from.
+    """
+    findings, findings_ok = fetch_v3_pages(
+        f"projects/{project_uuid}/dependencies/findings/security")
+    violations, violations_ok = fetch_v3_pages(
+        f"orgs/{org_uuid()}/projects/{project_uuid}/violations")
+    dd_licenses, dd_components, licenses_ok = fetch_v3_licenses(project_uuid)
+    lib_components, lib_licenses, libraries_ok = fetch_v3_libraries(project_uuid)
+    roots, roots_ok = fetch_v3_root_libraries(project_uuid)
+    # The libraries call is the primary projection and wins; due diligence fills only the fields
+    # it leaves blank. Neither is complete on its own -- see source3.merge_component_index.
+    components = merge_component_index(lib_components, dd_components)
+    licenses = merge_license_index(lib_licenses, dd_licenses)
+
+    per_cve = per_cve_mode()
+    vuln_entries, unscored = normalise_findings(findings, floor, per_cve=per_cve)
+    lic_entries = normalise_violations(violations)
+
+    if unscored:
+        # Logged explicitly, so an included unscored finding is never a silent side effect.
+        logger.info(f"{unscored} unscored vulnerability finding(s) in project "
+                    f"{project_uuid} were INCLUDED: they cannot be compared to MEND_SEVERITY, "
+                    f"and a real finding vanishing because Mend has not scored it yet is the "
+                    f"worse failure.")
+
+    # Which source each License Details link will come from. Every candidate field is optional
+    # in 3.0, so a license rendering without a link is a DATA fact, not a code fact -- and it has
+    # to be visible without a live debugging round.
+    link_report = license_link_report(licenses, components)
+    # Deliberately DEBUG-only, not a warning: the missing license URLs were confirmed to be a
+    # Mend-side data gap, not something a run should nag about every time.
+    logger.debug(f"Project {project_uuid} license links -- "
+                 f"{len(link_report['license_url'])} from a license URL, "
+                 f"{len(link_report['library_page'])} from the library's Mend page, "
+                 f"{len(link_report['no_link'])} with none: {link_report}")
+
+    desired = {}
+    for key, entry in vuln_entries.items():
+        # licenses and components are indexed by LIBRARY, and `key` is not the library in
+        # per-CVE mode. The component index is a FALLBACK here: a finding's own component is
+        # authoritative and render_inputs only reaches for the index where the finding is blank.
+        entry["licenses"] = licenses.get(entry["library"], [])
+        entry["component"] = components.get(entry["library"], {})
+        # entry["library"] is the ROOT name in dependency mode, so this lookup hits directly. In
+        # per-CVE mode it is the vulnerable library and will usually miss -- {} then renders no
+        # remediation block, which is correct: a per-CVE item is not about a root.
+        entry["root"] = roots.get(entry["library"], {})
+        desired[("vulnerability", key)] = entry
+    for lib, entry in lic_entries.items():
+        entry["licenses"] = licenses.get(lib, [])
+        # A license violation carries no component of its own (ProjectViolationDTOV3 has none),
+        # so its version/paths/home page come from the due-diligence index. {} when the library
+        # has no due-diligence row -- render_inputs then yields blanks and the renderer omits
+        # those lines rather than showing empty labels.
+        entry["component"] = components.get(lib, {})
+        desired[("license", lib)] = entry
+    # Decorative, like the root-remediation index below: dependency paths can only add a line to
+    # a description, never remove a key from `desired`, so a failed /paths call must never touch
+    # `ok`. See attach_library_paths and fetch_v2_library_paths.
+    attach_library_paths(project_uuid, desired, per_cve)
+    # roots_ok is deliberately absent from this chain -- see the docstring. It cannot shrink
+    # `desired`, so it cannot cause a false closure, and gating on it would stop closure org-wide
+    # if the rootLibrary endpoint is unavailable.
+    return desired, (findings_ok and violations_ok and licenses_ok and libraries_ok)
 
 
 def extract_url(url: str) -> str:
@@ -1131,18 +2930,33 @@ def extract_url(url: str) -> str:
     return url_[0:pos] if pos > -1 else url_
 
 
+def mend_api_url() -> str:
+    """The 2.0/3.0 API host, derived from MEND_URL's host prefixed with 'api-'.
+
+    `conf.ws_url` (MEND_URL) is the SCA app host; the API host is always derivable from it
+    by prefixing the hostname with 'api-' (e.g. saas.mend.io -> api-saas.mend.io); this is
+    confirmed Mend platform behaviour. Idempotent: a host already carrying the 'api-' prefix
+    is left alone. Empty `conf.ws_url` yields "" rather than "https://api-".
+    """
+    if not conf.ws_url:
+        return ""
+    normalised = extract_url(conf.ws_url)
+    host = normalised[len("https://"):]
+    if host.startswith("api-"):
+        return normalised
+    return f"https://api-{host}"
+
+
 def startup():
     global conf
     conf = Config(
         ws_user_key=varenvs.get_env("wsuserkey").strip(),
-        ws_org_token=varenvs.get_env("wsapikey").strip(),
         ws_url=varenvs.get_env("wsurl").strip(),
         wsproducttoken=varenvs.get_env("wsproduct").strip(),
         wsprojecttoken=varenvs.get_env("wsproject").strip(),
         azure_uri=varenvs.get_env("wsazureuri").strip(),
         azure_pat=varenvs.get_env("wsazurepat").strip(),
         azure_project=varenvs.get_env("wsazureproject").strip(),
-        reset=varenvs.get_env("wsreset", "False").strip(),
         wsexcludetoken=varenvs.get_env("wsexcludetoken").strip(),
         azure_area=varenvs.get_env("wsazurearea").strip(),
         azure_type=varenvs.get_env("wsazuretype", "Task").strip(),
@@ -1152,8 +2966,18 @@ def startup():
         reponame=varenvs.get_env("wsreponame").strip(),
         description=varenvs.get_env("azuredesc").strip(),
         priority=varenvs.get_env("azurepriority").strip(),
-        wsalert=varenvs.get_env("wsalert").strip(),
         proxy=varenvs.get_env("proxy").strip(),
+        routing=varenvs.get_env("wsrouting").strip(),
+        branches=varenvs.get_env("wsbranches").strip(),
+        reachability=varenvs.get_env("wsreachability").strip(),
+        email=varenvs.get_env("wsemail").strip(),
+        org_uuid=varenvs.get_env("wsorguuid").strip(),
+        severity=varenvs.get_env("wsseverity").strip(),
+        closed_state=varenvs.get_env("wsclosedstate").strip(),
+        reopen_state=varenvs.get_env("wsreopenstate").strip(),
+        ssl_verify=varenvs.get_env("wssslverify").strip(),
+        dep_paths=varenvs.get_env("wsdeppaths").strip(),
+        dep_paths_concurrency=varenvs.get_env("wsdeppathsconcurrency").strip(),
     )
     try:
         return conf

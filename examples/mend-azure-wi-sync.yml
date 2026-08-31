@@ -17,6 +17,11 @@ variables:
 
 steps:
 
+- task: UsePythonVersion@0
+  inputs:
+    versionSpec: '3.12'
+  displayName: 'Use Python 3.12'
+
 - script: |
     python -m pip install --upgrade pip
     pip install -r requirements.txt
@@ -26,23 +31,67 @@ steps:
   displayName: 'Mend SCA Work Item Sync'
   env:
     # Required parameters
-    # Documentation: https://github.com/mend-toolkit/azure-wi-sync/tree/main#azure-pipeline-variables
+    # Documentation: https://github.com/mend-toolkit/mend-azure-pipeline-workitems#azure-pipeline-variables
     MEND_URL: $(MEND_URL)
     MEND_USERKEY: $(MEND_USERKEY)
-    MEND_APIKEY: $(MEND_APIKEY)
+    # MEND_ORGUUID is the UUID of your Mend organization. It replaced MEND_APIKEY, which is no
+    # longer read: the API key and the organization UUID were the same identifier, and keeping
+    # both meant a pipeline that set only MEND_ORGUUID failed at startup.
+    MEND_ORGUUID: $(MEND_ORGUUID)
+    # MEND_EMAIL is REQUIRED: the email of the Mend user whose MEND_USERKEY this is. It logs in
+    # against Mend API 2.0 to obtain the JWT that authenticates every Mend API 3.0 call, which
+    # is how this integration now reads everything. Without it the run cannot authenticate.
+    MEND_EMAIL: $(MEND_EMAIL)
     MEND_AZUREPAT: $(MEND_AZUREPAT)
     MEND_AZUREURI: $(System.CollectionUri)
     MEND_AZUREPROJECT: $(System.TeamProject)
     # Optional parameters
+    # NOTE: the three token variables now take Mend API 3.0 UUIDs, not 1.4 tokens. A stale 1.4
+    # token aborts the run with a message naming the variable.
     MEND_PRODUCTTOKEN: $(MEND_PRODUCTTOKEN)
     MEND_PROJECTTOKEN: $(MEND_PROJECTTOKEN)
     MEND_EXCLUDETOKEN: $(MEND_EXCLUDETOKEN)
     MEND_AZUREAREA: $(MEND_AZUREAREA)
     MEND_AZURETYPE: $(MEND_AZURETYPE)
-    MEND_RESET: $(MEND_RESET)
     MEND_CUSTOMFIELDS: $(MEND_CUSTOMFIELDS)
     MEND_DEPENDENCY : $(MEND_DEPENDENCY)
     MEND_REPONAME : $(MEND_REPONAME)
     MEND_DESCRIPTION : $(MEND_DESCRIPTION)
     MEND_CALCULATEPRIORITY : $(MEND_CALCULATEPRIORITY)
-    MEND_ALERT : $(MEND_ALERT)
+    # Minimum CVSS severity that earns a work item: low | medium | high | critical, or a number
+    # from 0 to 10. Defaults to "high" (7.0). The SAME floor governs closure -- a work item whose
+    # findings all drop below it is closed -- so lowering it creates work items and raising it
+    # closes them.
+    MEND_SEVERITY: $(MEND_SEVERITY)
+    # State names written when a finding disappears from Mend and when it comes back. These are
+    # process-dependent: Agile Closed/Active, Scrum Done/New, Basic Done/To Do. Closure never
+    # deletes a work item -- it keeps its id and history.
+    # MEND_CLOSEDSTATE: $(MEND_CLOSEDSTATE)
+    # MEND_REOPENSTATE: $(MEND_REOPENSTATE)
+    # Tag-based routing to multiple Azure projects (optional)
+    # MEND_ROUTING: $(MEND_ROUTING)
+    # MEND_BRANCHES: $(MEND_BRANCHES)
+    # EPSS score and exploit code maturity always render and have no variable.
+    # Reachability on every work item (optional) -- an org without reachability analysis
+    # enabled can leave this off and avoid a column of "-"
+    # MEND_REACHABILITY: $(MEND_REACHABILITY)
+    # Read from the same Mend 3.0 finding as the rest of the work item -- no extra call, no
+    # extra variable and no extra Mend permission.
+    # NOTE: uncomment the line only once the matching pipeline variable exists. Azure leaves
+    # an undefined variable as the literal string "$(MEND_REACHABILITY)", which normalizes to
+    # "false" -- the feature then stays off with nothing logged as an error.
+    # Root-to-leaf dependency chains in the description (optional). Defaults to true. Set false
+    # to speed up Work Item creation; descriptions then fall back to the flat parents list.
+    # MEND_DEPPATHS: $(MEND_DEPPATHS)
+    # How many dependency-path calls run at once. Defaults to 16. Raise it if a run with many
+    # transitive libraries is slow. Above 64 is clamped; an invalid value falls back to 16.
+    # MEND_DEPPATHS_CONCURRENCY: $(MEND_DEPPATHS_CONCURRENCY)
+    # Network and advanced (optional)
+    # Proxy as <proxy_ip>:<proxy_port>, or <username>:<password>@<proxy_ip>:<proxy_port> for
+    # basic auth. Without an http:// or https:// prefix, http:// is assumed.
+    # MEND_PROXY: $(MEND_PROXY)
+    # TLS certificate verification for the Mend and Azure DevOps calls. Defaults to true. Set
+    # false only to unblock a run where verification fails. To supply a CA bundle for a
+    # self-hosted agent behind a TLS-inspecting proxy, set the standard REQUESTS_CA_BUNDLE
+    # variable to its path instead -- MEND_SSLVERIFY does not take a path.
+    # MEND_SSLVERIFY: $(MEND_SSLVERIFY)
