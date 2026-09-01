@@ -56,7 +56,7 @@ WARNING_MSG = False
 # run. Silencing at source covers every call site, present and future.
 TLS_WARNINGS_SILENCED = False
 mend_v2_session = None
-AGENT_INFO = {"agent": f"{__tool_name__.replace('_', '-')}", "agentVersion": __version__}
+AGENT_INFO = {"agent": f"ps-{__tool_name__}".replace('_', '-'), "agentVersion": __version__}
 DEFAULT_PRIORITY = 2
 uuid_pattern = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 token_pattern = r"^[0-9a-zA-Z]{64}$"
@@ -279,6 +279,21 @@ def ssl_error_hint(host_desc: str, err) -> str:
             f"previous versions did.")
 
 
+def mend_headers(token: str = "") -> dict:
+    """Headers for every Mend call.
+
+    agent-name and agent-version are what Mend's API logs read to attribute traffic to this
+    integration. Without them a call is indistinguishable from any other python-requests client,
+    so they go on the 2.0 login as well, which runs before there is a token to send.
+    """
+    headers = {"Content-Type": "application/json",
+               "agent-name": AGENT_INFO["agent"],
+               "agent-version": AGENT_INFO["agentVersion"]}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _post_v2_login():
     # Split out so tests can stub the transport without mocking requests itself.
     # mend_api_url(), NOT conf.ws_url: 2.0/3.0 live on api-saas.mend.io while conf.ws_url is
@@ -290,7 +305,7 @@ def _post_v2_login():
     body = {"email": conf.email, "userKey": conf.ws_user_key, "orgToken": org_uuid()}
     try:
         res_ = requests.post(url, json=body, verify=verify_setting(), proxies=conf.proxy,
-                             headers={"Content-Type": "application/json"})
+                             headers=mend_headers())
         return (json.loads(res_.text), 0) if res_.status_code == 200 \
             else (try_or_error(lambda: json.loads(res_.text), {}), 2)
     except requests.exceptions.SSLError as err:
@@ -336,8 +351,7 @@ def _get_v2(url: str, token: str, params: dict, timeout: float = None):
                 warnings.simplefilter("always", InsecureRequestWarning)
                 res_ = requests.get(url, params=params or {}, verify=verify_setting(),
                                     proxies=conf.proxy, timeout=timeout,
-                                    headers={"Authorization": f"Bearer {token}",
-                                             "Content-Type": "application/json"})
+                                    headers=mend_headers(token))
             if not WARNING_MSG:
                 for warning in warning_list:
                     if issubclass(warning.category, InsecureRequestWarning):
@@ -347,8 +361,7 @@ def _get_v2(url: str, token: str, params: dict, timeout: float = None):
         else:
             res_ = requests.get(url, params=params or {}, verify=verify_setting(),
                                 proxies=conf.proxy, timeout=timeout,
-                                headers={"Authorization": f"Bearer {token}",
-                                         "Content-Type": "application/json"})
+                                headers=mend_headers(token))
         if res_.status_code == 200:
             return json.loads(res_.text), 0
         return try_or_error(lambda: json.loads(res_.text), {}), res_.status_code
@@ -372,8 +385,7 @@ def _post_v3(url: str, token: str, body: dict, params: dict):
             res_ = requests.post(url, params=params or {}, json=body or {},
                                  verify=verify_setting(),
                                  proxies=conf.proxy,
-                                 headers={"Authorization": f"Bearer {token}",
-                                          "Content-Type": "application/json"})
+                                 headers=mend_headers(token))
         if not WARNING_MSG:
             for warning in warning_list:
                 if issubclass(warning.category, InsecureRequestWarning):
