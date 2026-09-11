@@ -2990,6 +2990,9 @@ def startup():
         ssl_verify=varenvs.get_env("wssslverify").strip(),
         dep_paths=varenvs.get_env("wsdeppaths").strip(),
         dep_paths_concurrency=varenvs.get_env("wsdeppathsconcurrency").strip(),
+        azure_tenant_id=varenvs.get_env("wsazuretenantid").strip(),
+        azure_client_id=varenvs.get_env("wsazureclientid").strip(),
+        azure_client_secret=varenvs.get_env("wsazureclientsecret").strip(),
     )
     try:
         return conf

@@ -55,6 +55,9 @@ class varenvs(Enum):  # Accepted env var name(s) per setting, in priority order
     wssslverify = ("MEND_SSLVERIFY",)
     wsdeppaths = ("MEND_DEPPATHS",)
     wsdeppathsconcurrency = ("MEND_DEPPATHS_CONCURRENCY",)
+    wsazuretenantid = ("MEND_AZURETENANTID",)
+    wsazureclientid = ("MEND_AZURECLIENTID",)
+    wsazureclientsecret = ("MEND_AZURECLIENTSECRET",)
 
     @classmethod
     def get_env(cls, key, alt_val=""):
@@ -130,6 +133,11 @@ class Config:
     # and core.library_paths_pool_size.
     dep_paths: str = ""
     dep_paths_concurrency: str = ""
+    # Entra service principal credentials. Defaulted, like ssl_verify and dep_paths, so an
+    # older Config(...) call keeps working and gets PAT behaviour without opting in.
+    azure_tenant_id: str = ""
+    azure_client_id: str = ""
+    azure_client_secret: str = ""
 
     def conf_json(self):
         return {
@@ -137,7 +145,6 @@ class Config:
             "wsurl": self.ws_url,
             "wsazureuri": self.azure_uri,
             "wsazureproject": self.azure_project,
-            "wsazurepat": self.azure_pat,
             "wsazurearea": self.azure_area,
             "utcdelta": self.utc_delta,
             "wsproducttoken": self.wsproducttoken,
