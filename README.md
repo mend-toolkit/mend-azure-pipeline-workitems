@@ -26,6 +26,7 @@ reconciles Azure DevOps against it:
 - [Azure DevOps Setup](#azure-devops-setup)
 - [Mend SCA Setup](#mend-sca-setup)
 - [Azure Pipeline Variables](#azure-pipeline-variables)
+- [Entra authentication](#entra-authentication)
 - [Reachability](#reachability)
 - [Routing to Multiple Azure Projects](#routing-to-multiple-azure-projects)
 - [Closing and Reopening Work Items](#closing-and-reopening-work-items)
@@ -94,7 +95,10 @@ are likely to fill them in.
 | `MEND_USERKEY` | secret | N/A | Your Mend user key |
 | `MEND_ORGUUID` | string | N/A | UUID of your Mend organization. Identifies the organization on every Mend API call |
 | `MEND_AZUREURI` | string | N/A | Azure DevOps organization URI, for example `https://dev.azure.com/MyOrganization`. Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services) `$(System.CollectionUri)` |
-| `MEND_AZUREPAT` | secret | N/A | Azure DevOps [Personal Access Token](https://docs.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate?view=azure-devops&tabs=Windows) |
+| `MEND_AZUREPAT` | secret | N/A | Azure DevOps [Personal Access Token](https://docs.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate?view=azure-devops&tabs=Windows). Not required when the Entra trio below is set, see [Entra authentication](#entra-authentication) |
+| `MEND_AZURETENANTID` | string | N/A | Microsoft Entra Directory (tenant) ID. Alternative to `MEND_AZUREPAT`, see [Entra authentication](#entra-authentication) |
+| `MEND_AZURECLIENTID` | string | N/A | Entra Application (client) ID |
+| `MEND_AZURECLIENTSECRET` | secret | N/A | Entra client secret **Value** |
 | `MEND_AZUREPROJECT` | string | N/A | Azure Team Project name. Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services) `$(System.TeamProject)`. **Not required when `MEND_ROUTING: true`**, where every destination comes from the Mend project's tags and the Work Item type is read from each destination. Set without routing, it is the destination |
 
 ### Choosing what to sync
@@ -142,6 +146,28 @@ one's findings to the Azure project named by its tag.
 | `MEND_SSLVERIFY` | boolean | `true` | TLS certificate verification for the Mend and Azure DevOps calls. Set `false` to unblock a run where verification fails. To supply a CA bundle for a self-hosted agent behind a TLS-inspecting proxy, set the standard `REQUESTS_CA_BUNDLE` environment variable to its path; this variable does not take a path |
 
 <br />
+
+## Entra authentication
+
+Instead of a Personal Access Token, the integration can authenticate to Azure DevOps as a
+Microsoft Entra service principal, which uses short-lived tokens rather than a long-lived
+credential. Set `MEND_AZURETENANTID`, `MEND_AZURECLIENTID` and `MEND_AZURECLIENTSECRET`
+and leave `MEND_AZUREPAT` unset. If both are configured the service principal is used.
+
+Available for Azure DevOps **Services** only. Azure DevOps Server continues to use a PAT.
+
+**In Azure DevOps**, the service principal needs the same access the PAT user has today:
+added to the organization explicitly with a **Basic** access level (Stakeholder cannot
+access work items), Work Items read and write plus Project and Team read on the target
+project, and **Create tag definition** and **View permissions for this node** under
+Project Settings. Adding it to an Entra security group does not grant Azure DevOps access.
+
+**Network.** The runner needs outbound HTTPS to `login.microsoftonline.com` in addition to
+your Azure DevOps host. This is a new destination: the integration did not contact it when
+using a PAT. If the runner is behind a proxy, set `MEND_PROXY`. An Azure Pipelines
+self-hosted agent's own proxy configuration does not pass through to the Python process
+this tool runs in, so `MEND_PROXY` is required even on an agent that is already proxied.
+If the proxy inspects TLS, point `REQUESTS_CA_BUNDLE` at its CA bundle.
 
 ## Reachability
 
