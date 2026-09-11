@@ -90,3 +90,64 @@ def test_startup_reads_all_three_variables():
     assert conf.azure_tenant_id == TENANT
     assert conf.azure_client_id == "cid"
     assert conf.azure_client_secret == "sec"
+
+
+# ------------------------------------------------------------------ validation
+
+def test_a_complete_triple_needs_no_pat():
+    conf = _conf(azure_pat="", azure_tenant_id=TENANT, azure_client_id="cid",
+                 azure_client_secret="sec")
+    with mock.patch.object(core, "conf", conf):
+        assert not [r for r in core.check_patterns() if "AZURE" in r]
+
+
+def test_a_pat_alone_still_validates():
+    """No regression for every existing customer."""
+    with mock.patch.object(core, "conf", _conf()):
+        assert not [r for r in core.check_patterns() if "AZURE" in r]
+
+
+def test_a_partial_triple_names_exactly_the_missing_variable():
+    """Reporting MEND_AZUREPAT here would send an operator debugging the wrong
+    credential entirely."""
+    conf = _conf(azure_pat="", azure_tenant_id=TENANT, azure_client_id="",
+                 azure_client_secret="sec")
+    with mock.patch.object(core, "conf", conf):
+        res = core.check_patterns()
+    assert any("MEND_AZURECLIENTID" in r for r in res)
+    assert not any("MEND_AZURETENANTID" in r for r in res)
+    assert not any(r.startswith("MEND_AZUREPAT") for r in res)
+
+
+def test_no_credential_at_all_offers_both_options():
+    conf = _conf(azure_pat="")
+    with mock.patch.object(core, "conf", conf):
+        res = core.check_patterns()
+    joined = " ".join(res)
+    assert "MEND_AZUREPAT" in joined
+    assert "MEND_AZURETENANTID" in joined
+
+
+def test_both_credentials_configured_warns_once_and_does_not_fail(caplog):
+    conf = _conf(azure_tenant_id=TENANT, azure_client_id="cid", azure_client_secret="sec")
+    with mock.patch.object(core, "conf", conf), caplog.at_level("WARNING"):
+        res = core.check_patterns()
+    assert not [r for r in res if "AZURE" in r]
+    assert "MEND_AZUREPAT" in caplog.text
+
+
+def test_a_pat_plus_a_partial_triple_warns_but_does_not_fail(caplog):
+    """A half-finished migration must be visible without breaking a live pipeline."""
+    conf = _conf(azure_tenant_id=TENANT)
+    with mock.patch.object(core, "conf", conf), caplog.at_level("WARNING"):
+        res = core.check_patterns()
+    assert not [r for r in res if "AZURE" in r]
+    assert "MEND_AZURECLIENTID" in caplog.text
+
+
+def test_the_secret_never_reaches_a_log_record(caplog):
+    conf = _conf(azure_tenant_id=TENANT, azure_client_id="cid",
+                 azure_client_secret="super-secret-value")
+    with mock.patch.object(core, "conf", conf), caplog.at_level("DEBUG"):
+        core.check_patterns()
+    assert "super-secret-value" not in caplog.text

@@ -10,6 +10,7 @@ import requests
 import sys
 
 sys.path.append(os.path.dirname(__file__))
+import auth
 from _version import __tool_name__, __version__
 from config import *
 from identity import (cve_key, license_title, matches_cve, matches_library,
@@ -114,6 +115,12 @@ def try_or_error(supplier, msg):
         return msg
 
 
+def _azure_auth_mode() -> str:
+    """Which Azure DevOps credential this run uses. See auth.auth_mode."""
+    return auth.auth_mode(conf.azure_pat, conf.azure_tenant_id,
+                          conf.azure_client_id, conf.azure_client_secret)
+
+
 def check_patterns():
     res = []
     if not (re.match(uuid_pattern, conf.ws_user_key) or re.match(token_pattern, conf.ws_user_key)):
@@ -155,8 +162,24 @@ def check_patterns():
         # $(System.TeamProject)-style value that picked up a team suffix by mistake.
         res.append(f"MEND_AZUREPROJECT ('{conf.azure_project}') must not contain '/' "
                    f"— Azure DevOps parses this as '{{project}}/{{team}}'")
-    if not conf.azure_pat:
-        res.append("MEND_AZUREPAT")
+    mode = _azure_auth_mode()
+    partial = auth.missing_entra_fields(conf.azure_tenant_id, conf.azure_client_id,
+                                        conf.azure_client_secret)
+    if mode == "none":
+        if partial:
+            # Naming MEND_AZUREPAT here would send an operator debugging the wrong
+            # credential: two thirds of a service principal is clearly the intent.
+            for name in partial:
+                res.append(f"{name} (the Entra service principal configuration is incomplete)")
+        else:
+            res.append("MEND_AZUREPAT, or the Entra trio MEND_AZURETENANTID, "
+                       "MEND_AZURECLIENTID and MEND_AZURECLIENTSECRET")
+    elif mode == "entra" and conf.azure_pat:
+        logger.warning("Both MEND_AZUREPAT and an Entra service principal are configured. "
+                       "Using the service principal; MEND_AZUREPAT is ignored.")
+    elif mode == "pat" and partial:
+        logger.warning(f"Ignoring an incomplete Entra service principal configuration and "
+                       f"using MEND_AZUREPAT. Missing: {', '.join(partial)}.")
     if not conf.ws_url:
         res.append("MEND_URL")
     if not conf.email.strip():
