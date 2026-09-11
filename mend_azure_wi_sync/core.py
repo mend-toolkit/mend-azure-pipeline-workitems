@@ -356,6 +356,64 @@ def mend_v2_token() -> str:
     return token
 
 
+# Process-wide, like mend_v2_session. expires_at is a time.monotonic() reading, so an NTP
+# correction on a self-hosted runner cannot make a live token look expired or the reverse.
+azure_entra_session = {"token": "", "expires_at": 0.0}
+
+
+def _post_entra_token():
+    # Split out so tests can stub the transport without mocking requests itself, exactly
+    # as _post_v2_login is.
+    url = auth.token_endpoint(conf.azure_tenant_id)
+    body = auth.token_request_body(conf.azure_client_id, conf.azure_client_secret)
+    try:
+        res_ = requests.post(url, data=body, verify=verify_setting(), proxies=conf.proxy,
+                             headers={"Content-Type": "application/x-www-form-urlencoded"})
+        payload = try_or_error(lambda: json.loads(res_.text), {})
+        if res_.status_code == 200:
+            return payload, 0
+        # token_error_message sees only the response, never the body we just sent.
+        logger.error(f"Entra token request failed: "
+                     f"{auth.token_error_message(payload, res_.text)}")
+        return payload, 2
+    except requests.exceptions.SSLError as err:
+        logger.error(f"[{ex()}] {ssl_error_hint('the Microsoft Entra login host', err)}")
+        return {}, 2
+    except Exception as err:
+        logger.error(f"[{ex()}] Entra token request failed: {err}. Check that the runner "
+                     f"can reach login.microsoftonline.com, and set MEND_PROXY if it is "
+                     f"behind a proxy.")
+        return {}, 2
+
+
+def azure_entra_token() -> str:
+    """A cached Entra access token, re-minted auth.REFRESH_MARGIN_SECONDS before expiry.
+
+    Returns "" on failure, having logged it. A failure is deliberately NOT cached, so a
+    transient 503 does not poison the rest of the run.
+    """
+    global azure_entra_session
+    now = time.monotonic()
+    if auth.token_is_fresh(azure_entra_session["token"],
+                           azure_entra_session["expires_at"], now):
+        return azure_entra_session["token"]
+    payload, errorcode = _post_entra_token()
+    if errorcode != 0:
+        return ""
+    token, expires_at = auth.parse_token_response(payload, now)
+    if not token:
+        logger.error("The Entra token response carried no access_token.")
+        return ""
+    azure_entra_session = {"token": token, "expires_at": expires_at}
+    return token
+
+
+def invalidate_azure_entra_token():
+    """Drop the cached token so the next call re-mints. Used by the single 401 retry."""
+    global azure_entra_session
+    azure_entra_session = {"token": "", "expires_at": 0.0}
+
+
 def _get_v2(url: str, token: str, params: dict, timeout: float = None):
     # timeout defaults to None, meaning no timeout: call_ws_api_v2, call_ws_api_v3 and the 2.0
     # login all pass nothing. Only the batch /paths fetch (_fetch_paths_batch) passes a value, so
