@@ -605,6 +605,32 @@ def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000, method: str
     return items, False
 
 
+def _azure_request_kwargs(header: str) -> dict:
+    """The auth kwargs for whichever credential this run uses."""
+    headers = {'Content-Type': f'{header}'}
+    if _azure_auth_mode() == "entra":
+        headers["Authorization"] = f"Bearer {azure_entra_token()}"
+        return {"headers": headers}
+    return {"headers": headers, "auth": ('', conf.azure_pat)}
+
+
+def _azure_send(api_type: str, url: str, data: dict, header: str, proxies):
+    """One Azure DevOps request, with a single re-mint retry on 401 in Entra mode.
+
+    A cached token can die before its deadline (clock skew, a secret rotated mid-run), and
+    that is indistinguishable from a permission failure until it is retried. Exactly once:
+    a second 401 is real and must surface. Mirrors the single expiry retry call_ws_api_v2
+    already performs for the Mend JWT.
+    """
+    res_ = requests.request(api_type, url, json=data, proxies=proxies,
+                            verify=verify_setting(), **_azure_request_kwargs(header))
+    if res_.status_code == 401 and _azure_auth_mode() == "entra":
+        invalidate_azure_entra_token()
+        res_ = requests.request(api_type, url, json=data, proxies=proxies,
+                                verify=verify_setting(), **_azure_request_kwargs(header))
+    return res_
+
+
 def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", project: str = "", cmd_type: str = "?",
                    header: str = "application/json-patch+json"):
 
@@ -617,11 +643,7 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
             f"{conf.azure_uri}{project}/_apis/{api}{cmd_type}api-version={version}"
         with warnings.catch_warnings(record=True) as warning_list:
             warnings.simplefilter("always", InsecureRequestWarning)
-            res_ = requests.request(api_type, url, json=data,
-                                    headers={'Content-Type': f'{header}'},
-                                    proxies=conf.proxy,
-                                    verify=verify_setting(),
-                                    auth=('', conf.azure_pat))
+            res_ = _azure_send(api_type, url, data, header, conf.proxy)
         if not WARNING_MSG:
             for warning in warning_list:
                 if issubclass(warning.category, InsecureRequestWarning):
@@ -636,11 +658,8 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                 if temp_http_proxy:
                     with warnings.catch_warnings(record=True) as warning_list:
                         warnings.simplefilter("always", InsecureRequestWarning)
-                        res_ = requests.request(api_type, url, json=data,
-                                                headers={'Content-Type': f'{header}'},
-                                                proxies={"http": temp_http_proxy},
-                                                verify=verify_setting(),
-                                                auth=('', conf.azure_pat))
+                        res_ = _azure_send(api_type, url, data, header,
+                                           {"http": temp_http_proxy})
                     if not WARNING_MSG:
                         for warning in warning_list:
                             if issubclass(warning.category, InsecureRequestWarning):
@@ -673,8 +692,13 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                 msg_text = f'{msg_text} - {msg.group(1)}' if msg else f'{msg_text} - {try_or_error(lambda: json.loads(res_.text)["message"], "")}'
                 res = {f"{msg_text}"}
             elif res_.status_code == 401:
-                res = {f" Non-valid authentication credentials or PAT does not have enough permissions."
-                       f"Check it according to READ.ME file."}
+                if _azure_auth_mode() == "entra":
+                    res = {"Azure DevOps rejected the Entra service principal. Check that it "
+                           "is a member of the organization with a BASIC access level, and "
+                           "that it has Work Items read/write on the project. See the README."}
+                else:
+                    res = {f" Non-valid authentication credentials or PAT does not have enough permissions."
+                           f"Check it according to READ.ME file."}
             else:
                 res = {f"Azure API call failed": "No message text was returned."}
     except requests.exceptions.SSLError as err:
