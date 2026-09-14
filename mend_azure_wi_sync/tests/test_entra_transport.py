@@ -103,17 +103,58 @@ def test_a_401_in_pat_mode_does_not_re_mint():
     assert req.call_count == 1
 
 
+SIGN_IN_PAGE = "<html><head><title>Azure DevOps Services | Sign In</title></head></html>"
+
+
 def test_the_401_message_names_the_credential_actually_in_use():
     """In Entra mode "PAT does not have enough permissions" sends the operator to the
-    wrong place. The usual cause is the service principal's org membership or licence."""
+    wrong place. The usual cause is the service principal's org membership or licence.
+
+    The body matters: a real Azure DevOps 401 carries an HTML sign-in page, so a message
+    that renders only for an empty body never reaches an operator.
+    """
     with mock.patch.object(core, "conf", _entra_conf()), \
          mock.patch.object(core, "azure_entra_token", return_value="tok-1"), \
          mock.patch.object(core.requests, "request") as req:
-        req.return_value = mock.MagicMock(status_code=401, text="")
+        req.return_value = mock.MagicMock(status_code=401, text=SIGN_IN_PAGE)
         res, _ = core.call_azure_api("GET", "projects", project="Platform")
     rendered = str(res)
     assert "service principal" in rendered
     assert "PAT does not have enough permissions" not in rendered
+
+
+def test_the_401_message_survives_a_json_body_too():
+    with mock.patch.object(core, "conf", _entra_conf()), \
+         mock.patch.object(core, "azure_entra_token", return_value="tok-1"), \
+         mock.patch.object(core.requests, "request") as req:
+        req.return_value = mock.MagicMock(
+            status_code=401, text='{"message": "TF400813: unauthorized"}')
+        res, _ = core.call_azure_api("GET", "projects", project="Platform")
+    assert "service principal" in str(res)
+
+
+def test_a_pat_mode_401_with_a_body_still_names_the_pat():
+    with mock.patch.object(core, "conf", _pat_conf()), \
+         mock.patch.object(core.requests, "request") as req:
+        req.return_value = mock.MagicMock(status_code=401, text=SIGN_IN_PAGE)
+        res, errorcode = core.call_azure_api("GET", "projects", project="Platform")
+    assert "PAT does not have enough permissions" in str(res)
+    assert errorcode == 2
+
+
+def test_a_non_401_failure_still_reports_its_status_and_body():
+    """Hoisting the 401 arm must not swallow the status-code message every other
+    failure relies on."""
+    with mock.patch.object(core, "conf", _pat_conf()), \
+         mock.patch.object(core.requests, "request") as req:
+        req.return_value = mock.MagicMock(
+            status_code=403, text='{"message": "VS800075: no permission"}')
+        res, errorcode = core.call_azure_api("GET", "projects", project="Platform")
+    rendered = str(res)
+    assert "403" in rendered
+    assert "VS800075" in rendered
+    assert errorcode == 2
+
 
 def test_an_empty_token_never_reaches_azure_devops(caplog):
     """azure_entra_token returns "" on mint failure by design. Sending `Bearer ` with

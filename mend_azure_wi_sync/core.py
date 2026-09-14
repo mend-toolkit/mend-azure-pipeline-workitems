@@ -712,12 +712,11 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
             return "", 0
         else:
             errorcode = 2
-            if res_.text:
-                msg = try_or_error(lambda: re.search(r"<title>(.*?)</title>", res_.text), "")
-                msg_text = f'Status code: {res_.status_code}'
-                msg_text = f'{msg_text} - {msg.group(1)}' if msg else f'{msg_text} - {try_or_error(lambda: json.loads(res_.text)["message"], "")}'
-                res = {f"{msg_text}"}
-            elif res_.status_code == 401:
+            # 401 is checked before res_.text because an Azure DevOps 401 nearly always
+            # carries a body -- an HTML sign-in page, or a JSON message -- so testing the
+            # body first left the credential-specific advice below unreachable and printed
+            # "Status code: 401 - Azure DevOps Services | Sign In" instead.
+            if res_.status_code == 401:
                 if _azure_auth_mode() == "entra":
                     res = {"Azure DevOps rejected the Entra service principal. Check that it "
                            "is a member of the organization with a BASIC access level, and "
@@ -725,6 +724,11 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                 else:
                     res = {f" Non-valid authentication credentials or PAT does not have enough permissions."
                            f"Check it according to READ.ME file."}
+            elif res_.text:
+                msg = try_or_error(lambda: re.search(r"<title>(.*?)</title>", res_.text), "")
+                msg_text = f'Status code: {res_.status_code}'
+                msg_text = f'{msg_text} - {msg.group(1)}' if msg else f'{msg_text} - {try_or_error(lambda: json.loads(res_.text)["message"], "")}'
+                res = {f"{msg_text}"}
             else:
                 res = {f"Azure API call failed": "No message text was returned."}
     except EntraTokenUnavailable as err:
