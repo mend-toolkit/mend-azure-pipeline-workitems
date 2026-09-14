@@ -52,6 +52,18 @@ def test_conf_json_no_longer_exposes_the_pat():
     assert "wsazurepat" not in _conf().conf_json()
 
 
+def test_conf_json_no_longer_exposes_the_mend_user_key():
+    """Same mechanism and the same blast radius as the PAT above, a different credential:
+    $MEND_USERKEY in MEND_CUSTOMFIELDS wrote the Mend API key into a work item description
+    visible to anyone with board access. It is not documented as substitutable."""
+    # A distinct value, because the fixture reuses VALID as the org UUID, which is an
+    # identifier rather than a credential and legitimately stays exposed.
+    key = "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321"
+    exposed = _conf(ws_user_key=key).conf_json()
+    assert "wsuserkey" not in exposed
+    assert key not in exposed.values()
+
+
 def test_conf_json_exposes_no_entra_credential():
     conf = _conf(azure_tenant_id=TENANT, azure_client_id="cid", azure_client_secret="sec")
     exposed = conf.conf_json()

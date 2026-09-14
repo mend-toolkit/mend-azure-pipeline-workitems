@@ -140,8 +140,11 @@ class Config:
     azure_client_secret: str = ""
 
     def conf_json(self):
+        # No credential belongs here. This dict backs $MEND_X substitution in
+        # MEND_CUSTOMFIELDS, so anything in it can be written into a work item description
+        # and read by everyone with board access. Neither the Mend user key nor any Azure
+        # DevOps credential is exposed, and none may be added.
         return {
-            "wsuserkey": self.ws_user_key,
             "wsurl": self.ws_url,
             "wsazureuri": self.azure_uri,
             "wsazureproject": self.azure_project,

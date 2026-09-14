@@ -67,5 +67,5 @@ def test_no_credential_is_reachable_from_custom_field_substitution():
     import inspect
     source = inspect.getsource(Config.conf_json)
     for forbidden in ("azure_pat", "azure_client_secret", "azure_tenant_id",
-                      "azure_client_id"):
+                      "azure_client_id", "ws_user_key"):
         assert forbidden not in source, f"{forbidden} is reachable from MEND_CUSTOMFIELDS"
