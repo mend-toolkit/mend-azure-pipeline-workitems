@@ -100,6 +100,10 @@ LIBRARY_PATHS_POOL_SIZE_MAX = 64
 # short enough that one stuck socket cannot recreate the multi-minute hang this change fixes --
 # with a 16-wide pool a handful of hangs would otherwise stack up to real wall-clock damage.
 LIBRARY_PATHS_TIMEOUT = 30
+# login.microsoftonline.com is the one host a customer's firewall has never had to allow for this
+# tool, so a dropped rather than refused connection is the likely first failure. Without a timeout
+# that hangs the scheduled run until the agent job timeout and logs nothing.
+ENTRA_TOKEN_TIMEOUT = 30
 run_failed = False
 
 
@@ -368,7 +372,8 @@ def _post_entra_token():
     body = auth.token_request_body(conf.azure_client_id, conf.azure_client_secret)
     try:
         res_ = requests.post(url, data=body, verify=verify_setting(), proxies=conf.proxy,
-                             headers={"Content-Type": "application/x-www-form-urlencoded"})
+                             headers={"Content-Type": "application/x-www-form-urlencoded"},
+                             timeout=ENTRA_TOKEN_TIMEOUT)
         payload = try_or_error(lambda: json.loads(res_.text), {})
         if res_.status_code == 200:
             return payload, 0

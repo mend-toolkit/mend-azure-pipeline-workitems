@@ -178,3 +178,29 @@ def test_invalidating_forces_the_next_call_to_re_mint():
         assert core.azure_entra_token() == "tok-1"
         core.invalidate_azure_entra_token()
         assert core.azure_entra_token() == "tok-2"
+
+
+def test_the_token_post_carries_a_timeout():
+    """login.microsoftonline.com is a host the customer's firewall has never had to
+    allow. A blackholed egress, dropped rather than refused, hangs the scheduled pipeline
+    until the agent job timeout and emits no log line at all."""
+    _reset()
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core.requests, "post") as post:
+        post.return_value = mock.MagicMock(
+            status_code=200, text='{"access_token": "tok-1", "expires_in": 3599}')
+        core.azure_entra_token()
+    assert post.call_args[1]["timeout"] == core.ENTRA_TOKEN_TIMEOUT
+    assert 0 < core.ENTRA_TOKEN_TIMEOUT <= 30
+
+
+def test_a_token_post_timeout_returns_empty_and_names_the_host(caplog):
+    """The existing except arm already carries the egress and proxy hint; this proves a
+    timeout reaches it rather than propagating."""
+    _reset()
+    with mock.patch.object(core, "conf", _conf()), \
+         mock.patch.object(core.requests, "post",
+                           side_effect=requests.exceptions.ConnectTimeout("timed out")), \
+         caplog.at_level("ERROR"):
+        assert core.azure_entra_token() == ""
+    assert "login.microsoftonline.com" in caplog.text
