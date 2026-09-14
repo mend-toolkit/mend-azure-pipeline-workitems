@@ -619,6 +619,16 @@ def _azure_request_kwargs(header: str) -> dict:
     return {"headers": headers, "auth": ('', conf.azure_pat)}
 
 
+class EntraTokenUnavailable(Exception):
+    """Raised instead of sending `Authorization: Bearer ` with nothing after it.
+
+    An empty bearer is not reliably a 401 from Azure DevOps: it can answer 203, or
+    redirect to a sign-in page that requests follows to a 200 HTML body, which lands in
+    call_azure_api's JSONDecodeError branch and reports a proxy fault for what is a
+    token-mint failure. azure_entra_token has already logged the real cause.
+    """
+
+
 def _azure_send(api_type: str, url: str, data: dict, header: str, proxies):
     """One Azure DevOps request, with a single re-mint retry on 401 in Entra mode.
 
@@ -627,13 +637,24 @@ def _azure_send(api_type: str, url: str, data: dict, header: str, proxies):
     a second 401 is real and must surface. Mirrors the single expiry retry call_ws_api_v2
     already performs for the Mend JWT.
     """
+    kwargs = _azure_request_kwargs(header)
+    _reject_empty_bearer(kwargs)
     res_ = requests.request(api_type, url, json=data, proxies=proxies,
-                            verify=verify_setting(), **_azure_request_kwargs(header))
+                            verify=verify_setting(), **kwargs)
     if res_.status_code == 401 and _azure_auth_mode() == "entra":
         invalidate_azure_entra_token()
+        kwargs = _azure_request_kwargs(header)
+        _reject_empty_bearer(kwargs)
         res_ = requests.request(api_type, url, json=data, proxies=proxies,
-                                verify=verify_setting(), **_azure_request_kwargs(header))
+                                verify=verify_setting(), **kwargs)
     return res_
+
+
+def _reject_empty_bearer(kwargs: dict):
+    if kwargs["headers"].get("Authorization") == "Bearer ":
+        raise EntraTokenUnavailable(
+            "No Entra access token could be obtained, so no call was made to Azure "
+            "DevOps. The token request failure is logged above.")
 
 
 def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", project: str = "", cmd_type: str = "?",
@@ -706,6 +727,13 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                            f"Check it according to READ.ME file."}
             else:
                 res = {f"Azure API call failed": "No message text was returned."}
+    except EntraTokenUnavailable as err:
+        # Ahead of the SSLError arm so a mint failure is never reported as a transport or
+        # proxy fault. errorcode 2 is the same fatal read failure the callers already
+        # refuse to create or close on.
+        errorcode = 2
+        logger.error(f"[{ex()}] {err}")
+        res = {f"[{ex()}] Azure API call skipped": f"{err}"}
     except requests.exceptions.SSLError as err:
         errorcode = 2
         logger.error(f"[{ex()}] {ssl_error_hint('the Azure DevOps host', err)}")

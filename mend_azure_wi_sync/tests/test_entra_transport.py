@@ -114,3 +114,35 @@ def test_the_401_message_names_the_credential_actually_in_use():
     rendered = str(res)
     assert "service principal" in rendered
     assert "PAT does not have enough permissions" not in rendered
+
+def test_an_empty_token_never_reaches_azure_devops(caplog):
+    """azure_entra_token returns "" on mint failure by design. Sending `Bearer ` with
+    nothing after it is not reliably a 401: Azure DevOps can answer 203, or redirect to a
+    sign-in page that requests follows to a 200 HTML body, which lands in the
+    JSONDecodeError branch and exit(-1)s with a proxy message for a token-mint failure."""
+    with mock.patch.object(core, "conf", _entra_conf()), \
+         mock.patch.object(core, "azure_entra_token", return_value=""), \
+         mock.patch.object(core.requests, "request") as req, \
+         caplog.at_level("ERROR"):
+        res, errorcode = core.call_azure_api("GET", "projects", project="Platform")
+    assert req.call_count == 0, "no request may go out carrying an empty bearer"
+    assert errorcode == 2
+    assert "token" in str(res).lower()
+
+
+def test_an_empty_token_does_not_exit_the_process():
+    """errorcode 2 is what get_exist_wi and the sync guards already treat as a fatal read
+    failure, so the mass-closure invariant holds without a hard exit."""
+    with mock.patch.object(core, "conf", _entra_conf()), \
+         mock.patch.object(core, "azure_entra_token", return_value=""), \
+         mock.patch.object(core.requests, "request"):
+        _, errorcode = core.call_azure_api("GET", "projects", project="Platform")
+    assert errorcode == 2
+
+
+def test_a_pat_run_is_untouched_by_the_empty_token_guard():
+    with mock.patch.object(core, "conf", _pat_conf()), \
+         mock.patch.object(core.requests, "request", return_value=_ok()) as req:
+        _, errorcode = core.call_azure_api("GET", "projects", project="Platform")
+    assert req.call_count == 1
+    assert errorcode == 0

@@ -25,9 +25,12 @@ from mend_azure_wi_sync import core
 
 
 def _conf(ssl_verify=True, **overrides):
+    # The Entra fields must be empty strings: a bare MagicMock auto-creates them as
+    # truthy attributes, which selects Entra mode and sends no PAT at all.
     values = dict(ssl_verify=ssl_verify, proxy={}, azure_project="TestProj", azure_pat="pat",
                   azure_uri="https://dev.azure.com/org", email="a@b.c", ws_user_key="uk",
-                  ws_org_token="ot")
+                  ws_org_token="ot", azure_tenant_id="", azure_client_id="",
+                  azure_client_secret="")
     values.update(overrides)
     return mock.MagicMock(**values)
 
