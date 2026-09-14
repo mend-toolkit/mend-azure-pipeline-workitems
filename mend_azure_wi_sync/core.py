@@ -619,6 +619,23 @@ def _azure_request_kwargs(header: str) -> dict:
     return {"headers": headers, "auth": ('', conf.azure_pat)}
 
 
+def log_azure_auth_mode():
+    """Say which Azure DevOps credential this run uses, once, before the first call.
+
+    check_patterns warns only when the configuration is ambiguous, so an unremarkable run
+    left no record of which credential it used. Naming the tenant and client makes a live
+    log self-identifying, and makes "is this still the PAT path?" readable at a glance
+    rather than inferred. The secret is never logged.
+    """
+    mode = _azure_auth_mode()
+    if mode == "entra":
+        logger.info(f"Authenticating to Azure DevOps with a Microsoft Entra service "
+                    f"principal (tenant {conf.azure_tenant_id}, client "
+                    f"{conf.azure_client_id}).")
+    elif mode == "pat":
+        logger.info("Authenticating to Azure DevOps with a personal access token.")
+
+
 class EntraTokenUnavailable(Exception):
     """Raised instead of sending `Authorization: Bearer ` with nothing after it.
 

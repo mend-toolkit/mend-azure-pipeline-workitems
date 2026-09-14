@@ -163,3 +163,48 @@ def test_the_secret_never_reaches_a_log_record(caplog):
     with mock.patch.object(core, "conf", conf), caplog.at_level("DEBUG"):
         core.check_patterns()
     assert "super-secret-value" not in caplog.text
+
+
+# --- which credential a run actually used --------------------------------------------------
+
+def _mode_conf(**overrides):
+    values = dict(azure_pat="", azure_tenant_id="", azure_client_id="",
+                  azure_client_secret="")
+    values.update(overrides)
+    return mock.MagicMock(**values)
+
+
+def test_an_entra_run_says_so_at_startup(caplog):
+    """check_patterns warns only in the ambiguous cases, so without this a log does not
+    say which credential was used. Matrix step 7 -- the PAT regression check -- is then
+    verifiable only by inference."""
+    conf = _mode_conf(azure_tenant_id=TENANT, azure_client_id="cid",
+                      azure_client_secret="sec")
+    with mock.patch.object(core, "conf", conf), caplog.at_level("INFO"):
+        core.log_azure_auth_mode()
+    assert "Entra" in caplog.text
+    assert TENANT in caplog.text, "the tenant identifies WHICH service principal"
+    assert "cid" in caplog.text
+
+
+def test_a_pat_run_says_so_at_startup(caplog):
+    with mock.patch.object(core, "conf", _mode_conf(azure_pat="a-pat")), \
+         caplog.at_level("INFO"):
+        core.log_azure_auth_mode()
+    assert "personal access token" in caplog.text.lower()
+
+
+def test_the_startup_line_never_carries_the_secret(caplog):
+    conf = _mode_conf(azure_tenant_id=TENANT, azure_client_id="cid",
+                      azure_client_secret="super-secret-value")
+    with mock.patch.object(core, "conf", conf), caplog.at_level("DEBUG"):
+        core.log_azure_auth_mode()
+    assert "super-secret-value" not in caplog.text
+
+
+def test_a_run_with_no_credential_at_all_is_not_announced_as_authenticated(caplog):
+    """check_patterns already aborts this run; the line must not claim otherwise."""
+    with mock.patch.object(core, "conf", _mode_conf()), caplog.at_level("INFO"):
+        core.log_azure_auth_mode()
+    assert "Entra" not in caplog.text
+    assert "personal access token" not in caplog.text.lower()

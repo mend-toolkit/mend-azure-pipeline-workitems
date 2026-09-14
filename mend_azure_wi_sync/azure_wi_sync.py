@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _version import __tool_name__, __version__, __description__
 from core import run_sync, startup, load_wi_json, apply_custom_fields, AGENT_INFO, \
-    check_patterns, sync_had_fatal_error, error_count
+    check_patterns, sync_had_fatal_error, error_count, log_azure_auth_mode
 
 logger = logging.getLogger(__tool_name__)
 logging.getLogger('urllib3').setLevel(logging.INFO)
@@ -29,6 +29,8 @@ def main():
         logger.error("Missing or malformed configuration parameters:")
         [logger.error(el_) for el_ in chp_]
         exit(-1)
+    # Before the work item type probe below, which is the first Azure DevOps call.
+    log_azure_auth_mode()
     if conf.routing.lower() == "true":
         # No startup probe under routing: MEND_AZUREPROJECT is not a destination and may be
         # unset. run_sync_routed reads the work item type from each destination instead, and
