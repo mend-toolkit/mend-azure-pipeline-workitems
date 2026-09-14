@@ -97,8 +97,8 @@ are likely to fill them in.
 | `MEND_AZUREURI` | string | N/A | Azure DevOps organization URI, for example `https://dev.azure.com/MyOrganization`. Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services) `$(System.CollectionUri)` |
 | `MEND_AZUREPAT` | secret | N/A | Azure DevOps [Personal Access Token](https://docs.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate?view=azure-devops&tabs=Windows). Not required when the Entra trio below is set, see [Entra authentication](#entra-authentication) |
 | `MEND_AZURETENANTID` | string | N/A | Microsoft Entra Directory (tenant) ID. Alternative to `MEND_AZUREPAT`, see [Entra authentication](#entra-authentication) |
-| `MEND_AZURECLIENTID` | string | N/A | Entra Application (client) ID |
-| `MEND_AZURECLIENTSECRET` | secret | N/A | Entra client secret **Value** |
+| `MEND_AZURECLIENTID` | string | N/A | Entra Application (client) ID. Alternative to `MEND_AZUREPAT`, see [Entra authentication](#entra-authentication) |
+| `MEND_AZURECLIENTSECRET` | secret | N/A | Entra client secret **Value**. Alternative to `MEND_AZUREPAT`, see [Entra authentication](#entra-authentication) |
 | `MEND_AZUREPROJECT` | string | N/A | Azure Team Project name. Accepts the [system variable](https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml#system-variables-devops-services) `$(System.TeamProject)`. **Not required when `MEND_ROUTING: true`**, where every destination comes from the Mend project's tags and the Work Item type is read from each destination. Set without routing, it is the destination |
 
 ### Choosing what to sync
