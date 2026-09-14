@@ -69,3 +69,23 @@ def test_no_credential_is_reachable_from_custom_field_substitution():
     for forbidden in ("azure_pat", "azure_client_secret", "azure_tenant_id",
                       "azure_client_id", "ws_user_key"):
         assert forbidden not in source, f"{forbidden} is reachable from MEND_CUSTOMFIELDS"
+
+
+def test_the_autouse_fixture_resets_the_cached_token():
+    """azure_entra_session is credential-bearing and was the one new module global the
+    autouse reset did not cover, so a test that set a live token leaked it into every test
+    that ran after it.
+
+    Asserted by inspection rather than by two order-dependent tests, because
+    pytest-randomly shuffles execution order.
+    """
+    import inspect
+
+    from mend_azure_wi_sync.tests import conftest
+    source = inspect.getsource(conftest.reset_core_globals)
+    assert source.count("azure_entra_session") >= 2, (
+        "reset_core_globals must both clear and restore core.azure_entra_session")
+
+
+def test_the_cached_token_starts_from_the_module_default():
+    assert core.azure_entra_session == {"token": "", "expires_at": 0.0}
