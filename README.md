@@ -27,6 +27,9 @@ reconciles Azure DevOps against it:
 - [Mend SCA Setup](#mend-sca-setup)
 - [Azure Pipeline Variables](#azure-pipeline-variables)
 - [Entra authentication](#entra-authentication)
+  - [Register the application in Entra](#1-register-the-application-in-entra)
+  - [Grant the service principal access in Azure DevOps](#2-grant-the-service-principal-access-in-azure-devops)
+  - [Set the pipeline variables](#3-set-the-pipeline-variables)
 - [Reachability](#reachability)
 - [Routing to Multiple Azure Projects](#routing-to-multiple-azure-projects)
 - [Closing and Reopening Work Items](#closing-and-reopening-work-items)
@@ -43,6 +46,7 @@ reconciles Azure DevOps against it:
 **In Azure DevOps**
 * A Personal Access Token (PAT) with **Work Items (Read, write & manage)** and **Project and Team (Read)**
 * The PAT's user added to a group with **Create tag definition** and **View permissions for this node**, and added to the team for each area path you want Work Items in
+* On Azure DevOps Services, a Microsoft Entra service principal can replace the PAT. See [Entra authentication](#entra-authentication)
 
 **In Mend**
 * A service user with the **Organization Administrator** or **Organization Auditor** [role](https://docs.mend.io/bundle/sca_user_guide/page/managing_groups.html#Assigning-a-Role-to-a-Group)
@@ -151,23 +155,52 @@ one's findings to the Azure project named by its tag.
 
 Instead of a Personal Access Token, the integration can authenticate to Azure DevOps as a
 Microsoft Entra service principal, which uses short-lived tokens rather than a long-lived
-credential. Set `MEND_AZURETENANTID`, `MEND_AZURECLIENTID` and `MEND_AZURECLIENTSECRET`
-and leave `MEND_AZUREPAT` unset. If both are configured the service principal is used.
+credential. Setting it up is three steps: register an application in Entra, grant that
+application access in Azure DevOps, then point the pipeline at it.
 
 Available for Azure DevOps **Services** only. Azure DevOps Server continues to use a PAT.
 
-**In Azure DevOps**, the service principal needs the same access the PAT user has today:
-added to the organization explicitly with a **Basic** access level (Stakeholder cannot
-access work items), Work Items read and write plus Project and Team read on the target
-project, and **Create tag definition** and **View permissions for this node** under
-Project Settings. Adding it to an Entra security group does not grant Azure DevOps access.
+### 1. Register the application in Entra
 
-**Network.** The runner needs outbound HTTPS to `login.microsoftonline.com` in addition to
-your Azure DevOps host. This is a new destination: the integration did not contact it when
-using a PAT. If the runner is behind a proxy, set `MEND_PROXY`. An Azure Pipelines
-self-hosted agent's own proxy configuration does not pass through to the Python process
-this tool runs in, so `MEND_PROXY` is required even on an agent that is already proxied.
-If the proxy inspects TLS, point `REQUESTS_CA_BUNDLE` at its CA bundle.
+In the Microsoft Entra admin center or the Azure portal, under
+**Microsoft Entra ID > App registrations**:
+
+1. **New registration**. Give it a name, for example `mend-azure-wi-sync`. Leave
+   **Supported account types** on *Accounts in this organizational directory only*, and
+   leave **Redirect URI** empty. This is a daemon application: it signs in as itself with
+   the client credentials flow, so it needs no redirect URI and no user consent.
+2. On the app's **Overview** page, copy the **Application (client) ID** into
+   `MEND_AZURECLIENTID` and the **Directory (tenant) ID** into `MEND_AZURETENANTID`.
+3. Under **Certificates & secrets > Client secrets**, choose **New client secret**, set an
+   expiry, and copy the secret's **Value** into `MEND_AZURECLIENTSECRET`. Copy it
+   immediately: the value is shown once and is unrecoverable afterwards. Note the expiry
+   date, because the pipeline fails on the day the secret lapses.
+
+No **API permissions** need to be added to the registration. Azure DevOps decides what the
+principal may do from the access you grant it below.
+
+### 2. Grant the service principal access in Azure DevOps
+
+The app registration on its own can authenticate but cannot see anything. The service
+principal needs the same access the PAT user has today:
+
+1. **Organization settings > Users > Add users**, and add the service principal by its
+   application name. Give it a **Basic** access level: Stakeholder cannot access work
+   items. Adding it to an Entra security group instead does **not** grant Azure DevOps
+   access; it must be added to the organization explicitly.
+2. Add it to the project, with **Work Items (read and write)** and **Project and Team
+   (read)**. Adding it to the project's **Contributors** group covers both.
+3. **Project Settings > Permissions**, grant its group **Create tag definition** and
+   **View permissions for this node**, and add it to the team for each area path you want
+   Work Items in.
+4. Under routing, repeat steps 2 and 3 for every destination Azure project.
+
+### 3. Set the pipeline variables
+
+Set `MEND_AZURETENANTID`, `MEND_AZURECLIENTID` and `MEND_AZURECLIENTSECRET`, and leave
+`MEND_AZUREPAT` unset. Mark the client secret as a secret variable. If both the PAT and
+the Entra trio are configured, the service principal is used. The run logs which
+credential it authenticated with, so the pipeline log confirms the switch took effect.
 
 ## Reachability
 
