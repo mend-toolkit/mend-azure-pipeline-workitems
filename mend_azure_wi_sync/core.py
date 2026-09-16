@@ -10,6 +10,7 @@ import requests
 import sys
 
 sys.path.append(os.path.dirname(__file__))
+import auth
 from _version import __tool_name__, __version__
 from config import *
 from identity import (cve_key, license_title, matches_cve, matches_library,
@@ -99,6 +100,10 @@ LIBRARY_PATHS_POOL_SIZE_MAX = 64
 # short enough that one stuck socket cannot recreate the multi-minute hang this change fixes --
 # with a 16-wide pool a handful of hangs would otherwise stack up to real wall-clock damage.
 LIBRARY_PATHS_TIMEOUT = 30
+# login.microsoftonline.com is the one host a customer's firewall has never had to allow for this
+# tool, so a dropped rather than refused connection is the likely first failure. Without a timeout
+# that hangs the scheduled run until the agent job timeout and logs nothing.
+ENTRA_TOKEN_TIMEOUT = 30
 run_failed = False
 
 
@@ -112,6 +117,12 @@ def try_or_error(supplier, msg):
         return supplier()
     except:
         return msg
+
+
+def _azure_auth_mode() -> str:
+    """Which Azure DevOps credential this run uses. See auth.auth_mode."""
+    return auth.auth_mode(conf.azure_pat, conf.azure_tenant_id,
+                          conf.azure_client_id, conf.azure_client_secret)
 
 
 def check_patterns():
@@ -155,8 +166,24 @@ def check_patterns():
         # $(System.TeamProject)-style value that picked up a team suffix by mistake.
         res.append(f"MEND_AZUREPROJECT ('{conf.azure_project}') must not contain '/' "
                    f"— Azure DevOps parses this as '{{project}}/{{team}}'")
-    if not conf.azure_pat:
-        res.append("MEND_AZUREPAT")
+    mode = _azure_auth_mode()
+    partial = auth.missing_entra_fields(conf.azure_tenant_id, conf.azure_client_id,
+                                        conf.azure_client_secret)
+    if mode == "none":
+        if partial:
+            # Naming MEND_AZUREPAT here would send an operator debugging the wrong
+            # credential: two thirds of a service principal is clearly the intent.
+            for name in partial:
+                res.append(f"{name} (the Entra service principal configuration is incomplete)")
+        else:
+            res.append("MEND_AZUREPAT, or the Entra trio MEND_AZURETENANTID, "
+                       "MEND_AZURECLIENTID and MEND_AZURECLIENTSECRET")
+    elif mode == "entra" and conf.azure_pat:
+        logger.warning("Both MEND_AZUREPAT and an Entra service principal are configured. "
+                       "Using the service principal; MEND_AZUREPAT is ignored.")
+    elif mode == "pat" and partial:
+        logger.warning(f"Ignoring an incomplete Entra service principal configuration and "
+                       f"using MEND_AZUREPAT. Missing: {', '.join(partial)}.")
     if not conf.ws_url:
         res.append("MEND_URL")
     if not conf.email.strip():
@@ -331,6 +358,65 @@ def mend_v2_token() -> str:
     if token:
         mend_v2_session = payload
     return token
+
+
+# Process-wide, like mend_v2_session. expires_at is a time.monotonic() reading, so an NTP
+# correction on a self-hosted runner cannot make a live token look expired or the reverse.
+azure_entra_session = {"token": "", "expires_at": 0.0}
+
+
+def _post_entra_token():
+    # Split out so tests can stub the transport without mocking requests itself, exactly
+    # as _post_v2_login is.
+    url = auth.token_endpoint(conf.azure_tenant_id)
+    body = auth.token_request_body(conf.azure_client_id, conf.azure_client_secret)
+    try:
+        res_ = requests.post(url, data=body, verify=verify_setting(), proxies=conf.proxy,
+                             headers={"Content-Type": "application/x-www-form-urlencoded"},
+                             timeout=ENTRA_TOKEN_TIMEOUT)
+        payload = try_or_error(lambda: json.loads(res_.text), {})
+        if res_.status_code == 200:
+            return payload, 0
+        # token_error_message sees only the response, never the body we just sent.
+        logger.error(f"Entra token request failed: "
+                     f"{auth.token_error_message(payload, res_.text)}")
+        return payload, 2
+    except requests.exceptions.SSLError as err:
+        logger.error(f"[{ex()}] {ssl_error_hint('the Microsoft Entra login host', err)}")
+        return {}, 2
+    except Exception as err:
+        logger.error(f"[{ex()}] Entra token request failed: {err}. Check that the runner "
+                     f"can reach login.microsoftonline.com, and set MEND_PROXY if it is "
+                     f"behind a proxy.")
+        return {}, 2
+
+
+def azure_entra_token() -> str:
+    """A cached Entra access token, re-minted auth.REFRESH_MARGIN_SECONDS before expiry.
+
+    Returns "" on failure, having logged it. A failure is deliberately NOT cached, so a
+    transient 503 does not poison the rest of the run.
+    """
+    global azure_entra_session
+    now = time.monotonic()
+    if auth.token_is_fresh(azure_entra_session["token"],
+                           azure_entra_session["expires_at"], now):
+        return azure_entra_session["token"]
+    payload, errorcode = _post_entra_token()
+    if errorcode != 0:
+        return ""
+    token, expires_at = auth.parse_token_response(payload, now)
+    if not token:
+        logger.error("The Entra token response carried no access_token.")
+        return ""
+    azure_entra_session = {"token": token, "expires_at": expires_at}
+    return token
+
+
+def invalidate_azure_entra_token():
+    """Drop the cached token so the next call re-mints. Used by the single 401 retry."""
+    global azure_entra_session
+    azure_entra_session = {"token": "", "expires_at": 0.0}
 
 
 def _get_v2(url: str, token: str, params: dict, timeout: float = None):
@@ -524,6 +610,70 @@ def fetch_v3_pages(api: str, params: dict = None, limit: int = 1000, method: str
     return items, False
 
 
+def _azure_request_kwargs(header: str) -> dict:
+    """The auth kwargs for whichever credential this run uses."""
+    headers = {'Content-Type': f'{header}'}
+    if _azure_auth_mode() == "entra":
+        headers["Authorization"] = f"Bearer {azure_entra_token()}"
+        return {"headers": headers}
+    return {"headers": headers, "auth": ('', conf.azure_pat)}
+
+
+def log_azure_auth_mode():
+    """Say which Azure DevOps credential this run uses, once, before the first call.
+
+    check_patterns warns only when the configuration is ambiguous, so an unremarkable run
+    left no record of which credential it used. Naming the tenant and client makes a live
+    log self-identifying, and makes "is this still the PAT path?" readable at a glance
+    rather than inferred. The secret is never logged.
+    """
+    mode = _azure_auth_mode()
+    if mode == "entra":
+        logger.info(f"Authenticating to Azure DevOps with a Microsoft Entra service "
+                    f"principal (tenant {conf.azure_tenant_id}, client "
+                    f"{conf.azure_client_id}).")
+    elif mode == "pat":
+        logger.info("Authenticating to Azure DevOps with a personal access token.")
+
+
+class EntraTokenUnavailable(Exception):
+    """Raised instead of sending `Authorization: Bearer ` with nothing after it.
+
+    An empty bearer is not reliably a 401 from Azure DevOps: it can answer 203, or
+    redirect to a sign-in page that requests follows to a 200 HTML body, which lands in
+    call_azure_api's JSONDecodeError branch and reports a proxy fault for what is a
+    token-mint failure. azure_entra_token has already logged the real cause.
+    """
+
+
+def _azure_send(api_type: str, url: str, data: dict, header: str, proxies):
+    """One Azure DevOps request, with a single re-mint retry on 401 in Entra mode.
+
+    A cached token can die before its deadline (clock skew, a secret rotated mid-run), and
+    that is indistinguishable from a permission failure until it is retried. Exactly once:
+    a second 401 is real and must surface. Mirrors the single expiry retry call_ws_api_v2
+    already performs for the Mend JWT.
+    """
+    kwargs = _azure_request_kwargs(header)
+    _reject_empty_bearer(kwargs)
+    res_ = requests.request(api_type, url, json=data, proxies=proxies,
+                            verify=verify_setting(), **kwargs)
+    if res_.status_code == 401 and _azure_auth_mode() == "entra":
+        invalidate_azure_entra_token()
+        kwargs = _azure_request_kwargs(header)
+        _reject_empty_bearer(kwargs)
+        res_ = requests.request(api_type, url, json=data, proxies=proxies,
+                                verify=verify_setting(), **kwargs)
+    return res_
+
+
+def _reject_empty_bearer(kwargs: dict):
+    if kwargs["headers"].get("Authorization") == "Bearer ":
+        raise EntraTokenUnavailable(
+            "No Entra access token could be obtained, so no call was made to Azure "
+            "DevOps. The token request failure is logged above.")
+
+
 def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", project: str = "", cmd_type: str = "?",
                    header: str = "application/json-patch+json"):
 
@@ -536,11 +686,7 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
             f"{conf.azure_uri}{project}/_apis/{api}{cmd_type}api-version={version}"
         with warnings.catch_warnings(record=True) as warning_list:
             warnings.simplefilter("always", InsecureRequestWarning)
-            res_ = requests.request(api_type, url, json=data,
-                                    headers={'Content-Type': f'{header}'},
-                                    proxies=conf.proxy,
-                                    verify=verify_setting(),
-                                    auth=('', conf.azure_pat))
+            res_ = _azure_send(api_type, url, data, header, conf.proxy)
         if not WARNING_MSG:
             for warning in warning_list:
                 if issubclass(warning.category, InsecureRequestWarning):
@@ -555,11 +701,8 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
                 if temp_http_proxy:
                     with warnings.catch_warnings(record=True) as warning_list:
                         warnings.simplefilter("always", InsecureRequestWarning)
-                        res_ = requests.request(api_type, url, json=data,
-                                                headers={'Content-Type': f'{header}'},
-                                                proxies={"http": temp_http_proxy},
-                                                verify=verify_setting(),
-                                                auth=('', conf.azure_pat))
+                        res_ = _azure_send(api_type, url, data, header,
+                                           {"http": temp_http_proxy})
                     if not WARNING_MSG:
                         for warning in warning_list:
                             if issubclass(warning.category, InsecureRequestWarning):
@@ -586,16 +729,32 @@ def call_azure_api(api_type: str, api: str, data={}, version: str = "6.0", proje
             return "", 0
         else:
             errorcode = 2
-            if res_.text:
+            # 401 is checked before res_.text because an Azure DevOps 401 nearly always
+            # carries a body -- an HTML sign-in page, or a JSON message -- so testing the
+            # body first left the credential-specific advice below unreachable and printed
+            # "Status code: 401 - Azure DevOps Services | Sign In" instead.
+            if res_.status_code == 401:
+                if _azure_auth_mode() == "entra":
+                    res = {"Azure DevOps rejected the Entra service principal. Check that it "
+                           "is a member of the organization with a BASIC access level, and "
+                           "that it has Work Items read/write on the project. See the README."}
+                else:
+                    res = {f" Non-valid authentication credentials or PAT does not have enough permissions."
+                           f"Check it according to READ.ME file."}
+            elif res_.text:
                 msg = try_or_error(lambda: re.search(r"<title>(.*?)</title>", res_.text), "")
                 msg_text = f'Status code: {res_.status_code}'
                 msg_text = f'{msg_text} - {msg.group(1)}' if msg else f'{msg_text} - {try_or_error(lambda: json.loads(res_.text)["message"], "")}'
                 res = {f"{msg_text}"}
-            elif res_.status_code == 401:
-                res = {f" Non-valid authentication credentials or PAT does not have enough permissions."
-                       f"Check it according to READ.ME file."}
             else:
                 res = {f"Azure API call failed": "No message text was returned."}
+    except EntraTokenUnavailable as err:
+        # Ahead of the SSLError arm so a mint failure is never reported as a transport or
+        # proxy fault. errorcode 2 is the same fatal read failure the callers already
+        # refuse to create or close on.
+        errorcode = 2
+        logger.error(f"[{ex()}] {err}")
+        res = {f"[{ex()}] Azure API call skipped": f"{err}"}
     except requests.exceptions.SSLError as err:
         errorcode = 2
         logger.error(f"[{ex()}] {ssl_error_hint('the Azure DevOps host', err)}")
@@ -2990,6 +3149,9 @@ def startup():
         ssl_verify=varenvs.get_env("wssslverify").strip(),
         dep_paths=varenvs.get_env("wsdeppaths").strip(),
         dep_paths_concurrency=varenvs.get_env("wsdeppathsconcurrency").strip(),
+        azure_tenant_id=varenvs.get_env("wsazuretenantid").strip(),
+        azure_client_id=varenvs.get_env("wsazureclientid").strip(),
+        azure_client_secret=varenvs.get_env("wsazureclientsecret").strip(),
     )
     try:
         return conf

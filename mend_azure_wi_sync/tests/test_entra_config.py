@@ -1,0 +1,210 @@
+"""The Entra config surface, and the credential leak it must not widen.
+
+conf_json() feeds MEND_CUSTOMFIELDS substitution ($MEND_X in analyze_fields / mend_val).
+Anything reachable from there can be written into a work item description and read by
+everyone with board access. The PAT was reachable; nothing credential-bearing is now.
+"""
+
+import os
+from unittest import mock
+
+from mend_azure_wi_sync import core
+from mend_azure_wi_sync.config import Config
+
+VALID = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47"
+
+
+def _conf(**overrides):
+    """Mirrors tests/test_routing_config.py:_valid_conf. It deliberately omits every
+    defaulted field, which is exactly why the three new fields must have defaults."""
+    fields = dict(ws_user_key=VALID, ws_url="https://saas.mend.io",
+                  azure_uri="https://dev.azure.com/org/", azure_project="Platform",
+                  azure_pat=VALID, utc_delta=0, wsproducttoken="",
+                  wsprojecttoken="", wsexcludetoken="", azure_area="", azure_type="Task",
+                  azure_custom="", dependency="true", reponame="", description="ReproSteps",
+                  priority="false", proxy="", routing="false",
+                  branches="main,master", reachability="false",
+                  email="qa@example.com", org_uuid=VALID, severity="high",
+                  closed_state="Closed", reopen_state="New")
+    fields.update(overrides)
+    return Config(**fields)
+
+
+def test_the_three_entra_fields_default_to_empty():
+    """They MUST be defaulted, not positional. A required field raises TypeError in every
+    helper that builds Config from an explicit dict, including this one."""
+    conf = _conf()
+    assert conf.azure_tenant_id == ""
+    assert conf.azure_client_id == ""
+    assert conf.azure_client_secret == ""
+
+
+def test_the_fields_round_trip_when_set():
+    conf = _conf(azure_tenant_id=TENANT, azure_client_id="cid", azure_client_secret="sec")
+    assert (conf.azure_tenant_id, conf.azure_client_id, conf.azure_client_secret) == (
+        TENANT, "cid", "sec")
+
+
+def test_conf_json_no_longer_exposes_the_pat():
+    """Live defect until this change: $MEND_AZUREPAT in MEND_CUSTOMFIELDS wrote the PAT
+    into a work item description."""
+    assert "wsazurepat" not in _conf().conf_json()
+
+
+def test_conf_json_no_longer_exposes_the_mend_user_key():
+    """Same mechanism and the same blast radius as the PAT above, a different credential:
+    $MEND_USERKEY in MEND_CUSTOMFIELDS wrote the Mend API key into a work item description
+    visible to anyone with board access. It is not documented as substitutable."""
+    # A distinct value, because the fixture reuses VALID as the org UUID, which is an
+    # identifier rather than a credential and legitimately stays exposed.
+    key = "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321"
+    exposed = _conf(ws_user_key=key).conf_json()
+    assert "wsuserkey" not in exposed
+    assert key not in exposed.values()
+
+
+def test_conf_json_exposes_no_entra_credential():
+    conf = _conf(azure_tenant_id=TENANT, azure_client_id="cid", azure_client_secret="sec")
+    exposed = conf.conf_json()
+    assert "sec" not in exposed.values()
+    for key in ("wsazuretenantid", "wsazureclientid", "wsazureclientsecret"):
+        assert key not in exposed
+
+
+def test_no_conf_json_value_carries_the_secret():
+    """Belt and braces: catches a future key added under any name."""
+    conf = _conf(azure_tenant_id=TENANT, azure_client_id="cid",
+                 azure_client_secret="super-secret-value")
+    assert "super-secret-value" not in repr(conf.conf_json())
+
+
+def test_an_unexpanded_pipeline_placeholder_is_blanked():
+    """If Azure does not substitute $(MEND_AZURECLIENTSECRET), the literal must become ""
+    so check_patterns reports a missing secret. Otherwise the tool POSTs the placeholder
+    to Entra and the operator debugs AADSTS7000215 instead of a pipeline variable."""
+    conf = _conf(azure_tenant_id="$(MEND_AZURETENANTID)",
+                 azure_client_id="$(MEND_AZURECLIENTID)",
+                 azure_client_secret="$(MEND_AZURECLIENTSECRET)")
+    conf.update_properties()
+    assert conf.azure_tenant_id == ""
+    assert conf.azure_client_id == ""
+    assert conf.azure_client_secret == ""
+
+
+def test_startup_reads_all_three_variables():
+    env = {"MEND_AZURETENANTID": TENANT, "MEND_AZURECLIENTID": "cid",
+           "MEND_AZURECLIENTSECRET": "sec", "MEND_URL": "https://saas.mend.io",
+           "MEND_USERKEY": VALID, "MEND_ORGUUID": VALID, "MEND_EMAIL": "qa@example.com",
+           "MEND_AZUREURI": "https://dev.azure.com/org/", "MEND_AZUREPROJECT": "Platform"}
+    with mock.patch.dict(os.environ, env, clear=False):
+        conf = core.startup()
+    assert conf.azure_tenant_id == TENANT
+    assert conf.azure_client_id == "cid"
+    assert conf.azure_client_secret == "sec"
+
+
+# ------------------------------------------------------------------ validation
+
+def test_a_complete_triple_needs_no_pat():
+    conf = _conf(azure_pat="", azure_tenant_id=TENANT, azure_client_id="cid",
+                 azure_client_secret="sec")
+    with mock.patch.object(core, "conf", conf):
+        assert not [r for r in core.check_patterns() if "AZURE" in r]
+
+
+def test_a_pat_alone_still_validates():
+    """No regression for every existing customer."""
+    with mock.patch.object(core, "conf", _conf()):
+        assert not [r for r in core.check_patterns() if "AZURE" in r]
+
+
+def test_a_partial_triple_names_exactly_the_missing_variable():
+    """Reporting MEND_AZUREPAT here would send an operator debugging the wrong
+    credential entirely."""
+    conf = _conf(azure_pat="", azure_tenant_id=TENANT, azure_client_id="",
+                 azure_client_secret="sec")
+    with mock.patch.object(core, "conf", conf):
+        res = core.check_patterns()
+    assert any("MEND_AZURECLIENTID" in r for r in res)
+    assert not any("MEND_AZURETENANTID" in r for r in res)
+    assert not any(r.startswith("MEND_AZUREPAT") for r in res)
+
+
+def test_no_credential_at_all_offers_both_options():
+    conf = _conf(azure_pat="")
+    with mock.patch.object(core, "conf", conf):
+        res = core.check_patterns()
+    joined = " ".join(res)
+    assert "MEND_AZUREPAT" in joined
+    assert "MEND_AZURETENANTID" in joined
+
+
+def test_both_credentials_configured_warns_once_and_does_not_fail(caplog):
+    conf = _conf(azure_tenant_id=TENANT, azure_client_id="cid", azure_client_secret="sec")
+    with mock.patch.object(core, "conf", conf), caplog.at_level("WARNING"):
+        res = core.check_patterns()
+    assert not [r for r in res if "AZURE" in r]
+    assert "MEND_AZUREPAT" in caplog.text
+
+
+def test_a_pat_plus_a_partial_triple_warns_but_does_not_fail(caplog):
+    """A half-finished migration must be visible without breaking a live pipeline."""
+    conf = _conf(azure_tenant_id=TENANT)
+    with mock.patch.object(core, "conf", conf), caplog.at_level("WARNING"):
+        res = core.check_patterns()
+    assert not [r for r in res if "AZURE" in r]
+    assert "MEND_AZURECLIENTID" in caplog.text
+
+
+def test_the_secret_never_reaches_a_log_record(caplog):
+    conf = _conf(azure_tenant_id=TENANT, azure_client_id="cid",
+                 azure_client_secret="super-secret-value")
+    with mock.patch.object(core, "conf", conf), caplog.at_level("DEBUG"):
+        core.check_patterns()
+    assert "super-secret-value" not in caplog.text
+
+
+# --- which credential a run actually used --------------------------------------------------
+
+def _mode_conf(**overrides):
+    values = dict(azure_pat="", azure_tenant_id="", azure_client_id="",
+                  azure_client_secret="")
+    values.update(overrides)
+    return mock.MagicMock(**values)
+
+
+def test_an_entra_run_says_so_at_startup(caplog):
+    """check_patterns warns only in the ambiguous cases, so without this a log does not
+    say which credential was used. Matrix step 7 -- the PAT regression check -- is then
+    verifiable only by inference."""
+    conf = _mode_conf(azure_tenant_id=TENANT, azure_client_id="cid",
+                      azure_client_secret="sec")
+    with mock.patch.object(core, "conf", conf), caplog.at_level("INFO"):
+        core.log_azure_auth_mode()
+    assert "Entra" in caplog.text
+    assert TENANT in caplog.text, "the tenant identifies WHICH service principal"
+    assert "cid" in caplog.text
+
+
+def test_a_pat_run_says_so_at_startup(caplog):
+    with mock.patch.object(core, "conf", _mode_conf(azure_pat="a-pat")), \
+         caplog.at_level("INFO"):
+        core.log_azure_auth_mode()
+    assert "personal access token" in caplog.text.lower()
+
+
+def test_the_startup_line_never_carries_the_secret(caplog):
+    conf = _mode_conf(azure_tenant_id=TENANT, azure_client_id="cid",
+                      azure_client_secret="super-secret-value")
+    with mock.patch.object(core, "conf", conf), caplog.at_level("DEBUG"):
+        core.log_azure_auth_mode()
+    assert "super-secret-value" not in caplog.text
+
+
+def test_a_run_with_no_credential_at_all_is_not_announced_as_authenticated(caplog):
+    """check_patterns already aborts this run; the line must not claim otherwise."""
+    with mock.patch.object(core, "conf", _mode_conf()), caplog.at_level("INFO"):
+        core.log_azure_auth_mode()
+    assert "Entra" not in caplog.text
+    assert "personal access token" not in caplog.text.lower()

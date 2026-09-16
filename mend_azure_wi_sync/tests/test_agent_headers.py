@@ -22,9 +22,12 @@ AGENT = "ps-azure-wi-sync"
 
 
 def _conf():
+    # The Entra fields must be empty strings: a bare MagicMock auto-creates them as
+    # truthy attributes, which selects Entra mode and sends no PAT at all.
     return mock.MagicMock(email="a@b.c", ws_user_key="uk", org_uuid="org-1", proxy={},
                           ssl_verify=True, azure_project="TestProj", azure_pat="pat",
-                          azure_uri="https://dev.azure.com/org")
+                          azure_uri="https://dev.azure.com/org", azure_tenant_id="",
+                          azure_client_id="", azure_client_secret="")
 
 
 def test_the_agent_name_carries_the_ps_prefix_and_the_hyphenated_tool_name():

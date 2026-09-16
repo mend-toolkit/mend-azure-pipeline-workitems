@@ -52,12 +52,15 @@ def reset_core_globals():
     """core.py holds mutable module globals that leak between tests."""
     from mend_azure_wi_sync import core
     saved = (core.exist_wis, core.updated_wi, core.global_errors, core.conf,
-             core.run_failed, core.synced_projects)
+             core.run_failed, core.synced_projects, core.azure_entra_session)
     core.exist_wis = []
     core.updated_wi = []
     core.global_errors = 0
     core.run_failed = False
     core.synced_projects = []
+    # Credential-bearing, so a test that sets a live token must not leak it into the rest
+    # of the suite.
+    core.azure_entra_session = {"token": "", "expires_at": 0.0}
     # library_paths_pool_size() memoises MEND_DEPPATHS_CONCURRENCY for the run (see its
     # docstring): a test elsewhere that sets conf.dep_paths_concurrency to a specific value would
     # otherwise leak that resolved number into every test that runs after it, in any file, not
@@ -65,5 +68,5 @@ def reset_core_globals():
     core.reset_library_paths_pool_size_cache()
     yield
     (core.exist_wis, core.updated_wi, core.global_errors, core.conf,
-     core.run_failed, core.synced_projects) = saved
+     core.run_failed, core.synced_projects, core.azure_entra_session) = saved
     core.reset_library_paths_pool_size_cache()
