@@ -38,6 +38,7 @@ reconciles Azure DevOps against it:
   - [Syntax](#syntax)
   - [Available `MEND:` Paths](#available-mend-paths)
   - [Examples](#examples)
+- [Example Work Item](#example-work-item)
 
 ## Prerequisites
 
@@ -454,3 +455,9 @@ A complete pipeline fragment: a full custom Work Item type populated from a sing
 >**_NOTE_**: `MEND_CUSTOMFIELDS` must be a **single-line** string. Field names are matched exactly, with no trimming, so a YAML folded block (`>-`) breaks it: the fold inserts a space, and ` Version` no longer matches the field `Version`.
 
 >**_NOTE_**: `MEND_DEPENDENCY: false` is used here deliberately. In the default `true` mode the same mapping still works, but each of the `MEND:findings.*` fields would reflect an arbitrary one of the library's CVEs. See [Available `MEND:` Paths](#available-mend-paths).
+
+## Example Work Item
+
+A vulnerability Work Item created in the default `MEND_DEPENDENCY: true` mode:
+
+![Example Azure DevOps Work Item for a vulnerable root library, listing its CVE with severity, CVSS, EPSS and reachability](https://raw.githubusercontent.com/mend-toolkit/mend-azure-pipeline-workitems/main/.github/images/WorkitemExample.png)

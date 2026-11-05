@@ -20,6 +20,7 @@ target/
 # Excluded Files - Extensions
 *.iml
 *.png
+!.github/images/*.png
 *.tar.gz
 *.url
 .coverage
